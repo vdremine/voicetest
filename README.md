@@ -1,34 +1,33 @@
 # LiveKit Transport-First Scaffold
 
-Минимальный каркас для transport-check перед AI voice loop.
+Минимальный каркас для transport-check и первого browser-safe AI voice loop.
 
-На этом этапе цель только такая:
+Текущая цель:
 
-1. Браузер заходит в комнату.
+1. Браузер заходит в комнату по `https://vdremin.ru`.
 2. Агент заходит в ту же комнату.
 3. Frontend видит `agent-001`.
 4. Frontend получает `agent_ready`.
 5. Агент видит audio track пользователя.
 6. Агент умеет отправлять data-message обратно.
 
-Сейчас сознательно не делаем:
+Что сознательно не делаем на этом этапе:
 
-- Caddy
-- WSS/TLS
 - TURN/TLS
-- доменную production-маршрутизацию
-- сложный production perimeter
-
-Это отдельный этап после первого рабочего AI loop.
+- отдельный `turn.vdremin.ru`
+- полный production perimeter
+- multi-node routing
+- прикладной AI orchestration поверх транспорта
 
 ## Что есть в репозитории
 
 - `docker-compose.yml` — локальный smoke-test
-- `docker-compose.prod.yml` — public-IP baseline для Ubuntu
+- `docker-compose.prod.yml` — доменный baseline для Ubuntu
 - `token_server` на FastAPI
 - простой `frontend` без React
 - Python `agent`, который входит в комнату и отправляет `agent_ready`
 - bootstrap/user-data скрипты
+- `Caddy` для HTTPS и WSS
 
 ## Структура
 
@@ -79,49 +78,63 @@ cp .env.example .env
 docker compose up --build
 ```
 
-### 2. Ubuntu public-IP baseline
+### 2. Ubuntu domain baseline
 
 Файл: [docker-compose.prod.yml](/Users/dr_emin/Desktop/livekit/docker-compose.prod.yml)
 
-Сейчас это основной серверный режим для проверки транспорта.
+Сейчас это основной серверный режим для проверки транспорта и микрофона без `localhost` tunnel.
 
 URL:
 
-- frontend: `http://193.39.168.244`
-- token server через frontend: `http://193.39.168.244/token`
-- health: `http://193.39.168.244/healthz`
-- LiveKit: `ws://193.39.168.244:7880`
+- frontend: `https://vdremin.ru`
+- token server через frontend: `https://vdremin.ru/token`
+- health: `https://vdremin.ru/healthz`
+- LiveKit: `wss://livekit.vdremin.ru`
 
 ## Схема baseline
 
 ```mermaid
 flowchart LR
-    U["Browser / User"] -->|HTTP 80| F["frontend nginx"]
-    F -->|GET /token| T["token_server"]
-    T -->|JWT + ws URL| U
-    U -->|WS 7880| LK["LiveKit room"]
-    A["agent"] -->|WS 7880| LK
+    U["Browser / User"] -->|HTTPS 443| C["Caddy"]
+    C -->|proxy| F["frontend nginx :8080"]
+    F -->|GET /token| T["token_server :8000"]
+    T -->|JWT + wss URL| U
+    U -->|WSS 443| C
+    C -->|proxy| LK["LiveKit signal :7880"]
+    A["agent"] -->|WS 127.0.0.1:7880| LK
     U -->|WebRTC UDP 50000-60000| LK
     U -->|WebRTC TCP 7881 fallback| LK
 ```
 
 Что важно:
 
-- frontend отдается по обычному `http://`
+- frontend отдается по `https://vdremin.ru`
 - token server наружу напрямую не нужен, frontend проксирует `/token`
-- browser подключается к LiveKit напрямую по `ws://PUBLIC_IP:7880`
-- этого достаточно для первого AI transport-check
+- browser получает secure context и может запрашивать микрофон без tunnel
+- signal идет через `wss://livekit.vdremin.ru`
+- media по-прежнему идет напрямую в LiveKit по UDP/TCP
 
-## Production baseline на Ubuntu 24.04
+## DNS
+
+Для этого baseline нужны две A-записи:
+
+- `vdremin.ru -> 193.39.168.244`
+- `livekit.vdremin.ru -> 193.39.168.244`
+
+`turn.vdremin.ru` пока не нужен.
+
+## Domain baseline на Ubuntu 24.04
 
 Минимальный `.env`:
 
 ```env
 SERVER_TIMEZONE=Europe/Moscow
 SERVER_PUBLIC_IP=193.39.168.244
+APP_DOMAIN=vdremin.ru
+LIVEKIT_DOMAIN=livekit.vdremin.ru
 LIVEKIT_API_KEY=voice-agent-prod
 LIVEKIT_API_SECRET=replace-with-long-random-secret
-LIVEKIT_URL_PUBLIC=ws://193.39.168.244:7880
+LIVEKIT_URL_PUBLIC=wss://livekit.vdremin.ru
 LIVEKIT_USE_EXTERNAL_IP=true
 TOKEN_TTL_MINUTES=60
 CORS_ALLOW_ORIGINS=*
@@ -142,19 +155,19 @@ docker compose -f docker-compose.prod.yml up --build -d
 
 ## Порты
 
-Для baseline-сервера должны быть доступны:
+Для domain baseline должны быть доступны:
 
-- `80/tcp` — frontend
-- `7880/tcp` — LiveKit signal
+- `80/tcp` — ACME / HTTP challenge
+- `443/tcp` — HTTPS frontend и WSS signal
 - `7881/tcp` — WebRTC TCP fallback
-- `3478/udp` — можно открыть заранее
 - `50000-60000/udp` — media traffic
 
-`443` можно оставить открытым заранее, но текущий baseline его не использует.
+`3478/udp` можно держать открытым заранее, но текущая конфигурация его не использует.
+`7880/tcp` снаружи больше не нужен. По LiveKit docs этот порт должен быть за SSL termination layer, а наружу для клиентов нужен `wss://...` endpoint.
 
 ## Проверка
 
-1. Откройте `http://193.39.168.244`.
+1. Откройте `https://vdremin.ru`.
 2. Нажмите `Join`.
 3. Проверьте, что frontend подключился к комнате.
 4. Проверьте, что в participants виден `agent-001`.
@@ -190,9 +203,17 @@ docker compose -f docker-compose.prod.yml up --build -d
 
 ```json
 {
-  "url": "ws://193.39.168.244:7880",
+  "url": "wss://livekit.vdremin.ru",
   "token": "<jwt>",
   "room": "demo-room",
   "identity": "user-123"
 }
 ```
+
+## Источники
+
+По официальной документации LiveKit secure deployment требует домен, SSL termination и `wss://` endpoint для SDK-клиентов:
+
+- [Deployment](https://docs.livekit.io/home/self-hosting/deployment/)
+- [Virtual machines](https://docs.livekit.io/transport/self-hosting/vm/)
+- [Ports and firewall](https://docs.livekit.io/transport/self-hosting/ports-firewall/)

@@ -443,6 +443,18 @@
           return;
         }
 
+        if (!window.isSecureContext && location.hostname !== "localhost" && location.hostname !== "127.0.0.1") {
+          throw new Error(
+            "Microphone access requires a secure context. Use HTTPS or open the app via localhost tunnel for testing.",
+          );
+        }
+
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          throw new Error(
+            "navigator.mediaDevices.getUserMedia is unavailable in this browser context.",
+          );
+        }
+
         const nextState = !micEnabled;
         await currentRoom.localParticipant.setMicrophoneEnabled(nextState);
         micEnabled = nextState;

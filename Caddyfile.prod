@@ -1,0 +1,11 @@
+{
+  auto_https on
+}
+
+vdremin.ru {
+  reverse_proxy 127.0.0.1:8080
+}
+
+livekit.vdremin.ru {
+  reverse_proxy 127.0.0.1:7880
+}

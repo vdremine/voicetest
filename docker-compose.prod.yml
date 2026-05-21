@@ -1,4 +1,16 @@
 services:
+  caddy:
+    image: caddy:2.9-alpine
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - frontend
+      - livekit
+    volumes:
+      - ./Caddyfile.prod:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
   livekit:
     image: livekit/livekit-server:latest
     network_mode: host
@@ -56,3 +68,7 @@ services:
       AGENT_NAME: ${AGENT_NAME:-Room Agent}
       AGENT_READY_TOPIC: ${AGENT_READY_TOPIC:-presence}
       TOKEN_REQUEST_TIMEOUT: ${TOKEN_REQUEST_TIMEOUT:-10}
+
+volumes:
+  caddy_data:
+  caddy_config:
