@@ -38,7 +38,7 @@ services:
     environment:
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-voice-agent-prod}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-replace-with-long-random-secret}
-      LIVEKIT_URL_PUBLIC: ${LIVEKIT_URL_PUBLIC:-ws://193.39.168.244:7880}
+      LIVEKIT_URL_PUBLIC: ${LIVEKIT_URL_PUBLIC:-wss://livekit.vdremin.ru}
       TOKEN_TTL_MINUTES: ${TOKEN_TTL_MINUTES:-60}
       CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-*}
 

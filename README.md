@@ -18,6 +18,7 @@
 - полный production perimeter
 - multi-node routing
 - прикладной AI orchestration поверх транспорта
+- автоматическое управление `ufw` из repo-скриптов
 
 ## Что есть в репозитории
 
@@ -28,6 +29,11 @@
 - Python `agent`, который входит в комнату и отправляет `agent_ready`
 - bootstrap/user-data скрипты
 - `Caddy` для HTTPS и WSS
+
+Важно:
+
+- firewall на сервере управляется вручную;
+- `scripts/bootstrap_server.sh` не должен включать или настраивать `ufw`.
 
 ## Структура
 
