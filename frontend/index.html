@@ -1,0 +1,485 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LiveKit Transport Check</title>
+    <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
+    <style>
+      :root {
+        --bg: #09111f;
+        --panel: rgba(12, 23, 39, 0.88);
+        --panel-border: rgba(122, 162, 255, 0.18);
+        --text: #e7eefc;
+        --muted: #91a3bf;
+        --accent: #8df0cc;
+        --accent-2: #ffcc8a;
+        --danger: #ff7c7c;
+        --ok: #90f7a6;
+        --shadow: 0 24px 80px rgba(0, 0, 0, 0.32);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+        color: var(--text);
+        background:
+          radial-gradient(circle at top left, rgba(82, 157, 255, 0.2), transparent 28%),
+          radial-gradient(circle at top right, rgba(141, 240, 204, 0.18), transparent 24%),
+          linear-gradient(160deg, #050914 0%, #0b1322 48%, #08111d 100%);
+        padding: 24px;
+      }
+
+      .shell {
+        max-width: 1100px;
+        margin: 0 auto;
+        display: grid;
+        gap: 20px;
+      }
+
+      .hero,
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--panel-border);
+        border-radius: 20px;
+        box-shadow: var(--shadow);
+        backdrop-filter: blur(16px);
+      }
+
+      .hero {
+        padding: 24px;
+      }
+
+      .hero h1 {
+        margin: 0 0 10px;
+        font-size: clamp(28px, 5vw, 48px);
+        line-height: 1;
+      }
+
+      .hero p {
+        margin: 0;
+        color: var(--muted);
+        max-width: 760px;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: 1.2fr 0.8fr;
+        gap: 20px;
+      }
+
+      .panel {
+        padding: 20px;
+      }
+
+      .panel h2 {
+        margin: 0 0 16px;
+        font-size: 16px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--accent-2);
+      }
+
+      .controls {
+        display: grid;
+        gap: 14px;
+      }
+
+      .row {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      label {
+        display: grid;
+        gap: 6px;
+        color: var(--muted);
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
+
+      input {
+        width: 100%;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        background: rgba(255, 255, 255, 0.04);
+        color: var(--text);
+        border-radius: 12px;
+        padding: 12px 14px;
+        font: inherit;
+      }
+
+      input:focus {
+        outline: 1px solid rgba(141, 240, 204, 0.55);
+      }
+
+      .actions {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+
+      button {
+        border: 0;
+        border-radius: 999px;
+        padding: 12px 18px;
+        font: inherit;
+        cursor: pointer;
+        color: #04111b;
+        background: var(--accent);
+        transition: transform 140ms ease, opacity 140ms ease, background 140ms ease;
+      }
+
+      button:hover:not(:disabled) {
+        transform: translateY(-1px);
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.45;
+      }
+
+      button.secondary {
+        background: #d9e4ff;
+      }
+
+      button.danger {
+        background: #ffb0b0;
+      }
+
+      .statusbar {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+
+      .badge {
+        border-radius: 999px;
+        padding: 8px 12px;
+        background: rgba(255, 255, 255, 0.06);
+        color: var(--muted);
+      }
+
+      .badge.ok {
+        color: var(--ok);
+      }
+
+      .list,
+      .log {
+        border-radius: 14px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        background: rgba(0, 0, 0, 0.18);
+      }
+
+      .list {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+      }
+
+      .list li {
+        padding: 12px 14px;
+        border-top: 1px solid rgba(255, 255, 255, 0.06);
+      }
+
+      .list li:first-child {
+        border-top: 0;
+      }
+
+      .log {
+        min-height: 340px;
+        max-height: 420px;
+        overflow: auto;
+        padding: 14px;
+        white-space: pre-wrap;
+      }
+
+      .hint {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      @media (max-width: 840px) {
+        body {
+          padding: 16px;
+        }
+
+        .grid,
+        .row {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <h1>LiveKit Transport Check</h1>
+        <p>
+          First-pass room join page for validating LiveKit, JWT issuance, agent presence, data
+          messages, and basic microphone publishing without adding React or AI orchestration yet.
+        </p>
+      </section>
+
+      <section class="grid">
+        <div class="panel">
+          <h2>Control Plane</h2>
+          <div class="controls">
+            <div class="row">
+              <label>
+                Room
+                <input id="roomName" value="demo-room" />
+              </label>
+              <label>
+                Identity
+                <input id="identity" />
+              </label>
+            </div>
+
+            <div class="actions">
+              <button id="joinBtn">Join</button>
+              <button id="leaveBtn" class="danger" disabled>Leave</button>
+              <button id="micBtn" class="secondary" disabled>Mic Off</button>
+            </div>
+
+            <div class="statusbar">
+              <div id="statusBadge" class="badge">idle</div>
+              <div id="roomBadge" class="badge">room: -</div>
+              <div id="serverBadge" class="badge">server: -</div>
+            </div>
+
+            <div class="hint">
+              Expected signal for stage one: successful join, visible `agent-001`, and incoming
+              `agent_ready` in the event log.
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h2>Participants</h2>
+          <ul id="participants" class="list">
+            <li>No participants yet</li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Event Log</h2>
+        <div id="eventLog" class="log"></div>
+      </section>
+    </main>
+
+    <script>
+      const roomInput = document.getElementById("roomName");
+      const identityInput = document.getElementById("identity");
+      const joinBtn = document.getElementById("joinBtn");
+      const leaveBtn = document.getElementById("leaveBtn");
+      const micBtn = document.getElementById("micBtn");
+      const eventLog = document.getElementById("eventLog");
+      const participantsList = document.getElementById("participants");
+      const statusBadge = document.getElementById("statusBadge");
+      const roomBadge = document.getElementById("roomBadge");
+      const serverBadge = document.getElementById("serverBadge");
+
+      const { Room, RoomEvent } = LivekitClient;
+      const encoder = new TextEncoder();
+      const decoder = new TextDecoder();
+
+      let currentRoom = null;
+      let micEnabled = false;
+
+      identityInput.value = `user-${Math.random().toString(36).slice(2, 8)}`;
+
+      function log(message) {
+        const timestamp = new Date().toLocaleTimeString();
+        eventLog.textContent += `[${timestamp}] ${message}\n`;
+        eventLog.scrollTop = eventLog.scrollHeight;
+      }
+
+      function setStatus(text, ok = false) {
+        statusBadge.textContent = text;
+        statusBadge.className = ok ? "badge ok" : "badge";
+      }
+
+      function setButtons({ joined }) {
+        joinBtn.disabled = joined;
+        leaveBtn.disabled = !joined;
+        micBtn.disabled = !joined;
+      }
+
+      function setMicButton() {
+        micBtn.textContent = micEnabled ? "Mic On" : "Mic Off";
+      }
+
+      function renderParticipants() {
+        if (!currentRoom) {
+          participantsList.innerHTML = "<li>No participants yet</li>";
+          return;
+        }
+
+        const entries = [
+          {
+            identity: currentRoom.localParticipant?.identity || "local",
+            label: "local",
+          },
+          ...Array.from(currentRoom.remoteParticipants.values()).map((participant) => ({
+            identity: participant.identity,
+            label: participant.isAgent ? "agent" : "remote",
+          })),
+        ];
+
+        participantsList.innerHTML = entries
+          .map((entry) => `<li>${entry.identity} <span class="hint">(${entry.label})</span></li>`)
+          .join("");
+      }
+
+      function resetUi() {
+        currentRoom = null;
+        micEnabled = false;
+        roomBadge.textContent = "room: -";
+        serverBadge.textContent = "server: -";
+        setButtons({ joined: false });
+        setMicButton();
+        renderParticipants();
+      }
+
+      function attachRoomHandlers(room) {
+        room
+          .on(RoomEvent.Connected, () => {
+            setStatus("connected", true);
+            roomBadge.textContent = `room: ${room.name || roomInput.value}`;
+            renderParticipants();
+            log(`connected to room ${room.name || roomInput.value}`);
+          })
+          .on(RoomEvent.ConnectionStateChanged, (state) => {
+            setStatus(`state: ${state}`, state === "connected");
+            log(`connection state changed: ${state}`);
+          })
+          .on(RoomEvent.ParticipantConnected, (participant) => {
+            log(`participant connected: ${participant.identity}`);
+            renderParticipants();
+          })
+          .on(RoomEvent.ParticipantActive, (participant) => {
+            log(`participant active: ${participant.identity}`);
+            renderParticipants();
+          })
+          .on(RoomEvent.ParticipantDisconnected, (participant) => {
+            log(`participant disconnected: ${participant.identity}`);
+            renderParticipants();
+          })
+          .on(RoomEvent.DataReceived, (payload, participant, kind, topic) => {
+            const text = decoder.decode(payload);
+            const sender = participant?.identity || "server";
+            log(`data received from ${sender} topic=${topic || "-"} kind=${kind}: ${text}`);
+          })
+          .on(RoomEvent.LocalTrackPublished, (publication) => {
+            log(`local track published: ${publication.kind}`);
+          })
+          .on(RoomEvent.LocalTrackUnpublished, (publication) => {
+            log(`local track unpublished: ${publication.kind}`);
+          })
+          .on(RoomEvent.Disconnected, (reason) => {
+            log(`disconnected: ${reason || "client_leave"}`);
+            setStatus("idle");
+            resetUi();
+          });
+      }
+
+      async function joinRoom() {
+        if (currentRoom) {
+          return;
+        }
+
+        const roomName = roomInput.value.trim() || "demo-room";
+        const identity = identityInput.value.trim() || `user-${Date.now()}`;
+
+        setStatus("fetching token");
+        log(`requesting token for room=${roomName} identity=${identity}`);
+
+        const response = await fetch(
+          `/token?room=${encodeURIComponent(roomName)}&identity=${encodeURIComponent(identity)}`,
+        );
+        if (!response.ok) {
+          throw new Error(`token request failed with status ${response.status}`);
+        }
+
+        const payload = await response.json();
+        serverBadge.textContent = `server: ${payload.url}`;
+
+        const room = new Room({
+          adaptiveStream: true,
+          dynacast: true,
+        });
+
+        attachRoomHandlers(room);
+        room.prepareConnection(payload.url, payload.token);
+
+        setStatus("connecting");
+        await room.connect(payload.url, payload.token);
+
+        currentRoom = room;
+        setButtons({ joined: true });
+        renderParticipants();
+      }
+
+      async function leaveRoom() {
+        if (!currentRoom) {
+          return;
+        }
+
+        await currentRoom.disconnect();
+      }
+
+      async function toggleMic() {
+        if (!currentRoom) {
+          return;
+        }
+
+        const nextState = !micEnabled;
+        await currentRoom.localParticipant.setMicrophoneEnabled(nextState);
+        micEnabled = nextState;
+        setMicButton();
+        log(`microphone ${micEnabled ? "enabled" : "disabled"}`);
+      }
+
+      joinBtn.addEventListener("click", async () => {
+        try {
+          await joinRoom();
+        } catch (error) {
+          setStatus("error");
+          log(`join failed: ${error.message}`);
+          resetUi();
+        }
+      });
+
+      leaveBtn.addEventListener("click", async () => {
+        try {
+          await leaveRoom();
+        } catch (error) {
+          log(`leave failed: ${error.message}`);
+        }
+      });
+
+      micBtn.addEventListener("click", async () => {
+        try {
+          await toggleMic();
+        } catch (error) {
+          log(`mic toggle failed: ${error.message}`);
+        }
+      });
+
+      setMicButton();
+      setButtons({ joined: false });
+      setStatus("idle");
+      log("frontend ready");
+    </script>
+  </body>
+</html>

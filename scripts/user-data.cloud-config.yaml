@@ -1,0 +1,15 @@
+#cloud-config
+timezone: Europe/Moscow
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - git
+  - curl
+
+runcmd:
+  - [ bash, -lc, "export REPO_URL='https://github.com/your-org/livekit-transport-scaffold.git'; export APP_DIR='/opt/voice-agent'; export SERVER_TIMEZONE='Europe/Moscow'; if [ ! -d \"$APP_DIR\" ]; then git clone \"$REPO_URL\" \"$APP_DIR\"; fi" ]
+  - [ bash, -lc, "cd /opt/voice-agent && chmod +x scripts/bootstrap_server.sh && SERVER_TIMEZONE='Europe/Moscow' ./scripts/bootstrap_server.sh" ]
+  - [ bash, -lc, "cd /opt/voice-agent && [ -f .env ] || cp .env.prod.example .env" ]
+  - [ bash, -lc, "cd /opt/voice-agent && docker compose -f docker-compose.prod.yml up --build -d" ]

@@ -1,0 +1,58 @@
+services:
+  livekit:
+    image: livekit/livekit-server:latest
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      LIVEKIT_CONFIG: |
+        port: 7880
+        log_level: info
+        rtc:
+          tcp_port: 7881
+          port_range_start: 50000
+          port_range_end: 60000
+          use_external_ip: ${LIVEKIT_USE_EXTERNAL_IP:-true}
+        keys:
+          "${LIVEKIT_API_KEY:-voice-agent-prod}": "${LIVEKIT_API_SECRET:-replace-with-long-random-secret}"
+
+  token_server:
+    build:
+      context: ./token_server
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - livekit
+    command: uvicorn main:app --host 127.0.0.1 --port 8000
+    environment:
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-voice-agent-prod}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-replace-with-long-random-secret}
+      LIVEKIT_URL_PUBLIC: ${LIVEKIT_URL_PUBLIC:-ws://193.39.168.244:7880}
+      TOKEN_TTL_MINUTES: ${TOKEN_TTL_MINUTES:-60}
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-*}
+
+  frontend:
+    image: nginx:1.27-alpine
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - token_server
+    volumes:
+      - ./frontend/index.html:/usr/share/nginx/html/index.html:ro
+      - ./frontend/nginx.prod.conf:/etc/nginx/nginx.conf:ro
+
+  agent:
+    build:
+      context: ./agent
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - livekit
+      - token_server
+    environment:
+      TOKEN_SERVER_URL: http://127.0.0.1:8000/token
+      LIVEKIT_URL_INTERNAL: ws://127.0.0.1:7880
+      AGENT_ROOM: ${AGENT_ROOM:-demo-room}
+      AGENT_IDENTITY: ${AGENT_IDENTITY:-agent-001}
+      AGENT_NAME: ${AGENT_NAME:-Room Agent}
+      AGENT_READY_TOPIC: ${AGENT_READY_TOPIC:-presence}
+      TOKEN_REQUEST_TIMEOUT: ${TOKEN_REQUEST_TIMEOUT:-10}
