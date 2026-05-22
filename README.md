@@ -4,7 +4,7 @@
 
 Текущая цель:
 
-1. Браузер заходит в комнату по `https://vdremin.ru`.
+1. Браузер заходит в комнату по `https://app.example.com`.
 2. Агент заходит в ту же комнату.
 3. Frontend видит `agent-001`.
 4. Frontend получает `agent_ready`.
@@ -14,7 +14,7 @@
 Что сознательно не делаем на этом этапе:
 
 - TURN/TLS
-- отдельный `turn.vdremin.ru`
+- отдельный `turn.example.com`
 - полный production perimeter
 - multi-node routing
 - прикладной AI orchestration поверх транспорта
@@ -96,10 +96,10 @@ docker compose up --build
 
 URL:
 
-- frontend: `https://vdremin.ru`
-- token server через frontend: `https://vdremin.ru/token`
-- health: `https://vdremin.ru/healthz`
-- LiveKit: `wss://livekit.vdremin.ru`
+- frontend: `https://app.example.com`
+- token server через frontend: `https://app.example.com/token`
+- health: `https://app.example.com/healthz`
+- LiveKit: `wss://livekit.example.com`
 
 ## Схема baseline
 
@@ -118,20 +118,20 @@ flowchart LR
 
 Что важно:
 
-- frontend отдается по `https://vdremin.ru`
+- frontend отдается по `https://app.example.com`
 - token server наружу напрямую не нужен, frontend проксирует `/token`
 - browser получает secure context и может запрашивать микрофон без tunnel
-- signal идет через `wss://livekit.vdremin.ru`
+- signal идет через `wss://livekit.example.com`
 - media по-прежнему идет напрямую в LiveKit по UDP/TCP
 
 ## DNS
 
 Для этого baseline нужны две A-записи:
 
-- `vdremin.ru -> 193.39.168.244`
-- `livekit.vdremin.ru -> 193.39.168.244`
+- `app.example.com -> 203.0.113.10`
+- `livekit.example.com -> 203.0.113.10`
 
-`turn.vdremin.ru` пока не нужен.
+`turn.example.com` пока не нужен.
 
 ## Domain baseline на Ubuntu 24.04
 
@@ -139,12 +139,12 @@ flowchart LR
 
 ```env
 SERVER_TIMEZONE=Europe/Moscow
-SERVER_PUBLIC_IP=193.39.168.244
-APP_DOMAIN=vdremin.ru
-LIVEKIT_DOMAIN=livekit.vdremin.ru
+SERVER_PUBLIC_IP=203.0.113.10
+APP_DOMAIN=app.example.com
+LIVEKIT_DOMAIN=livekit.example.com
 LIVEKIT_API_KEY=voice-agent-prod
 LIVEKIT_API_SECRET=replace-with-long-random-secret
-LIVEKIT_URL_PUBLIC=wss://livekit.vdremin.ru
+LIVEKIT_URL_PUBLIC=wss://livekit.example.com
 LIVEKIT_USE_EXTERNAL_IP=true
 TOKEN_TTL_MINUTES=60
 CORS_ALLOW_ORIGINS=*
@@ -220,7 +220,7 @@ docker compose -f docker-compose.prod.yml -f docker-compose.gpu.yml up --build -
 
 ## Проверка
 
-1. Откройте `https://vdremin.ru`.
+1. Откройте `https://app.example.com`.
 2. Нажмите `Join`.
 3. Проверьте, что frontend подключился к комнате.
 4. Проверьте, что в participants виден `agent-001`.
@@ -320,7 +320,7 @@ STT_MODEL=/models/faster-whisper-small
 
 ```json
 {
-  "url": "wss://livekit.vdremin.ru",
+  "url": "wss://livekit.example.com",
   "token": "<jwt>",
   "room": "demo-room",
   "identity": "user-123"
