@@ -522,6 +522,15 @@
 
               if (event?.type === "agent_response_text") {
                 log(`agent response text: ${event.text}`);
+                if (event.llm_intent) {
+                  log(`llm intent: ${event.llm_intent}`);
+                }
+                if (Array.isArray(event.search_index) && event.search_index.length > 0) {
+                  log(`search index: ${event.search_index.join(" | ")}`);
+                }
+                if (event.next_step) {
+                  log(`next step: ${event.next_step}`);
+                }
                 return;
               }
 

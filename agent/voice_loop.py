@@ -143,6 +143,14 @@ class IntentResult:
     action: str
 
 
+@dataclass(slots=True)
+class LlmReply:
+    reply_tts: str
+    search_index: list[str]
+    intent: str
+    next_step: str
+
+
 class AgentEventBus:
     def __init__(self, room: rtc.Room, *, topic: str, log: Callable[[str], None]) -> None:
         self._room = room
@@ -217,6 +225,93 @@ class SessionLogger:
 
 
 class OpenAiLlmService:
+    _LOCAL_MANAGER_PROMPT = """Ты — Влад+имир, дежурный менеджер компании МосИнвестФинанс.
+Если спрашивают, живой ли ты, отвечай: да.
+
+Верни только один JSON-объект строго по схеме.
+Без markdown.
+Без комментариев.
+Без текста вне JSON.
+
+Правила ответа:
+- reply_tts: одна короткая реплика для клиента, готовая для Yandex SpeechKit;
+- search_index: массив из 1-5 коротких строк без дублей;
+- intent: короткий смысловой интент клиента;
+- next_step: один короткий следующий шаг менеджера;
+- если данных мало, всё равно верни валидный JSON по схеме.
+
+Твоя задача:
+- активно вести разговор, а не ждать;
+- выявить потребность клиента;
+- подобрать подходящий продукт;
+- продвинуть разговор на один шаг вперёд.
+
+Стиль:
+- говори коротко, живо, уверенно;
+- на «вы»;
+- одна реплика = одна мысль;
+- без канцелярита;
+- без длинных монологов;
+- не повторяй уже известное;
+- после ответа клиента либо коротко ответь по сути, либо задай один следующий вопрос.
+
+Старт звонка:
+- первую реплику начинай с мягкого, чуть протяжного "Алл+о";
+- после этого говори быстрее и естественнее;
+- если это первый заход, начинай так:
+  "Алл+о. Это Влад+имир, МосИнвестФинанс. Мы с вами созванивались на прошлой неделе по поводу кредита. Подскажите, пожалуйста, вопрос для вас ещё актуален?"
+- если разговор уже идёт, не повторяй стартовую реплику.
+
+Что делать в разговоре:
+- если клиент задал прямой вопрос, сначала ответь на него;
+- потом мягко верни разговор к цели звонка;
+- задай один следующий короткий вопрос;
+- если клиент отвечает общо, сам переводи разговор в конкретику;
+- если клиент говорит коротко, продолжай разговор сам;
+- если клиент возражает, коротко сними напряжение и веди дальше.
+
+Что нужно выяснить:
+- какая сумма нужна;
+- цель кредита;
+- насколько срочно нужны деньги;
+- есть ли недвижимость;
+- какой объект;
+- есть ли обременение;
+- в каком городе или регионе объект;
+- если недвижимости нет, есть ли автомобиль, ПТС или спецтехника;
+- если речь о текущих кредитах, подходит ли рефинансирование.
+
+Основные направления:
+- кредит под залог недвижимости;
+- кредит под залог автомобиля;
+- займ под залог ПТС;
+- кредит для ИП и ООО;
+- кредит под залог коммерческой недвижимости;
+- рефинансирование;
+- потребительский кредит без подтверждения дохода;
+- ипотека по двум документам.
+
+Ключевые факты:
+- по недвижимости сумма может быть до 70% от рыночной стоимости;
+- срок от 1 года до 25 лет;
+- ставка от 5% годовых;
+- официальное трудоустройство не требуется;
+- решение обычно за 1–2 дня после документов;
+- клиент остаётся собственником;
+- документы и оригиналы остаются у клиента.
+
+Ограничения:
+- не выдумывай продукты и условия;
+- не предлагай инвестиции, вклады, брокерские продукты и другие нерелевантные услуги;
+- не используй неправильные формы вроде "звОним" или "звонем";
+- правильно: "звоним", "я звоню", "мы звоним".
+
+TTS:
+- reply_tts должен быть сразу пригоден для Yandex SpeechKit;
+- TTS-разметку используй только если она реально нужна;
+- обязательно помогай с произношением: Влад+имир;
+- если нужно, размечай суммы, проценты, сроки, сложные названия и слово зал+ог."""
+
     def __init__(self, config: VoicePipelineConfig, log: Callable[[str], None]) -> None:
         self._config = config
         self._log = log
@@ -245,7 +340,7 @@ class OpenAiLlmService:
         *,
         normalized_text: str,
         history: list[dict[str, str]],
-    ) -> tuple[str, int]:
+    ) -> tuple[LlmReply, int]:
         if not self.enabled:
             raise RuntimeError("LLM is disabled by configuration")
 
@@ -265,20 +360,16 @@ class OpenAiLlmService:
             messages=[
                 {
                     "role": "system",
-                    "content": (
-                        "Ты голосовой помощник. Отвечай только по-русски коротко, естественно, без канцелярита. "
-                        "Ответ должен быть удобен для озвучивания: 1-2 коротких предложения. "
-                        "Не показывай размышления, рассуждения, служебные теги, XML, markdown, "
-                        "скрытые планы, chain-of-thought и текст в стиле <think>...</think>. "
-                        "Верни только финальный ответ для пользователя."
-                    ),
+                    "content": self._LOCAL_MANAGER_PROMPT,
                 },
                 {
                     "role": "user",
                     "content": (
-                        f"{history_block}\n"
-                        f"user_request: {normalized_text}\n"
-                        "Верни только текст ответа для голоса."
+                        "Схема JSON:\n"
+                        '{"reply_tts":"строка","search_index":["строка"],"intent":"строка","next_step":"строка"}\n\n'
+                        f"История диалога:\n{history_block}\n\n"
+                        f"Текущая реплика клиента:\n{normalized_text}\n\n"
+                        "Верни только один JSON-объект без пояснений."
                     ),
                 },
             ],
@@ -292,7 +383,13 @@ class OpenAiLlmService:
             )
         else:
             text = str(content)
-        return sanitize_voice_response(text, fallback="Уточните, пожалуйста, что именно вы хотите сделать."), latency_ms
+        return parse_llm_reply(
+            text,
+            fallback_reply=self._config.fallback_complex_text,
+            fallback_intent="complex_request",
+            fallback_next_step="уточнить потребность клиента",
+            fallback_search_seed=normalized_text,
+        ), latency_ms
 
 
 def sanitize_voice_response(text: str, *, fallback: str) -> str:
@@ -334,6 +431,102 @@ def sanitize_voice_response(text: str, *, fallback: str) -> str:
     sentences = re.split(r"(?<=[.!?])\s+", value)
     short_text = " ".join(sentence.strip() for sentence in sentences[:2] if sentence.strip()).strip()
     return short_text or fallback
+
+
+def extract_first_json_object(text: str) -> str:
+    value = text.strip()
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", value, flags=re.DOTALL | re.IGNORECASE)
+    if fence_match:
+        return fence_match.group(1)
+
+    start = value.find("{")
+    if start < 0:
+        return value
+
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(value)):
+        char = value[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return value[start : index + 1]
+
+    return value
+
+
+def dedupe_compact_strings(items: list[str], *, limit: int) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        value = re.sub(r"\s+", " ", item.strip())
+        if not value:
+            continue
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(value[:120])
+        if len(result) >= limit:
+            break
+    return result
+
+
+def parse_llm_reply(
+    raw_text: str,
+    *,
+    fallback_reply: str,
+    fallback_intent: str,
+    fallback_next_step: str,
+    fallback_search_seed: str,
+) -> LlmReply:
+    payload_text = extract_first_json_object(raw_text)
+    parsed: dict[str, Any] = {}
+    try:
+        maybe_parsed = json.loads(payload_text)
+        if isinstance(maybe_parsed, dict):
+            parsed = maybe_parsed
+    except Exception:
+        parsed = {}
+
+    reply_tts = sanitize_voice_response(str(parsed.get("reply_tts", "") or raw_text), fallback=fallback_reply)
+    intent = str(parsed.get("intent", "")).strip() or fallback_intent
+    next_step = str(parsed.get("next_step", "")).strip() or fallback_next_step
+
+    raw_search_index = parsed.get("search_index", [])
+    search_values: list[str] = []
+    if isinstance(raw_search_index, list):
+        search_values = [str(item) for item in raw_search_index]
+    elif isinstance(raw_search_index, str):
+        search_values = [raw_search_index]
+
+    if fallback_search_seed:
+        search_values.append(fallback_search_seed)
+
+    search_index = dedupe_compact_strings(search_values, limit=5)
+    if not search_index:
+        search_index = [fallback_intent]
+
+    return LlmReply(
+        reply_tts=reply_tts,
+        search_index=search_index,
+        intent=intent[:120],
+        next_step=next_step[:160],
+    )
 
 
 class SileroTtsService:
@@ -1012,6 +1205,7 @@ class ParticipantAudioSession:
         normalized_text = ""
         intent = IntentResult("clarify", 0.0, False, "ask_repeat")
         transcript = TranscriptResult("", self._config.stt_language, 0.0, duration_ms, 0)
+        llm_reply: LlmReply | None = None
         error_stage = ""
         response_published = False
         llm_latency_ms = 0
@@ -1064,10 +1258,11 @@ class ParticipantAudioSession:
                     await self._publish_status("complex_request_detected")
                     if self._llm_service.enabled:
                         try:
-                            response_text, llm_latency_ms = await self._llm_service.generate_response(
+                            llm_reply, llm_latency_ms = await self._llm_service.generate_response(
                                 normalized_text=normalized_text,
                                 history=self._history,
                             )
+                            response_text = llm_reply.reply_tts
                         except Exception as exc:
                             self._log(f"llm fallback failed for {self._participant.identity}: {exc}")
                             response_text = self._responses.choose(
@@ -1097,6 +1292,9 @@ class ParticipantAudioSession:
                     "participant_identity": self._participant.identity,
                     "text": response_text,
                     "use_llm": intent.use_llm,
+                    "llm_intent": llm_reply.intent if llm_reply else "",
+                    "search_index": llm_reply.search_index if llm_reply else [],
+                    "next_step": llm_reply.next_step if llm_reply else "",
                 },
                 destination_identities=[self._participant.identity],
             )
@@ -1143,6 +1341,9 @@ class ParticipantAudioSession:
                     "participant_identity": self._participant.identity,
                     "text": response_text,
                     "use_llm": False,
+                    "llm_intent": "",
+                    "search_index": [],
+                    "next_step": "",
                 },
                 destination_identities=[self._participant.identity],
             )
@@ -1157,6 +1358,9 @@ class ParticipantAudioSession:
                         "participant_identity": self._participant.identity,
                         "text": response_text,
                         "use_llm": intent.use_llm,
+                        "llm_intent": llm_reply.intent if llm_reply else "",
+                        "search_index": llm_reply.search_index if llm_reply else [],
+                        "next_step": llm_reply.next_step if llm_reply else "",
                     },
                     destination_identities=[self._participant.identity],
                 )
@@ -1182,6 +1386,9 @@ class ParticipantAudioSession:
                     "error_stage": error_stage,
                     "response_text": response_text,
                     "llm_latency_ms": llm_latency_ms,
+                    "llm_reply_intent": llm_reply.intent if llm_reply else "",
+                    "llm_reply_search_index": llm_reply.search_index if llm_reply else [],
+                    "llm_reply_next_step": llm_reply.next_step if llm_reply else "",
                     "tts_latency_ms": tts_latency_ms,
                 }
             )
