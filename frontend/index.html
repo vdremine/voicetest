@@ -207,6 +207,17 @@
         font-size: 13px;
       }
 
+      #remoteMedia {
+        position: fixed;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        opacity: 0;
+        pointer-events: none;
+        left: -9999px;
+        top: -9999px;
+      }
+
       @media (max-width: 840px) {
         body {
           padding: 16px;
@@ -278,7 +289,7 @@
         <div id="eventLog" class="log"></div>
       </section>
     </main>
-    <div id="remoteMedia" hidden></div>
+    <div id="remoteMedia"></div>
 
     <script>
       const roomInput = document.getElementById("roomName");
@@ -379,11 +390,14 @@
           remoteAudioElements.delete(key);
         }
 
-        const element = track.attach();
+        const element = document.createElement("audio");
         element.autoplay = true;
         element.playsInline = true;
         element.controls = false;
+        element.muted = false;
+        element.volume = 1;
         element.dataset.trackSid = publication.trackSid || publication.sid || "";
+        track.attach(element);
         remoteMedia.appendChild(element);
         remoteAudioElements.set(key, element);
         log(`remote audio attached: participant=${participant.identity}`);
