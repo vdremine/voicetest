@@ -25,7 +25,23 @@ def log(message: str) -> None:
 
 
 def is_audio_kind(kind: Any) -> bool:
-    return "audio" in str(kind).lower()
+    kind_text = str(kind).lower()
+    if "audio" in kind_text:
+        return True
+
+    kind_name = str(getattr(kind, "name", "")).lower()
+    if "audio" in kind_name:
+        return True
+
+    # LiveKit Python SDK may expose TrackKind as an enum-like integer where 1 == audio.
+    if kind == 1:
+        return True
+
+    track_kind_audio = getattr(getattr(rtc, "TrackKind", object()), "KIND_AUDIO", None)
+    if track_kind_audio is not None and kind == track_kind_audio:
+        return True
+
+    return False
 
 
 async def fetch_token() -> dict[str, Any]:
