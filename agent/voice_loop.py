@@ -52,6 +52,10 @@ class VoicePipelineConfig:
     llm_model: str
     llm_reasoning_effort: str
     llm_timeout_seconds: float
+    llm_base_url: str
+    llm_api_key: str
+    llm_temperature: float
+    llm_max_tokens: int
     tts_enabled: bool
     tts_model_path: Path
     tts_model_url: str
@@ -87,9 +91,13 @@ class VoicePipelineConfig:
             stt_beam_size=int(os.getenv("STT_BEAM_SIZE", "1")),
             stt_confidence_floor=float(os.getenv("STT_CONFIDENCE_FLOOR", "0.35")),
             llm_enabled=env_bool("LLM_ENABLED", True),
-            llm_model=os.getenv("LLM_MODEL", "gpt-5.2"),
+            llm_model=os.getenv("LLM_MODEL", "Qwen/Qwen3-8B"),
             llm_reasoning_effort=os.getenv("LLM_REASONING_EFFORT", "low"),
             llm_timeout_seconds=float(os.getenv("LLM_TIMEOUT_SECONDS", "15")),
+            llm_base_url=os.getenv("LLM_BASE_URL", "http://127.0.0.1:8001/v1").strip(),
+            llm_api_key=os.getenv("LLM_API_KEY", "local-token").strip(),
+            llm_temperature=float(os.getenv("LLM_TEMPERATURE", "0.2")),
+            llm_max_tokens=int(os.getenv("LLM_MAX_TOKENS", "96")),
             tts_enabled=env_bool("TTS_ENABLED", True),
             tts_model_path=Path(os.getenv("TTS_MODEL_PATH", "/models/silero-tts/ru/v5_4_ru.pt")),
             tts_model_url=os.getenv(
@@ -216,11 +224,20 @@ class OpenAiLlmService:
 
     @property
     def enabled(self) -> bool:
-        return self._config.llm_enabled and bool(os.getenv("OPENAI_API_KEY"))
+        return self._config.llm_enabled and bool(self._config.llm_model)
 
     def _ensure_client(self) -> AsyncOpenAI:
         if self._client is None:
-            self._client = AsyncOpenAI(timeout=self._config.llm_timeout_seconds)
+            kwargs: dict[str, Any] = {"timeout": self._config.llm_timeout_seconds}
+            if self._config.llm_base_url:
+                kwargs["base_url"] = self._config.llm_base_url
+                kwargs["api_key"] = self._config.llm_api_key or "local-token"
+            else:
+                api_key = os.getenv("OPENAI_API_KEY", "").strip()
+                if not api_key:
+                    raise RuntimeError("OPENAI_API_KEY is not configured")
+                kwargs["api_key"] = api_key
+            self._client = AsyncOpenAI(**kwargs)
         return self._client
 
     async def generate_response(
@@ -230,7 +247,7 @@ class OpenAiLlmService:
         history: list[dict[str, str]],
     ) -> tuple[str, int]:
         if not self.enabled:
-            raise RuntimeError("OPENAI_API_KEY is not configured")
+            raise RuntimeError("LLM is disabled by configuration")
 
         client = self._ensure_client()
         started_at = time.perf_counter()
@@ -241,21 +258,38 @@ class OpenAiLlmService:
         ]
         history_block = "\n".join(history_lines) if history_lines else "history: <empty>"
 
-        response = await client.responses.create(
+        completion = await client.chat.completions.create(
             model=self._config.llm_model,
-            reasoning={"effort": self._config.llm_reasoning_effort},
-            instructions=(
-                "Ты голосовой помощник. Отвечай по-русски коротко, естественно, без канцелярита. "
-                "Ответ должен быть удобен для озвучивания: 1-2 коротких предложения."
-            ),
-            input=(
-                f"{history_block}\n"
-                f"user_request: {normalized_text}\n"
-                "Верни только текст ответа для голоса."
-            ),
+            temperature=self._config.llm_temperature,
+            max_tokens=self._config.llm_max_tokens,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты голосовой помощник. Отвечай по-русски коротко, естественно, без канцелярита. "
+                        "Ответ должен быть удобен для озвучивания: 1-2 коротких предложения."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"{history_block}\n"
+                        f"user_request: {normalized_text}\n"
+                        "Верни только текст ответа для голоса."
+                    ),
+                },
+            ],
         )
         latency_ms = int((time.perf_counter() - started_at) * 1000)
-        return response.output_text.strip(), latency_ms
+        content = completion.choices[0].message.content or ""
+        if isinstance(content, list):
+            text = "".join(
+                part.get("text", "") if isinstance(part, dict) else getattr(part, "text", "")
+                for part in content
+            )
+        else:
+            text = str(content)
+        return text.strip(), latency_ms
 
 
 class SileroTtsService:
