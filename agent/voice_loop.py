@@ -269,6 +269,18 @@ class OpenAiLlmService:
 - если клиент отвечает общо, сам переводи разговор в конкретику;
 - если клиент говорит коротко, продолжай разговор сам;
 - если клиент возражает, коротко сними напряжение и веди дальше.
+- если клиент спрашивает "это кто", сразу коротко представься и напомни причину звонка;
+- если клиент жалуется на грубый прошлый разговор, коротко извинись, признай проблему и верни разговор к практическому решению;
+- если клиент исправил имя, один раз извинись и дальше используй только правильное имя;
+- если клиент говорит, что плохо слышит, повтори одну короткую фразу без длинного объяснения;
+- если клиент просит не сегодня, зафиксируй удобное окно и подтверди обратный звонок;
+- если клиент спрашивает, куда переводить или как оплатить, не придумывай реквизиты и не обещай детали, которых нет; переведи на персонального менеджера с согласованием времени.
+- если клиент жалуется на прошлый разговор или грубость сотрудника, сначала коротко извинись и зафиксируй, что передашь жалобу, потом вернись к решению вопроса;
+- если клиент говорит, что ему нужна отсрочка, перенос последнего платежа или порядок оплаты, не уводи разговор в новый кредит, а помоги довести до менеджера по платежам;
+- если клиент сказал, что у него нет недвижимости, машины, ПТС или официальной работы, не предлагай продукты под такой залог и не спорь с этим.
+- если клиент говорит, что его с кем-то перепутали, не спорь и не дави; уточни, как к нему обращаться, и актуален ли вопрос по кредиту вообще;
+- если клиент хочет взять деньги на покупку автомобиля, не предлагай залог ПТС, если у него ещё нет автомобиля;
+- если клиент сказал, что работает официально, а до этого распознавание ошиблось, коротко прими исправление и опирайся на новую информацию.
 
 Что нужно выяснить:
 - какая сумма нужна;
@@ -305,6 +317,10 @@ class OpenAiLlmService:
 - не предлагай инвестиции, вклады, брокерские продукты и другие нерелевантные услуги;
 - не используй неправильные формы вроде "звОним" или "звонем";
 - правильно: "звоним", "я звоню", "мы звоним".
+- не предлагай залог автомобиля, ПТС, спецтехнику или недвижимость, если клиент прямо сказал, что этого нет;
+- не предлагай ПТС, если клиент просит деньги именно на покупку автомобиля и ещё не владеет машиной;
+- не дави на новый кредит, если клиент говорит только про закрытие долга, отсрочку или порядок оплаты;
+- не озвучивай внутренние рассуждения, сводки разговора или пересказ в стиле "клиент сказал...".
 
 TTS:
 - reply_tts должен быть сразу пригоден для Yandex SpeechKit;
@@ -848,6 +864,36 @@ class SimpleIntentRouter:
         self._cancel = {"отмена", "отменить", "отбой"}
         self._repeat = {"повтори", "повтори пожалуйста", "еще раз", "ещё раз", "не понял"}
         self._wait = {"подожди", "секунду", "одну секунду"}
+        self._ready_to_talk = {"я слушаю", "слушаю вас", "говорите", "да слушаю", "слушаю", "удобно"}
+        self._identify = {"это кто", "кто это", "кто вы", "представьтесь"}
+        self._identity_mismatch_markers = {
+            "с кем то",
+            "с кем-то",
+            "перепутали",
+            "не меня",
+            "ошиблись номером",
+            "ошиблись",
+        }
+        self._line_issue = {"не слышу", "плохо слышно", "связь плохая", "вас не слышно"}
+        self._service_complaint_markers = {
+            "грубо",
+            "груб",
+            "жалоб",
+            "запись разговора",
+            "плохо пообщалась",
+            "нехорошая",
+            "девушка",
+        }
+        self._payment_help_markers = {
+            "куда переводить",
+            "куда перевести",
+            "как оплатить",
+            "порядок оплаты",
+            "куда мне",
+            "последний платеж",
+            "отсроч",
+            "перенос платеж",
+        }
         self._end_session = {"стоп", "завершить", "закончить"}
         self._handoff_tokens = {"оператор", "человек"}
 
@@ -857,6 +903,18 @@ class SimpleIntentRouter:
 
         if text in self._greeting or text.startswith(("привет", "здравствуйте", "добрый ", "алло", "ало")):
             return IntentResult("greeting", 0.99, False, "ack_greeting")
+        if text in self._ready_to_talk or text.startswith(("я слушаю", "слушаю вас", "говорите", "да слушаю")):
+            return IntentResult("ready_to_talk", 0.99, False, "continue_opening")
+        if text in self._identify or text.startswith(("это кто", "кто это", "кто вы", "представьтесь")):
+            return IntentResult("identify_self", 0.99, False, "introduce_self")
+        if any(marker in text for marker in self._identity_mismatch_markers):
+            return IntentResult("identity_mismatch", 0.95, False, "clarify_identity")
+        if text in self._line_issue or "не слышу" in text or "вас не слышно" in text:
+            return IntentResult("line_issue", 0.98, False, "repeat_last_agent_message")
+        if any(marker in text for marker in self._service_complaint_markers):
+            return IntentResult("service_complaint", 0.92, False, "ack_complaint_and_refocus")
+        if any(marker in text for marker in self._payment_help_markers):
+            return IntentResult("payment_help", 0.92, False, "handoff_payment_support")
         if text in self._confirm:
             return IntentResult("confirm", 0.99, False, "ack_confirm")
         if text in self._reject:
@@ -881,9 +939,50 @@ class CannedResponseEngine:
     def __init__(self, config: VoicePipelineConfig) -> None:
         self._config = config
 
+    @staticmethod
+    def _first_sentence(text: str | None) -> str:
+        value = (text or "").strip()
+        if not value:
+            return ""
+        parts = re.split(r"(?<=[.!?])\s+", value, maxsplit=1)
+        return parts[0].strip()
+
     def choose(self, intent: IntentResult, *, last_agent_message: str | None) -> str:
         if intent.intent == "greeting":
+            if not last_agent_message:
+                return (
+                    "Алл+о. Это Влад+имир, МосИнвестФинанс. "
+                    "Мы с вами созванивались по вопросу кредита. "
+                    "Подскажите, пожалуйста, вопрос для вас ещё актуален?"
+                )
             return "Добрый день. Слушаю вас."
+        if intent.intent == "ready_to_talk":
+            return (
+                "Это Влад+имир, МосИнвестФинанс. "
+                "Мы созванивались по вопросу кредита. "
+                "Подскажите, пожалуйста, вопрос для вас ещё актуален?"
+            )
+        if intent.intent == "identify_self":
+            return "Это Влад+имир, МосИнвестФинанс. Мы созванивались по вопросу кредита. Удобно сейчас говорить?"
+        if intent.intent == "identity_mismatch":
+            return (
+                "Понял вас. Давайте уточним. "
+                "Подскажите, пожалуйста, как к вам обращаться и вопрос по кредиту для вас вообще актуален?"
+            )
+        if intent.intent == "line_issue":
+            repeated = self._first_sentence(last_agent_message)
+            return repeated or "Повторю коротко. Подскажите, пожалуйста, удобно сейчас говорить?"
+        if intent.intent == "service_complaint":
+            return (
+                "Понял вас. Извините, пожалуйста, за этот разговор. "
+                "Я зафиксирую жалобу. "
+                "Подскажите, пожалуйста, вам сейчас важнее уточнить оплату или договориться о звонке менеджера?"
+            )
+        if intent.intent == "payment_help":
+            return (
+                "Понял вас. Реквизиты и точную сумму должен подтвердить персональный менеджер. "
+                "Подскажите, пожалуйста, вам удобнее, чтобы он связался сегодня или в другое время?"
+            )
         if intent.intent == "confirm":
             return "Хорошо."
         if intent.intent == "reject":
@@ -978,6 +1077,12 @@ class ParticipantAudioSession:
         self._speech_detected_published = False
         self._interrupt_speech_ms = 0
         self._barge_in_pending = False
+        self._resume_speech_ms = 0
+        self._turn_revision = 0
+        self._active_utterance_revision = 0
+        self._resume_buffer = np.empty(0, dtype=np.int16)
+        self._resume_probe_buffer = np.empty(0, dtype=np.int16)
+        self._resume_buffer_limit = self._config.sample_rate * 6
 
         self._chunk_ms = int(self._vad.window_size * 1000 / self._config.sample_rate)
         self._pad_chunks = max(1, math.ceil(self._config.vad_speech_pad_ms / self._chunk_ms))
@@ -1116,14 +1221,7 @@ class ParticipantAudioSession:
             return
 
         if self._is_processing:
-            if self._barge_in_pending:
-                if self._sample_buffer.size == 0:
-                    self._sample_buffer = samples
-                else:
-                    self._sample_buffer = np.concatenate((self._sample_buffer, samples))
-            else:
-                self._sample_buffer = np.empty(0, dtype=np.int16)
-                self._pre_speech_chunks.clear()
+            await self._handle_processing_samples(samples)
             return
 
         if self._sample_buffer.size == 0:
@@ -1136,36 +1234,73 @@ class ParticipantAudioSession:
             self._sample_buffer = self._sample_buffer[self._vad.window_size :]
             await self._process_vad_window(window)
 
-    async def _handle_barge_in_samples(self, samples: np.ndarray) -> None:
-        if self._sample_buffer.size == 0:
-            self._sample_buffer = samples
+    def _append_resume_samples(self, samples: np.ndarray) -> None:
+        if self._resume_buffer.size == 0:
+            self._resume_buffer = samples.copy()
         else:
-            self._sample_buffer = np.concatenate((self._sample_buffer, samples))
+            self._resume_buffer = np.concatenate((self._resume_buffer, samples))
+        if self._resume_buffer.size > self._resume_buffer_limit:
+            self._resume_buffer = self._resume_buffer[-self._resume_buffer_limit :]
 
-        while self._sample_buffer.size >= self._vad.window_size:
-            window = self._sample_buffer[: self._vad.window_size]
-            self._sample_buffer = self._sample_buffer[self._vad.window_size :]
+        if self._resume_probe_buffer.size == 0:
+            self._resume_probe_buffer = samples.copy()
+        else:
+            self._resume_probe_buffer = np.concatenate((self._resume_probe_buffer, samples))
+        if self._resume_probe_buffer.size > self._resume_buffer_limit:
+            self._resume_probe_buffer = self._resume_probe_buffer[-self._resume_buffer_limit :]
+
+    async def _detect_resumed_speech(self, *, speaking: bool) -> None:
+        while self._resume_probe_buffer.size >= self._vad.window_size:
+            window = self._resume_probe_buffer[: self._vad.window_size]
+            self._resume_probe_buffer = self._resume_probe_buffer[self._vad.window_size :]
             probability = self._vad.speech_probability(window)
             if probability >= self._config.vad_threshold:
-                self._interrupt_speech_ms += self._chunk_ms
+                if speaking:
+                    self._interrupt_speech_ms += self._chunk_ms
+                else:
+                    self._resume_speech_ms += self._chunk_ms
             else:
-                self._interrupt_speech_ms = 0
+                if speaking:
+                    self._interrupt_speech_ms = 0
+                else:
+                    self._resume_speech_ms = 0
 
-            if self._interrupt_speech_ms < self._config.vad_min_speech_duration_ms:
+            speech_ms = self._interrupt_speech_ms if speaking else self._resume_speech_ms
+            if speech_ms < self._config.vad_min_speech_duration_ms:
                 continue
 
-            self._log(
-                f"barge-in detected participant={self._participant.identity} "
-                f"vad_probability={probability:.3f}"
-            )
-            self._audio_publisher.interrupt_playback()
-            self._is_speaking = False
+            if not self._barge_in_pending:
+                self._turn_revision += 1
             self._barge_in_pending = True
             self._interrupt_speech_ms = 0
-            self._sample_buffer = np.empty(0, dtype=np.int16)
+            self._resume_speech_ms = 0
             self._reset_utterance_state()
             await self._publish_status("waiting_for_speech")
+
+            if speaking:
+                self._log(
+                    f"barge-in detected participant={self._participant.identity} "
+                    f"vad_probability={probability:.3f}"
+                )
+                self._audio_publisher.interrupt_playback()
+                self._is_speaking = False
+            else:
+                self._log(
+                    f"speech resumed during processing participant={self._participant.identity} "
+                    f"vad_probability={probability:.3f}"
+                )
             return
+
+    async def _handle_barge_in_samples(self, samples: np.ndarray) -> None:
+        self._append_resume_samples(samples)
+        await self._detect_resumed_speech(speaking=True)
+
+    async def _handle_processing_samples(self, samples: np.ndarray) -> None:
+        self._append_resume_samples(samples)
+        await self._detect_resumed_speech(speaking=False)
+
+    def _is_stale_turn(self, turn_revision: int) -> bool:
+        return turn_revision != self._turn_revision
 
     def _append_pre_speech(self, chunk: np.ndarray) -> None:
         self._pre_speech_chunks.append(chunk.copy())
@@ -1181,6 +1316,8 @@ class ParticipantAudioSession:
             if not is_speech:
                 return
 
+            self._turn_revision += 1
+            self._active_utterance_revision = self._turn_revision
             self._utterance_counter += 1
             self._active_utterance_id = f"utt-{self._utterance_counter:04d}"
             self._speech_started_at_ms = int(time.time() * 1000)
@@ -1266,6 +1403,7 @@ class ParticipantAudioSession:
                 vad_confidence=vad_confidence,
                 speech_start_time_ms=self._speech_started_at_ms,
                 speech_end_time_ms=speech_end_time_ms,
+                turn_revision=self._active_utterance_revision,
             )
         )
 
@@ -1276,6 +1414,7 @@ class ParticipantAudioSession:
         self._speech_ms = 0
         self._silence_ms = 0
         self._interrupt_speech_ms = 0
+        self._resume_speech_ms = 0
         self._active_utterance_id = None
         self._speech_detected_published = False
         self._pre_speech_chunks.clear()
@@ -1297,6 +1436,7 @@ class ParticipantAudioSession:
         vad_confidence: float,
         speech_start_time_ms: int,
         speech_end_time_ms: int,
+        turn_revision: int,
     ) -> None:
         await self._publish_status("stt_processing")
         started_at = time.perf_counter()
@@ -1340,6 +1480,14 @@ class ParticipantAudioSession:
                 self._log(
                     f"ignored low-information transcript participant={self._participant.identity} "
                     f"utterance_id={utterance_id} text={transcript.text!r}"
+                )
+                return
+            if self._is_stale_turn(turn_revision):
+                suppress_response = True
+                error_stage = "superseded_turn"
+                self._log(
+                    f"skipped stale utterance before routing participant={self._participant.identity} "
+                    f"utterance_id={utterance_id}"
                 )
                 return
 
@@ -1391,6 +1539,15 @@ class ParticipantAudioSession:
                         last_agent_message=self._last_agent_message,
                     )
 
+            if self._is_stale_turn(turn_revision):
+                suppress_response = True
+                error_stage = "superseded_turn"
+                self._log(
+                    f"skipped stale utterance after routing participant={self._participant.identity} "
+                    f"utterance_id={utterance_id}"
+                )
+                return
+
             self._last_agent_message = response_text
             self._history.append({"role": "assistant", "text": response_text})
             self._history = self._history[-12:]
@@ -1410,6 +1567,14 @@ class ParticipantAudioSession:
             )
             response_published = True
             if self._config.tts_enabled:
+                if self._is_stale_turn(turn_revision):
+                    suppress_response = True
+                    error_stage = "superseded_turn"
+                    self._log(
+                        f"skipped stale utterance before tts participant={self._participant.identity} "
+                        f"utterance_id={utterance_id}"
+                    )
+                    return
                 await self._publish_status("speaking")
                 self._is_speaking = True
                 self._log(
@@ -1513,6 +1678,11 @@ class ParticipantAudioSession:
             self._barge_in_pending = False
             await self._publish_status("waiting_for_speech")
             if had_barge_in_pending:
+                if self._resume_buffer.size:
+                    if self._sample_buffer.size == 0:
+                        self._sample_buffer = self._resume_buffer.copy()
+                    else:
+                        self._sample_buffer = np.concatenate((self._resume_buffer, self._sample_buffer))
                 while (
                     not self._is_processing
                     and not self._is_speaking
@@ -1521,6 +1691,9 @@ class ParticipantAudioSession:
                     window = self._sample_buffer[: self._vad.window_size]
                     self._sample_buffer = self._sample_buffer[self._vad.window_size :]
                     await self._process_vad_window(window)
+            self._resume_buffer = np.empty(0, dtype=np.int16)
+            self._resume_probe_buffer = np.empty(0, dtype=np.int16)
+            self._resume_speech_ms = 0
 
 
 class VoiceSessionManager:
