@@ -87,9 +87,21 @@ services:
       STT_LANGUAGE: ${STT_LANGUAGE:-ru}
       STT_BEAM_SIZE: ${STT_BEAM_SIZE:-1}
       STT_CONFIDENCE_FLOOR: ${STT_CONFIDENCE_FLOOR:-0.35}
+      LLM_ENABLED: ${LLM_ENABLED:-true}
+      LLM_MODEL: ${LLM_MODEL:-gpt-5.2}
+      LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-low}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-15}
+      TTS_ENABLED: ${TTS_ENABLED:-true}
+      TTS_MODEL_PATH: ${TTS_MODEL_PATH:-/models/silero-tts/ru/v5_4_ru.pt}
+      TTS_MODEL_URL: ${TTS_MODEL_URL:-https://models.silero.ai/models/tts/ru/v5_4_ru.pt}
+      TTS_SPEAKER: ${TTS_SPEAKER:-xenia}
+      TTS_SAMPLE_RATE: ${TTS_SAMPLE_RATE:-24000}
+      TTS_PUBLISH_SAMPLE_RATE: ${TTS_PUBLISH_SAMPLE_RATE:-24000}
+      TTS_FRAME_MS: ${TTS_FRAME_MS:-20}
       UTTERANCE_DIR: /tmp/voice-agent/utterances
       SESSION_LOG_DIR: /tmp/voice-agent/session-logs
       HF_HOME: /models/.cache/huggingface
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     volumes:
       - ${MODEL_CACHE_DIR:-/opt/models}:/models
       - ${VOICE_AGENT_DATA_DIR:-/opt/voice-agent-data}:/tmp/voice-agent

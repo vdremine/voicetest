@@ -7,7 +7,14 @@ from urllib.parse import urlencode
 import httpx
 from livekit import rtc
 
-from voice_loop import AgentEventBus, VoicePipelineConfig, VoiceSessionManager
+from voice_loop import (
+    AgentEventBus,
+    LiveKitAudioPublisher,
+    OpenAiLlmService,
+    SileroTtsService,
+    VoicePipelineConfig,
+    VoiceSessionManager,
+)
 
 
 TOKEN_SERVER_URL = os.getenv("TOKEN_SERVER_URL", "http://token_server:8000/token")
@@ -109,10 +116,16 @@ async def run() -> None:
     room = rtc.Room()
     pipeline_config = VoicePipelineConfig.from_env()
     event_bus = AgentEventBus(room, topic=pipeline_config.events_topic, log=log)
+    llm_service = OpenAiLlmService(pipeline_config, log)
+    tts_service = SileroTtsService(pipeline_config, log)
+    audio_publisher = LiveKitAudioPublisher(room, pipeline_config, log)
     voice_sessions = VoiceSessionManager(
         room=room,
         config=pipeline_config,
         event_bus=event_bus,
+        llm_service=llm_service,
+        tts_service=tts_service,
+        audio_publisher=audio_publisher,
         log=log,
     )
 
@@ -252,6 +265,12 @@ async def run() -> None:
         except Exception as exc:
             log(f"room connect failed, retrying in {CONNECT_RETRY_DELAY}s: {exc}")
             await asyncio.sleep(CONNECT_RETRY_DELAY)
+
+    if pipeline_config.tts_enabled:
+        try:
+            await audio_publisher.ensure_published()
+        except Exception as exc:
+            log(f"failed to publish local audio track for agent voice: {exc}")
 
     await publish_ready(room)
 

@@ -278,6 +278,7 @@
         <div id="eventLog" class="log"></div>
       </section>
     </main>
+    <div id="remoteMedia" hidden></div>
 
     <script>
       const roomInput = document.getElementById("roomName");
@@ -286,6 +287,7 @@
       const leaveBtn = document.getElementById("leaveBtn");
       const micBtn = document.getElementById("micBtn");
       const eventLog = document.getElementById("eventLog");
+      const remoteMedia = document.getElementById("remoteMedia");
       const participantsList = document.getElementById("participants");
       const statusBadge = document.getElementById("statusBadge");
       const agentBadge = document.getElementById("agentBadge");
@@ -298,6 +300,7 @@
 
       let currentRoom = null;
       let micEnabled = false;
+      const remoteAudioElements = new Map();
 
       identityInput.value = `user-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -350,6 +353,10 @@
       }
 
       function resetUi() {
+        for (const element of remoteAudioElements.values()) {
+          element.remove();
+        }
+        remoteAudioElements.clear();
         currentRoom = null;
         micEnabled = false;
         setAgentStatus("-");
@@ -358,6 +365,35 @@
         setButtons({ joined: false });
         setMicButton();
         renderParticipants();
+      }
+
+      function attachRemoteTrack(track, publication, participant) {
+        if (track.kind !== "audio") {
+          return;
+        }
+
+        const element = track.attach();
+        element.autoplay = true;
+        element.playsInline = true;
+        element.dataset.trackSid = publication.trackSid || publication.sid || "";
+        remoteMedia.appendChild(element);
+        remoteAudioElements.set(publication.trackSid || publication.sid || participant.identity, element);
+        log(`remote audio attached: participant=${participant.identity}`);
+      }
+
+      function detachRemoteTrack(track, publication, participant) {
+        if (track.kind !== "audio") {
+          return;
+        }
+
+        const key = publication.trackSid || publication.sid || participant.identity;
+        const element = remoteAudioElements.get(key);
+        track.detach();
+        if (element) {
+          element.remove();
+          remoteAudioElements.delete(key);
+        }
+        log(`remote audio detached: participant=${participant.identity}`);
       }
 
       function attachRoomHandlers(room) {
@@ -383,6 +419,14 @@
           .on(RoomEvent.ParticipantDisconnected, (participant) => {
             log(`participant disconnected: ${participant.identity}`);
             renderParticipants();
+          })
+          .on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
+            log(`remote track subscribed: participant=${participant.identity} kind=${track.kind}`);
+            attachRemoteTrack(track, publication, participant);
+          })
+          .on(RoomEvent.TrackUnsubscribed, (track, publication, participant) => {
+            log(`remote track unsubscribed: participant=${participant.identity} kind=${track.kind}`);
+            detachRemoteTrack(track, publication, participant);
           })
           .on(RoomEvent.DataReceived, (payload, participant, kind, topic) => {
             const text = decoder.decode(payload);

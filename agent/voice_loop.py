@@ -18,6 +18,7 @@ import numpy as np
 import torch
 from faster_whisper import WhisperModel
 from livekit import rtc
+from openai import AsyncOpenAI
 from silero_vad import load_silero_vad
 
 
@@ -47,6 +48,17 @@ class VoicePipelineConfig:
     stt_language: str
     stt_beam_size: int
     stt_confidence_floor: float
+    llm_enabled: bool
+    llm_model: str
+    llm_reasoning_effort: str
+    llm_timeout_seconds: float
+    tts_enabled: bool
+    tts_model_path: Path
+    tts_model_url: str
+    tts_speaker: str
+    tts_sample_rate: int
+    tts_publish_sample_rate: int
+    tts_frame_ms: int
     utterance_dir: Path
     session_log_dir: Path
     events_topic: str
@@ -74,6 +86,20 @@ class VoicePipelineConfig:
             stt_language=os.getenv("STT_LANGUAGE", "ru"),
             stt_beam_size=int(os.getenv("STT_BEAM_SIZE", "1")),
             stt_confidence_floor=float(os.getenv("STT_CONFIDENCE_FLOOR", "0.35")),
+            llm_enabled=env_bool("LLM_ENABLED", True),
+            llm_model=os.getenv("LLM_MODEL", "gpt-5.2"),
+            llm_reasoning_effort=os.getenv("LLM_REASONING_EFFORT", "low"),
+            llm_timeout_seconds=float(os.getenv("LLM_TIMEOUT_SECONDS", "15")),
+            tts_enabled=env_bool("TTS_ENABLED", True),
+            tts_model_path=Path(os.getenv("TTS_MODEL_PATH", "/models/silero-tts/ru/v5_4_ru.pt")),
+            tts_model_url=os.getenv(
+                "TTS_MODEL_URL",
+                "https://models.silero.ai/models/tts/ru/v5_4_ru.pt",
+            ),
+            tts_speaker=os.getenv("TTS_SPEAKER", "xenia"),
+            tts_sample_rate=int(os.getenv("TTS_SAMPLE_RATE", "24000")),
+            tts_publish_sample_rate=int(os.getenv("TTS_PUBLISH_SAMPLE_RATE", "24000")),
+            tts_frame_ms=int(os.getenv("TTS_FRAME_MS", "20")),
             utterance_dir=Path(os.getenv("UTTERANCE_DIR", "/tmp/voice-agent/utterances")),
             session_log_dir=Path(os.getenv("SESSION_LOG_DIR", "/tmp/voice-agent/session-logs")),
             events_topic=os.getenv("AGENT_EVENTS_TOPIC", "agent_events"),
@@ -180,6 +206,189 @@ class SessionLogger:
     def write(self, payload: dict[str, Any]) -> None:
         with self._log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+class OpenAiLlmService:
+    def __init__(self, config: VoicePipelineConfig, log: Callable[[str], None]) -> None:
+        self._config = config
+        self._log = log
+        self._client: AsyncOpenAI | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self._config.llm_enabled and bool(os.getenv("OPENAI_API_KEY"))
+
+    def _ensure_client(self) -> AsyncOpenAI:
+        if self._client is None:
+            self._client = AsyncOpenAI(timeout=self._config.llm_timeout_seconds)
+        return self._client
+
+    async def generate_response(
+        self,
+        *,
+        normalized_text: str,
+        history: list[dict[str, str]],
+    ) -> tuple[str, int]:
+        if not self.enabled:
+            raise RuntimeError("OPENAI_API_KEY is not configured")
+
+        client = self._ensure_client()
+        started_at = time.perf_counter()
+        history_lines = [
+            f"{item['role']}: {item['text']}"
+            for item in history[-8:]
+            if item.get("text")
+        ]
+        history_block = "\n".join(history_lines) if history_lines else "history: <empty>"
+
+        response = await client.responses.create(
+            model=self._config.llm_model,
+            reasoning={"effort": self._config.llm_reasoning_effort},
+            instructions=(
+                "Ты голосовой помощник. Отвечай по-русски коротко, естественно, без канцелярита. "
+                "Ответ должен быть удобен для озвучивания: 1-2 коротких предложения."
+            ),
+            input=(
+                f"{history_block}\n"
+                f"user_request: {normalized_text}\n"
+                "Верни только текст ответа для голоса."
+            ),
+        )
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        return response.output_text.strip(), latency_ms
+
+
+class SileroTtsService:
+    def __init__(self, config: VoicePipelineConfig, log: Callable[[str], None]) -> None:
+        self._config = config
+        self._log = log
+        self._lock = threading.Lock()
+        self._model: Any | None = None
+
+    def _ensure_model(self) -> Any:
+        if self._model is not None:
+            return self._model
+
+        self._config.tts_model_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self._config.tts_model_path.is_file():
+            self._log(f"downloading silero tts model to {self._config.tts_model_path}")
+            torch.hub.download_url_to_file(self._config.tts_model_url, str(self._config.tts_model_path))
+
+        model = torch.package.PackageImporter(str(self._config.tts_model_path)).load_pickle(
+            "tts_models",
+            "model",
+        )
+        model.to(torch.device("cpu"))
+        self._model = model
+        self._log(
+            f"initialized silero tts model={self._config.tts_model_path} speaker={self._config.tts_speaker}"
+        )
+        return self._model
+
+    def synthesize(self, text: str) -> tuple[np.ndarray, int, int]:
+        started_at = time.perf_counter()
+        with self._lock:
+            model = self._ensure_model()
+            audio = model.apply_tts(
+                text=text,
+                speaker=self._config.tts_speaker,
+                sample_rate=self._config.tts_sample_rate,
+            )
+
+        if isinstance(audio, torch.Tensor):
+            audio_np = audio.detach().cpu().numpy()
+        else:
+            audio_np = np.asarray(audio)
+
+        audio_np = np.clip(audio_np, -1.0, 1.0)
+        pcm16 = (audio_np * 32767.0).astype(np.int16)
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        return pcm16, self._config.tts_sample_rate, latency_ms
+
+
+class LiveKitAudioPublisher:
+    def __init__(self, room: rtc.Room, config: VoicePipelineConfig, log: Callable[[str], None]) -> None:
+        self._room = room
+        self._config = config
+        self._log = log
+        self._source: rtc.AudioSource | None = None
+        self._track: rtc.LocalAudioTrack | None = None
+        self._published = False
+        self._lock = asyncio.Lock()
+
+    async def ensure_published(self) -> None:
+        if self._published:
+            return
+
+        async with self._lock:
+            if self._published:
+                return
+
+            self._source = rtc.AudioSource(
+                self._config.tts_publish_sample_rate,
+                self._config.num_channels,
+                queue_size_ms=1000,
+            )
+            self._track = rtc.LocalAudioTrack.create_audio_track("agent-voice", self._source)
+
+            options = None
+            try:
+                options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
+            except Exception:
+                options = None
+
+            if options is not None:
+                await self._room.local_participant.publish_track(self._track, options)
+            else:
+                await self._room.local_participant.publish_track(self._track)
+
+            self._published = True
+            self._log("published local audio track for agent voice")
+
+    async def speak_pcm(self, pcm16: np.ndarray, sample_rate: int) -> None:
+        await self.ensure_published()
+        assert self._source is not None
+
+        target = pcm16
+        if sample_rate != self._config.tts_publish_sample_rate:
+            target = self._resample(
+                pcm16,
+                orig_rate=sample_rate,
+                target_rate=self._config.tts_publish_sample_rate,
+            )
+
+        samples_per_channel = int(self._config.tts_publish_sample_rate * self._config.tts_frame_ms / 1000)
+        if samples_per_channel <= 0:
+            samples_per_channel = 480
+
+        cursor = 0
+        while cursor < len(target):
+            chunk = target[cursor : cursor + samples_per_channel]
+            if len(chunk) < samples_per_channel:
+                chunk = np.pad(chunk, (0, samples_per_channel - len(chunk)))
+
+            frame = rtc.AudioFrame(
+                data=memoryview(chunk.tobytes()),
+                sample_rate=self._config.tts_publish_sample_rate,
+                num_channels=self._config.num_channels,
+                samples_per_channel=samples_per_channel,
+            )
+            await self._source.capture_frame(frame)
+            cursor += samples_per_channel
+
+        await self._source.wait_for_playout()
+
+    @staticmethod
+    def _resample(pcm16: np.ndarray, *, orig_rate: int, target_rate: int) -> np.ndarray:
+        if orig_rate == target_rate or len(pcm16) == 0:
+            return pcm16
+
+        duration = len(pcm16) / float(orig_rate)
+        target_len = max(1, int(round(duration * target_rate)))
+        source_x = np.linspace(0.0, 1.0, num=len(pcm16), endpoint=False)
+        target_x = np.linspace(0.0, 1.0, num=target_len, endpoint=False)
+        resampled = np.interp(target_x, source_x, pcm16.astype(np.float32))
+        return np.clip(resampled, -32768.0, 32767.0).astype(np.int16)
 
 
 class WhisperSttService:
@@ -384,6 +593,9 @@ class ParticipantAudioSession:
         config: VoicePipelineConfig,
         event_bus: AgentEventBus,
         stt_service: WhisperSttService,
+        llm_service: OpenAiLlmService,
+        tts_service: SileroTtsService,
+        audio_publisher: LiveKitAudioPublisher,
         log: Callable[[str], None],
     ) -> None:
         self._room = room
@@ -391,6 +603,9 @@ class ParticipantAudioSession:
         self._config = config
         self._event_bus = event_bus
         self._stt_service = stt_service
+        self._llm_service = llm_service
+        self._tts_service = tts_service
+        self._audio_publisher = audio_publisher
         self._log = log
 
         self._normalizer = TranscriptNormalizer()
@@ -413,6 +628,9 @@ class ParticipantAudioSession:
         self._active_utterance_id: str | None = None
         self._utterance_counter = 0
         self._last_agent_message: str | None = None
+        self._history: list[dict[str, str]] = []
+        self._is_speaking = False
+        self._is_processing = False
         self._state = "agent_ready"
         self._speech_started_at_ms = 0
         self._speech_detected_published = False
@@ -466,6 +684,7 @@ class ParticipantAudioSession:
             "routing_intent": "thinking",
             "simple_intent_detected": "thinking",
             "complex_request_detected": "thinking",
+            "speaking": "speaking",
             "error": "error",
         }.get(state, state)
         await self._event_bus.publish_status(
@@ -544,6 +763,11 @@ class ParticipantAudioSession:
                         await result
 
     async def _push_frame(self, frame: rtc.AudioFrame) -> None:
+        if self._is_speaking or self._is_processing:
+            self._sample_buffer = np.empty(0, dtype=np.int16)
+            self._pre_speech_chunks.clear()
+            return
+
         samples = np.array(frame.data, dtype=np.int16, copy=True)
         if frame.num_channels > 1:
             samples = samples.reshape(-1, frame.num_channels).mean(axis=1).astype(np.int16)
@@ -690,12 +914,15 @@ class ParticipantAudioSession:
     ) -> None:
         await self._publish_status("stt_processing")
         started_at = time.perf_counter()
+        self._is_processing = True
         response_text = self._config.fallback_low_confidence_text
         normalized_text = ""
         intent = IntentResult("clarify", 0.0, False, "ask_repeat")
         transcript = TranscriptResult("", self._config.stt_language, 0.0, duration_ms, 0)
         error_stage = ""
         response_published = False
+        llm_latency_ms = 0
+        tts_latency_ms = 0
 
         try:
             if not self._config.stt_enabled:
@@ -719,6 +946,9 @@ class ParticipantAudioSession:
             )
 
             normalized_text = self._normalizer.normalize(transcript.text)
+            if transcript.text:
+                self._history.append({"role": "user", "text": normalized_text or transcript.text})
+                self._history = self._history[-12:]
             await self._publish_status("routing_intent")
             intent = self._router.route(normalized_text)
             await self._event_bus.publish_json(
@@ -737,12 +967,35 @@ class ParticipantAudioSession:
             if not transcript.text or transcript.confidence < self._config.stt_confidence_floor:
                 response_text = self._config.fallback_low_confidence_text
             else:
-                await self._publish_status(
-                    "complex_request_detected" if intent.use_llm else "simple_intent_detected"
-                )
-                response_text = self._responses.choose(intent, last_agent_message=self._last_agent_message)
+                if intent.use_llm:
+                    await self._publish_status("complex_request_detected")
+                    if self._llm_service.enabled:
+                        try:
+                            response_text, llm_latency_ms = await self._llm_service.generate_response(
+                                normalized_text=normalized_text,
+                                history=self._history,
+                            )
+                        except Exception as exc:
+                            self._log(f"llm fallback failed for {self._participant.identity}: {exc}")
+                            response_text = self._responses.choose(
+                                intent,
+                                last_agent_message=self._last_agent_message,
+                            )
+                    else:
+                        response_text = self._responses.choose(
+                            intent,
+                            last_agent_message=self._last_agent_message,
+                        )
+                else:
+                    await self._publish_status("simple_intent_detected")
+                    response_text = self._responses.choose(
+                        intent,
+                        last_agent_message=self._last_agent_message,
+                    )
 
             self._last_agent_message = response_text
+            self._history.append({"role": "assistant", "text": response_text})
+            self._history = self._history[-12:]
 
             await self._event_bus.publish_json(
                 {
@@ -755,6 +1008,14 @@ class ParticipantAudioSession:
                 destination_identities=[self._participant.identity],
             )
             response_published = True
+            if self._config.tts_enabled:
+                await self._publish_status("speaking")
+                self._is_speaking = True
+                tts_pcm16, tts_sample_rate, tts_latency_ms = await asyncio.to_thread(
+                    self._tts_service.synthesize,
+                    response_text,
+                )
+                await self._audio_publisher.speak_pcm(tts_pcm16, tts_sample_rate)
         except Exception as exc:
             error_stage = "stt"
             self._log(f"utterance processing failed participant={self._participant.identity}: {exc}")
@@ -808,13 +1069,15 @@ class ParticipantAudioSession:
                     "use_llm": intent.use_llm,
                     "stt_latency_ms": transcript.stt_latency_ms,
                     "router_latency_ms": 0,
-                    "llm_latency_ms": 0,
-                    "tts_latency_ms": 0,
                     "total_latency_ms": total_latency_ms,
                     "error_stage": error_stage,
                     "response_text": response_text,
+                    "llm_latency_ms": llm_latency_ms,
+                    "tts_latency_ms": tts_latency_ms,
                 }
             )
+            self._is_speaking = False
+            self._is_processing = False
             await self._publish_status("waiting_for_speech")
 
 
@@ -825,11 +1088,17 @@ class VoiceSessionManager:
         room: rtc.Room,
         config: VoicePipelineConfig,
         event_bus: AgentEventBus,
+        llm_service: OpenAiLlmService,
+        tts_service: SileroTtsService,
+        audio_publisher: LiveKitAudioPublisher,
         log: Callable[[str], None],
     ) -> None:
         self._room = room
         self._config = config
         self._event_bus = event_bus
+        self._llm_service = llm_service
+        self._tts_service = tts_service
+        self._audio_publisher = audio_publisher
         self._log = log
         self._stt = WhisperSttService(config, log)
         self._sessions: dict[str, ParticipantAudioSession] = {}
@@ -848,6 +1117,9 @@ class VoiceSessionManager:
                 config=self._config,
                 event_bus=self._event_bus,
                 stt_service=self._stt,
+                llm_service=self._llm_service,
+                tts_service=self._tts_service,
+                audio_publisher=self._audio_publisher,
                 log=self._log,
             )
             self._sessions[participant.identity] = session
