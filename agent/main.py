@@ -7,6 +7,8 @@ from urllib.parse import urlencode
 import httpx
 from livekit import rtc
 
+from voice_loop import AgentEventBus, VoicePipelineConfig, VoiceSessionManager
+
 
 TOKEN_SERVER_URL = os.getenv("TOKEN_SERVER_URL", "http://token_server:8000/token")
 LIVEKIT_URL_INTERNAL = os.getenv("LIVEKIT_URL_INTERNAL", "ws://livekit:7880")
@@ -15,6 +17,7 @@ AGENT_IDENTITY = os.getenv("AGENT_IDENTITY", "agent-001")
 AGENT_NAME = os.getenv("AGENT_NAME", "Room Agent")
 AGENT_READY_TOPIC = os.getenv("AGENT_READY_TOPIC", "presence")
 TOKEN_REQUEST_TIMEOUT = float(os.getenv("TOKEN_REQUEST_TIMEOUT", "10"))
+CONNECT_RETRY_DELAY = float(os.getenv("CONNECT_RETRY_DELAY", "2"))
 
 
 def log(message: str) -> None:
@@ -87,6 +90,14 @@ def ensure_audio_subscription(publication: rtc.RemoteTrackPublication, participa
 async def run() -> None:
     stop_event = asyncio.Event()
     room = rtc.Room()
+    pipeline_config = VoicePipelineConfig.from_env()
+    event_bus = AgentEventBus(room, topic=pipeline_config.events_topic, log=log)
+    voice_sessions = VoiceSessionManager(
+        room=room,
+        config=pipeline_config,
+        event_bus=event_bus,
+        log=log,
+    )
 
     @room.on("participant_connected")
     def on_participant_connected(participant: rtc.RemoteParticipant) -> None:
@@ -98,10 +109,19 @@ async def run() -> None:
     def on_participant_active(participant: rtc.RemoteParticipant) -> None:
         log(f"participant active: {participant.identity}")
         asyncio.create_task(publish_ready(room, [participant.identity]))
+        asyncio.create_task(
+            event_bus.publish_status(
+                "agent_ready",
+                participant_identity=participant.identity,
+                status="ready",
+                destination_identities=[participant.identity],
+            )
+        )
 
     @room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant) -> None:
         log(f"participant disconnected: {participant.identity}")
+        asyncio.create_task(voice_sessions.participant_disconnected(participant.identity))
 
     @room.on("data_received")
     def on_data_received(data_packet: rtc.DataPacket) -> None:
@@ -128,15 +148,18 @@ async def run() -> None:
             "track subscribed: "
             f"participant={participant.identity} track={publication.sid} kind={publication.kind}"
         )
-        if is_audio_kind(publication.kind):
-            asyncio.create_task(
-                publish_agent_event(
-                    room,
-                    payload=f"user_audio_track_detected:{participant.identity}",
-                    topic="agent_status",
-                    destination_identities=[participant.identity],
-                )
+        if not is_audio_kind(publication.kind):
+            return
+
+        asyncio.create_task(
+            publish_agent_event(
+                room,
+                payload=f"user_audio_track_detected:{participant.identity}",
+                topic="agent_status",
+                destination_identities=[participant.identity],
             )
+        )
+        asyncio.create_task(voice_sessions.start_audio_track(track=track, participant=participant))
 
     @room.on("track_unsubscribed")
     def on_track_unsubscribed(
@@ -179,21 +202,37 @@ async def run() -> None:
     token = token_payload["token"]
     livekit_url = LIVEKIT_URL_INTERNAL or token_payload.get("url")
 
-    log(f"connecting to room={AGENT_ROOM} as identity={AGENT_IDENTITY}")
-    await room.connect(livekit_url, token)
-    log(f"connected to livekit room={room.name}")
+    while True:
+        try:
+            log(f"connecting to room={AGENT_ROOM} as identity={AGENT_IDENTITY}")
+            await room.connect(livekit_url, token)
+            log(f"connected to livekit room={room.name}")
+            break
+        except Exception as exc:
+            log(f"room connect failed, retrying in {CONNECT_RETRY_DELAY}s: {exc}")
+            await asyncio.sleep(CONNECT_RETRY_DELAY)
 
     await publish_ready(room)
 
     if room.remote_participants:
         for participant in room.remote_participants.values():
             await publish_ready(room, [participant.identity])
+            await event_bus.publish_status(
+                "agent_ready",
+                participant_identity=participant.identity,
+                status="ready",
+                destination_identities=[participant.identity],
+            )
             for publication in participant.track_publications.values():
                 ensure_audio_subscription(publication, participant)
+                track = getattr(publication, "track", None)
+                if track is not None and is_audio_kind(publication.kind):
+                    await voice_sessions.start_audio_track(track=track, participant=participant)
 
     await stop_event.wait()
 
     log("shutting down")
+    await voice_sessions.aclose()
     await room.disconnect()
 
 

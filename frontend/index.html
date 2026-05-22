@@ -252,13 +252,15 @@
 
             <div class="statusbar">
               <div id="statusBadge" class="badge">idle</div>
+              <div id="agentBadge" class="badge">agent: -</div>
               <div id="roomBadge" class="badge">room: -</div>
               <div id="serverBadge" class="badge">server: -</div>
             </div>
 
             <div class="hint">
-              Expected signal for stage one: successful join, visible `agent-001`, and incoming
-              `agent_ready` in the event log.
+              Transport baseline: successful join, visible `agent-001`, incoming `agent_ready`.
+              AI loop baseline: after `Mic On`, expect `speech_detected`, `transcript`, and
+              `intent` events in the log.
             </div>
           </div>
         </div>
@@ -286,6 +288,7 @@
       const eventLog = document.getElementById("eventLog");
       const participantsList = document.getElementById("participants");
       const statusBadge = document.getElementById("statusBadge");
+      const agentBadge = document.getElementById("agentBadge");
       const roomBadge = document.getElementById("roomBadge");
       const serverBadge = document.getElementById("serverBadge");
 
@@ -313,6 +316,11 @@
         joinBtn.disabled = joined;
         leaveBtn.disabled = !joined;
         micBtn.disabled = !joined;
+      }
+
+      function setAgentStatus(text, ok = false) {
+        agentBadge.textContent = `agent: ${text}`;
+        agentBadge.className = ok ? "badge ok" : "badge";
       }
 
       function setMicButton() {
@@ -344,6 +352,7 @@
       function resetUi() {
         currentRoom = null;
         micEnabled = false;
+        setAgentStatus("-");
         roomBadge.textContent = "room: -";
         serverBadge.textContent = "server: -";
         setButtons({ joined: false });
@@ -378,6 +387,49 @@
           .on(RoomEvent.DataReceived, (payload, participant, kind, topic) => {
             const text = decoder.decode(payload);
             const sender = participant?.identity || "server";
+            try {
+              const event = JSON.parse(text);
+              if (event?.type === "agent_status") {
+                setAgentStatus(event.status || event.state || "-", event.status === "listening");
+                log(
+                  `agent status: ${event.status || "-"} state=${event.state || "-"} participant=${event.participant_identity || sender}`,
+                );
+                return;
+              }
+
+              if (event?.type === "speech_detected") {
+                log(`speech detected: ${event.utterance_id}`);
+                return;
+              }
+
+              if (event?.type === "utterance_finalized") {
+                log(`utterance finalized: ${event.utterance_id} (${event.duration_ms} ms)`);
+                return;
+              }
+
+              if (event?.type === "transcript") {
+                log(`transcript final=${event.final}: ${event.text || "<empty>"}`);
+                return;
+              }
+
+              if (event?.type === "intent") {
+                log(`intent: ${event.intent} use_llm=${event.use_llm} action=${event.action}`);
+                return;
+              }
+
+              if (event?.type === "agent_response_text") {
+                log(`agent response text: ${event.text}`);
+                return;
+              }
+
+              if (event?.type === "error") {
+                log(`agent error stage=${event.stage}: ${event.message}`);
+                return;
+              }
+            } catch (error) {
+              // Keep legacy plain-text events in the log.
+            }
+
             log(`data received from ${sender} topic=${topic || "-"} kind=${kind}: ${text}`);
           })
           .on(RoomEvent.LocalTrackPublished, (publication) => {
@@ -490,6 +542,7 @@
 
       setMicButton();
       setButtons({ joined: false });
+      setAgentStatus("-");
       setStatus("idle");
       log("frontend ready");
     </script>

@@ -27,6 +27,9 @@
 - `token_server` на FastAPI
 - простой `frontend` без React
 - Python `agent`, который входит в комнату и отправляет `agent_ready`
+- agent-side audio receiver для remote microphone track
+- streaming VAD + utterance buffer
+- STT + normalization + simple intent router
 - bootstrap/user-data скрипты
 - `Caddy` для HTTPS и WSS
 
@@ -43,6 +46,7 @@
 ├── .env.prod.example
 ├── docker-compose.yml
 ├── docker-compose.prod.yml
+├── docker-compose.gpu.yml
 ├── README.md
 ├── token_server/
 │   ├── main.py
@@ -149,6 +153,31 @@ AGENT_IDENTITY=agent-001
 AGENT_NAME=Room Agent
 AGENT_READY_TOPIC=presence
 TOKEN_REQUEST_TIMEOUT=10
+CONNECT_RETRY_DELAY=2
+AGENT_EVENTS_TOPIC=agent_events
+
+MODEL_CACHE_DIR=/opt/models
+VOICE_AGENT_DATA_DIR=/opt/voice-agent-data
+
+AUDIO_SAMPLE_RATE=16000
+AUDIO_NUM_CHANNELS=1
+AUDIO_FRAME_SIZE_MS=20
+
+VAD_THRESHOLD=0.45
+VAD_MIN_SPEECH_DURATION_MS=200
+VAD_MIN_SILENCE_DURATION_MS=500
+VAD_SPEECH_PAD_MS=120
+VAD_USE_ONNX=false
+TORCH_NUM_THREADS=1
+
+STT_ENABLED=true
+STT_MODEL=Systran/faster-whisper-small
+STT_DEVICE=auto
+STT_COMPUTE_TYPE_CPU=int8
+STT_COMPUTE_TYPE_GPU=float16
+STT_LANGUAGE=ru
+STT_BEAM_SIZE=1
+STT_CONFIDENCE_FLOOR=0.35
 ```
 
 Запуск:
@@ -157,6 +186,24 @@ TOKEN_REQUEST_TIMEOUT=10
 cd /opt/voice-agent
 cp .env.prod.example .env
 docker compose -f docker-compose.prod.yml up --build -d
+```
+
+### 3. GPU override
+
+Файл: [docker-compose.gpu.yml](/Users/dr_emin/Desktop/livekit/docker-compose.gpu.yml)
+
+Используйте его только если:
+
+- на хосте есть NVIDIA GPU
+- `nvidia-smi` работает
+- установлен `nvidia-container-toolkit`
+
+Запуск:
+
+```bash
+cd /opt/voice-agent
+cp .env.prod.example .env
+docker compose -f docker-compose.prod.yml -f docker-compose.gpu.yml up --build -d
 ```
 
 ## Порты
@@ -184,7 +231,7 @@ docker compose -f docker-compose.prod.yml up --build -d
 
 ## Что делаем сразу после этого
 
-После transport-check переходим в AI loop:
+После transport-check идем по AI loop в таком порядке:
 
 1. Получение аудиофреймов от пользователя.
 2. VAD на аудиопотоке.
@@ -194,6 +241,70 @@ docker compose -f docker-compose.prod.yml up --build -d
 6. LLM только для сложных запросов.
 7. TTS с разметкой.
 8. Публикация аудиоответа обратно в LiveKit.
+
+Сейчас в репозитории уже реализованы первые 5 пунктов в виде MVP-контура:
+
+- agent получает PCM audio frames из LiveKit
+- VAD режет поток на utterance
+- utterance сохраняются в `/tmp/voice-agent/utterances`
+- faster-whisper возвращает transcript
+- transcript нормализуется и идет в простой router
+- frontend получает data-events:
+  - `agent_status`
+  - `speech_detected`
+  - `utterance_finalized`
+  - `transcript`
+  - `intent`
+  - `agent_response_text`
+
+Что еще не реализовано:
+
+- реальный LLM fallback
+- TTS layer
+- публикация голосового ответа обратно в LiveKit
+- half-duplex speaking lock
+
+## Models And GPU
+
+Базовый STT по умолчанию:
+
+- `Systran/faster-whisper-small`
+
+Почему так:
+
+- это самый быстрый путь к рабочему русскоязычному loop без сложной инфраструктуры
+- модель можно заменить позже на `medium` или другой backend без слома интерфейса
+
+Текущее поведение по GPU:
+
+- VAD остается легким и может спокойно жить на CPU
+- STT пытается использовать `cuda`, если `STT_DEVICE=auto` и внутри контейнера реально доступна NVIDIA runtime
+- если CUDA недоступна или инициализация падает, agent автоматически откатывается на CPU `int8`
+- для реального проброса GPU в контейнер используйте `docker-compose.gpu.yml`
+
+Проверка сервера:
+
+```bash
+./scripts/check_gpu.sh
+```
+
+Если хотите кэшировать модели на сервере, compose уже монтирует:
+
+- `${MODEL_CACHE_DIR}` -> `/models`
+- `${VOICE_AGENT_DATA_DIR}` -> `/tmp/voice-agent`
+
+Пример preload на сервере:
+
+```bash
+pip install -U "huggingface_hub[cli]"
+huggingface-cli download Systran/faster-whisper-small --local-dir /opt/models/faster-whisper-small
+```
+
+Тогда в `.env` можно указать:
+
+```env
+STT_MODEL=/models/faster-whisper-small
+```
 
 ## Token API
 

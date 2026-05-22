@@ -1,0 +1,5 @@
+services:
+  agent:
+    gpus: all
+    environment:
+      STT_DEVICE: cuda
