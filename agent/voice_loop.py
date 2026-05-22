@@ -29,6 +29,14 @@ def env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def env_nonempty(name: str, default: str = "") -> str:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip()
+    return value if value else default
+
+
 @dataclass(slots=True)
 class VoicePipelineConfig:
     sample_rate: int
@@ -74,6 +82,19 @@ class VoicePipelineConfig:
 
     @classmethod
     def from_env(cls) -> "VoicePipelineConfig":
+        yandex_api_key = env_nonempty("YANDEX_API_KEY")
+        yandex_project_id = env_nonempty("YANDEX_PROJECT_ID")
+        yandex_base_url = env_nonempty("YANDEX_BASE_URL", "https://ai.api.cloud.yandex.net/v1")
+
+        llm_provider = env_nonempty("LLM_PROVIDER").lower()
+        if not llm_provider:
+            llm_provider = "yandex" if yandex_api_key else "openai"
+
+        llm_project = env_nonempty("LLM_PROJECT", yandex_project_id or env_nonempty("YANDEX_CLOUD_FOLDER"))
+        default_llm_model = "Qwen/Qwen3-8B"
+        if llm_provider == "yandex" and llm_project:
+            default_llm_model = f"gpt://{llm_project}/yandexgpt-lite/latest"
+
         return cls(
             sample_rate=int(os.getenv("AUDIO_SAMPLE_RATE", "16000")),
             num_channels=int(os.getenv("AUDIO_NUM_CHANNELS", "1")),
@@ -93,13 +114,19 @@ class VoicePipelineConfig:
             stt_beam_size=int(os.getenv("STT_BEAM_SIZE", "1")),
             stt_confidence_floor=float(os.getenv("STT_CONFIDENCE_FLOOR", "0.35")),
             llm_enabled=env_bool("LLM_ENABLED", True),
-            llm_provider=os.getenv("LLM_PROVIDER", "openai").strip().lower(),
-            llm_model=os.getenv("LLM_MODEL", "Qwen/Qwen3-8B"),
+            llm_provider=llm_provider,
+            llm_model=env_nonempty("LLM_MODEL", default_llm_model),
             llm_reasoning_effort=os.getenv("LLM_REASONING_EFFORT", "low"),
             llm_timeout_seconds=float(os.getenv("LLM_TIMEOUT_SECONDS", "15")),
-            llm_base_url=os.getenv("LLM_BASE_URL", "http://127.0.0.1:8001/v1").strip(),
-            llm_api_key=os.getenv("LLM_API_KEY", "local-token").strip(),
-            llm_project=os.getenv("LLM_PROJECT", os.getenv("YANDEX_CLOUD_FOLDER", "")).strip(),
+            llm_base_url=env_nonempty(
+                "LLM_BASE_URL",
+                yandex_base_url if llm_provider == "yandex" else "http://127.0.0.1:8001/v1",
+            ),
+            llm_api_key=env_nonempty(
+                "LLM_API_KEY",
+                yandex_api_key if llm_provider == "yandex" else "local-token",
+            ),
+            llm_project=llm_project,
             llm_temperature=float(os.getenv("LLM_TEMPERATURE", "0.2")),
             llm_max_tokens=int(os.getenv("LLM_MAX_TOKENS", "96")),
             tts_enabled=env_bool("TTS_ENABLED", True),
