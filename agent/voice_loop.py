@@ -528,6 +528,7 @@ def parse_llm_reply(
 ) -> LlmReply:
     payload_text = extract_first_json_object(raw_text)
     parsed: dict[str, Any] = {}
+    json_like_response = raw_text.lstrip().startswith("{") or payload_text.lstrip().startswith("{")
     try:
         maybe_parsed = json.loads(payload_text)
         if isinstance(maybe_parsed, dict):
@@ -535,7 +536,14 @@ def parse_llm_reply(
     except Exception:
         parsed = {}
 
-    reply_tts = sanitize_voice_response(str(parsed.get("reply_tts", "") or raw_text), fallback=fallback_reply)
+    raw_reply_value = parsed.get("reply_tts", "")
+    reply_source = str(raw_reply_value).strip() if raw_reply_value is not None else ""
+    if not reply_source:
+        reply_source = fallback_reply if json_like_response else raw_text
+    if reply_source.lstrip().startswith("{") or '"reply_tts"' in reply_source:
+        reply_source = fallback_reply
+
+    reply_tts = sanitize_voice_response(reply_source, fallback=fallback_reply)
     intent = str(parsed.get("intent", "")).strip() or fallback_intent
     next_step = str(parsed.get("next_step", "")).strip() or fallback_next_step
 
