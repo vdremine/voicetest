@@ -434,7 +434,16 @@ class ParticipantAudioSession:
         if self._audio_task and not self._audio_task.done():
             return
         self._audio_task = asyncio.create_task(self._consume_audio(track))
+        self._audio_task.add_done_callback(self._on_audio_task_done)
         await self._publish_status("waiting_for_speech")
+
+    def _on_audio_task_done(self, task: asyncio.Task[None]) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            self._log(f"audio session task crashed for {self._participant.identity}: {exc}")
 
     async def aclose(self) -> None:
         if self._audio_task:
@@ -467,14 +476,22 @@ class ParticipantAudioSession:
         )
 
     async def _consume_audio(self, track: rtc.Track) -> None:
-        stream = rtc.AudioStream.from_track(
-            track=track,
-            sample_rate=self._config.sample_rate,
-            num_channels=self._config.num_channels,
-            frame_size_ms=self._config.frame_size_ms,
-        )
-
         try:
+            try:
+                stream = rtc.AudioStream.from_track(
+                    track=track,
+                    sample_rate=self._config.sample_rate,
+                    num_channels=self._config.num_channels,
+                    frame_size_ms=self._config.frame_size_ms,
+                )
+            except Exception:
+                # Keep compatibility with older Python SDK builds that only expose the constructor.
+                stream = rtc.AudioStream(
+                    track=track,
+                    sample_rate=self._config.sample_rate,
+                    num_channels=self._config.num_channels,
+                )
+
             async for frame_event in stream:
                 frame = frame_event.frame
                 if not self._first_frame_logged:
