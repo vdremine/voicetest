@@ -883,6 +883,18 @@ class SimpleIntentRouter:
             "ошиблись",
         }
         self._line_issue = {"не слышу", "плохо слышно", "связь плохая", "вас не слышно"}
+        self._why_need_info_markers = {
+            "зачем тебе эта информация",
+            "зачем вам эта информация",
+            "для чего эта информация",
+            "почему вам это нужно",
+        }
+        self._latency_markers = {
+            "почему так долго",
+            "долго отвечал",
+            "что так долго",
+            "почему долго",
+        }
         self._service_complaint_markers = {
             "грубо",
             "груб",
@@ -919,6 +931,10 @@ class SimpleIntentRouter:
             return IntentResult("identity_mismatch", 0.95, False, "clarify_identity")
         if text in self._line_issue or "не слышу" in text or "вас не слышно" in text:
             return IntentResult("line_issue", 0.98, False, "repeat_last_agent_message")
+        if any(marker in text for marker in self._why_need_info_markers):
+            return IntentResult("why_need_info", 0.95, False, "explain_question")
+        if any(marker in text for marker in self._latency_markers):
+            return IntentResult("latency_question", 0.94, False, "explain_delay_and_continue")
         if any(marker in text for marker in self._service_complaint_markers):
             return IntentResult("service_complaint", 0.92, False, "ack_complaint_and_refocus")
         if any(marker in text for marker in self._payment_help_markers):
@@ -980,6 +996,13 @@ class CannedResponseEngine:
         if intent.intent == "line_issue":
             repeated = self._first_sentence(last_agent_message)
             return repeated or "Повторю коротко. Подскажите, пожалуйста, удобно сейчас говорить?"
+        if intent.intent == "why_need_info":
+            return (
+                "Чтобы не гонять вас по лишним вопросам и сразу подобрать подходящий вариант. "
+                "Подскажите, пожалуйста, это покупка автомобиля или другая цель?"
+            )
+        if intent.intent == "latency_question":
+            return "Связь чуть задержалась. Продолжим. Подскажите, пожалуйста, это покупка автомобиля или другая цель?"
         if intent.intent == "service_complaint":
             return (
                 "Понял вас. Извините, пожалуйста, за этот разговор. "
@@ -1066,6 +1089,7 @@ class ParticipantAudioSession:
         self._session_logger = SessionLogger(config.session_log_dir / f"{self._session_id}.jsonl")
 
         self._audio_task: asyncio.Task[None] | None = None
+        self._active_track_sid: str | None = None
         self._sample_buffer = np.empty(0, dtype=np.int16)
         self._pre_speech_chunks: deque[np.ndarray] = deque()
         self._utterance_chunks: list[np.ndarray] = []
@@ -1105,9 +1129,20 @@ class ParticipantAudioSession:
     def participant_identity(self) -> str:
         return self._participant.identity
 
-    async def ensure_started(self, track: rtc.Track) -> None:
+    async def ensure_started(self, track: rtc.Track, *, track_sid: str | None = None) -> None:
         if self._audio_task and not self._audio_task.done():
-            return
+            if track_sid and self._active_track_sid == track_sid:
+                self._log(
+                    f"audio stream already active: participant={self._participant.identity} track_sid={track_sid}"
+                )
+                return
+            self._audio_task.cancel()
+            try:
+                await self._audio_task
+            except asyncio.CancelledError:
+                pass
+
+        self._active_track_sid = track_sid or getattr(track, "sid", None)
         self._audio_task = asyncio.create_task(self._consume_audio(track))
         self._audio_task.add_done_callback(self._on_audio_task_done)
         await self._publish_status("waiting_for_speech")
@@ -1127,6 +1162,7 @@ class ParticipantAudioSession:
                 await self._audio_task
             except asyncio.CancelledError:
                 pass
+        self._active_track_sid = None
         self._vad.reset_states()
 
     async def _publish_status(self, state: str) -> None:
@@ -1731,6 +1767,7 @@ class VoiceSessionManager:
         *,
         track: rtc.Track,
         participant: rtc.RemoteParticipant,
+        track_sid: str | None = None,
     ) -> None:
         session = self._sessions.get(participant.identity)
         if session is None:
@@ -1747,7 +1784,7 @@ class VoiceSessionManager:
             )
             self._sessions[participant.identity] = session
 
-        await session.ensure_started(track)
+        await session.ensure_started(track, track_sid=track_sid)
 
     async def participant_disconnected(self, participant_identity: str) -> None:
         session = self._sessions.pop(participant_identity, None)

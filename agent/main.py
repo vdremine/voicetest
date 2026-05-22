@@ -211,7 +211,7 @@ async def run() -> None:
             label="publish_user_audio_track_detected",
         )
         schedule(
-            voice_sessions.start_audio_track(track=track, participant=participant),
+            voice_sessions.start_audio_track(track=track, participant=participant, track_sid=publication.sid),
             label="start_audio_track",
         )
 
@@ -287,7 +287,11 @@ async def run() -> None:
                 ensure_audio_subscription(publication, participant)
                 track = getattr(publication, "track", None)
                 if track is not None and is_audio_kind(publication.kind):
-                    await voice_sessions.start_audio_track(track=track, participant=participant)
+                    await voice_sessions.start_audio_track(
+                        track=track,
+                        participant=participant,
+                        track_sid=publication.sid,
+                    )
 
     await stop_event.wait()
 
