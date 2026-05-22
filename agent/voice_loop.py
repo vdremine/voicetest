@@ -121,7 +121,7 @@ class VoicePipelineConfig:
             ),
             fallback_complex_text=os.getenv(
                 "FALLBACK_COMPLEX_TEXT",
-                "Я понял запрос. Сейчас подключу обработку следующего уровня.",
+                "Подскажите, пожалуйста, какая сумма вам нужна и на какую цель.",
             ),
         )
 
@@ -335,6 +335,19 @@ TTS:
             self._client = AsyncOpenAI(**kwargs)
         return self._client
 
+    @staticmethod
+    def _history_to_messages(history: list[dict[str, str]]) -> list[dict[str, str]]:
+        messages: list[dict[str, str]] = []
+        for item in history[-8:]:
+            role = str(item.get("role", "user")).strip().lower()
+            if role not in {"user", "assistant", "system"}:
+                role = "user"
+            content = str(item.get("text", "")).strip()
+            if not content:
+                continue
+            messages.append({"role": role, "content": content})
+        return messages
+
     async def generate_response(
         self,
         *,
@@ -346,33 +359,30 @@ TTS:
 
         client = self._ensure_client()
         started_at = time.perf_counter()
-        history_lines = [
-            f"{item['role']}: {item['text']}"
-            for item in history[-8:]
-            if item.get("text")
+        messages: list[dict[str, str]] = [
+            {
+                "role": "system",
+                "content": self._LOCAL_MANAGER_PROMPT,
+            },
+            {
+                "role": "system",
+                "content": (
+                    "Строго соблюдай JSON-схему ответа. "
+                    'Формат: {"reply_tts":"строка","search_index":["строка"],"intent":"строка","next_step":"строка"}. '
+                    "Никакого текста вне JSON."
+                ),
+            },
+            *self._history_to_messages(history),
         ]
-        history_block = "\n".join(history_lines) if history_lines else "history: <empty>"
+        if not messages or messages[-1]["role"] != "user":
+            messages.append({"role": "user", "content": normalized_text})
 
         completion = await client.chat.completions.create(
             model=self._config.llm_model,
             temperature=self._config.llm_temperature,
             max_tokens=self._config.llm_max_tokens,
-            messages=[
-                {
-                    "role": "system",
-                    "content": self._LOCAL_MANAGER_PROMPT,
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        "Схема JSON:\n"
-                        '{"reply_tts":"строка","search_index":["строка"],"intent":"строка","next_step":"строка"}\n\n'
-                        f"История диалога:\n{history_block}\n\n"
-                        f"Текущая реплика клиента:\n{normalized_text}\n\n"
-                        "Верни только один JSON-объект без пояснений."
-                    ),
-                },
-            ],
+            response_format={"type": "json_object"},
+            messages=messages,
         )
         latency_ms = int((time.perf_counter() - started_at) * 1000)
         content = completion.choices[0].message.content or ""
@@ -411,6 +421,12 @@ def sanitize_voice_response(text: str, *, fallback: str) -> str:
         return fallback
 
     suspicious_meta_markers = (
+        "клиент написал",
+        "клиент сказал",
+        "запрос клиента",
+        "разберемся с этим запросом",
+        "давайте разберемся с этим запросом",
+        "в этом запросе",
         "the user said",
         "the assistant",
         "user said",
@@ -827,7 +843,7 @@ class SimpleIntentRouter:
             "доброе утро",
             "доброй ночи",
         }
-        self._confirm = {"да", "угу", "ага", "подтверждаю", "конечно", "хорошо"}
+        self._confirm = {"да", "угу", "ага", "подтверждаю", "конечно", "хорошо", "супер", "отлично"}
         self._reject = {"нет", "неа", "не надо"}
         self._cancel = {"отмена", "отменить", "отбой"}
         self._repeat = {"повтори", "повтори пожалуйста", "еще раз", "ещё раз", "не понял"}
@@ -961,6 +977,7 @@ class ParticipantAudioSession:
         self._speech_started_at_ms = 0
         self._speech_detected_published = False
         self._interrupt_speech_ms = 0
+        self._barge_in_pending = False
 
         self._chunk_ms = int(self._vad.window_size * 1000 / self._config.sample_rate)
         self._pad_chunks = max(1, math.ceil(self._config.vad_speech_pad_ms / self._chunk_ms))
@@ -1099,8 +1116,14 @@ class ParticipantAudioSession:
             return
 
         if self._is_processing:
-            self._sample_buffer = np.empty(0, dtype=np.int16)
-            self._pre_speech_chunks.clear()
+            if self._barge_in_pending:
+                if self._sample_buffer.size == 0:
+                    self._sample_buffer = samples
+                else:
+                    self._sample_buffer = np.concatenate((self._sample_buffer, samples))
+            else:
+                self._sample_buffer = np.empty(0, dtype=np.int16)
+                self._pre_speech_chunks.clear()
             return
 
         if self._sample_buffer.size == 0:
@@ -1137,11 +1160,11 @@ class ParticipantAudioSession:
             )
             self._audio_publisher.interrupt_playback()
             self._is_speaking = False
+            self._barge_in_pending = True
             self._interrupt_speech_ms = 0
             self._sample_buffer = np.empty(0, dtype=np.int16)
             self._reset_utterance_state()
             await self._publish_status("waiting_for_speech")
-            await self._process_vad_window(window)
             return
 
     def _append_pre_speech(self, chunk: np.ndarray) -> None:
@@ -1486,7 +1509,18 @@ class ParticipantAudioSession:
             )
             self._is_speaking = False
             self._is_processing = False
+            had_barge_in_pending = self._barge_in_pending
+            self._barge_in_pending = False
             await self._publish_status("waiting_for_speech")
+            if had_barge_in_pending:
+                while (
+                    not self._is_processing
+                    and not self._is_speaking
+                    and self._sample_buffer.size >= self._vad.window_size
+                ):
+                    window = self._sample_buffer[: self._vad.window_size]
+                    self._sample_buffer = self._sample_buffer[self._vad.window_size :]
+                    await self._process_vad_window(window)
 
 
 class VoiceSessionManager:
