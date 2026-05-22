@@ -266,7 +266,7 @@ class OpenAiLlmService:
                 {
                     "role": "system",
                     "content": (
-                        "Ты голосовой помощник. Отвечай по-русски коротко, естественно, без канцелярита. "
+                        "Ты голосовой помощник. Отвечай только по-русски коротко, естественно, без канцелярита. "
                         "Ответ должен быть удобен для озвучивания: 1-2 коротких предложения. "
                         "Не показывай размышления, рассуждения, служебные теги, XML, markdown, "
                         "скрытые планы, chain-of-thought и текст в стиле <think>...</think>. "
@@ -310,7 +310,25 @@ def sanitize_voice_response(text: str, *, fallback: str) -> str:
     if not value:
         return fallback
 
-    if value.startswith(("Хорошо, пользователь", "Пользователь", "Нужно ", "Стоит ")):
+    if value.startswith(("Хорошо, пользователь", "Пользователь", "Нужно ", "Стоит ", "Okay,", "The user")):
+        return fallback
+
+    suspicious_meta_markers = (
+        "the user said",
+        "the assistant",
+        "user said",
+        "assistant initially",
+        "means in russian",
+        "chain-of-thought",
+        "hidden reasoning",
+    )
+    lowered = value.lower()
+    if any(marker in lowered for marker in suspicious_meta_markers):
+        return fallback
+
+    ascii_letters = sum(1 for char in value if "a" <= char.lower() <= "z")
+    cyrillic_letters = sum(1 for char in value if "а" <= char.lower() <= "я")
+    if ascii_letters > max(8, cyrillic_letters):
         return fallback
 
     sentences = re.split(r"(?<=[.!?])\s+", value)
@@ -569,6 +587,7 @@ class SimpleIntentRouter:
             "алло",
             "ало",
             "привет",
+            "всем привет",
             "здравствуйте",
             "добрый день",
             "добрый вечер",
@@ -587,7 +606,7 @@ class SimpleIntentRouter:
         if not text:
             return IntentResult("clarify", 0.0, False, "ask_repeat")
 
-        if text in self._greeting:
+        if text in self._greeting or text.startswith(("привет", "здравствуйте", "добрый ", "алло", "ало")):
             return IntentResult("greeting", 0.99, False, "ack_greeting")
         if text in self._confirm:
             return IntentResult("confirm", 0.99, False, "ack_confirm")
