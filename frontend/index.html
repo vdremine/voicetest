@@ -372,13 +372,32 @@
           return;
         }
 
+        const key = publication.trackSid || publication.sid || participant.identity;
+        const existing = remoteAudioElements.get(key);
+        if (existing) {
+          existing.remove();
+          remoteAudioElements.delete(key);
+        }
+
         const element = track.attach();
         element.autoplay = true;
         element.playsInline = true;
+        element.controls = false;
         element.dataset.trackSid = publication.trackSid || publication.sid || "";
         remoteMedia.appendChild(element);
-        remoteAudioElements.set(publication.trackSid || publication.sid || participant.identity, element);
+        remoteAudioElements.set(key, element);
         log(`remote audio attached: participant=${participant.identity}`);
+
+        const playPromise = typeof element.play === "function" ? element.play() : null;
+        if (playPromise && typeof playPromise.then === "function") {
+          playPromise
+            .then(() => {
+              log(`remote audio playing: participant=${participant.identity}`);
+            })
+            .catch((error) => {
+              log(`remote audio play blocked: participant=${participant.identity} error=${error.message}`);
+            });
+        }
       }
 
       function detachRemoteTrack(track, publication, participant) {
@@ -396,6 +415,29 @@
         log(`remote audio detached: participant=${participant.identity}`);
       }
 
+      function attachExistingRemoteAudio(room) {
+        for (const participant of room.remoteParticipants.values()) {
+          for (const publication of participant.trackPublications.values()) {
+            if (publication.kind !== "audio") {
+              continue;
+            }
+
+            const track = publication.audioTrack || publication.track;
+            if (!track) {
+              log(
+                `remote audio pending: participant=${participant.identity} track=${publication.trackSid || publication.sid}`,
+              );
+              continue;
+            }
+
+            log(
+              `remote audio discovered: participant=${participant.identity} track=${publication.trackSid || publication.sid}`,
+            );
+            attachRemoteTrack(track, publication, participant);
+          }
+        }
+      }
+
       function attachRoomHandlers(room) {
         room
           .on(RoomEvent.Connected, () => {
@@ -403,6 +445,7 @@
             roomBadge.textContent = `room: ${room.name || roomInput.value}`;
             renderParticipants();
             log(`connected to room ${room.name || roomInput.value}`);
+            attachExistingRemoteAudio(room);
           })
           .on(RoomEvent.ConnectionStateChanged, (state) => {
             setStatus(`state: ${state}`, state === "connected");
@@ -411,10 +454,12 @@
           .on(RoomEvent.ParticipantConnected, (participant) => {
             log(`participant connected: ${participant.identity}`);
             renderParticipants();
+            attachExistingRemoteAudio(room);
           })
           .on(RoomEvent.ParticipantActive, (participant) => {
             log(`participant active: ${participant.identity}`);
             renderParticipants();
+            attachExistingRemoteAudio(room);
           })
           .on(RoomEvent.ParticipantDisconnected, (participant) => {
             log(`participant disconnected: ${participant.identity}`);

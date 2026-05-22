@@ -1085,11 +1085,27 @@ class ParticipantAudioSession:
             if self._config.tts_enabled:
                 await self._publish_status("speaking")
                 self._is_speaking = True
+                self._log(
+                    f"tts synth start participant={self._participant.identity} "
+                    f"utterance_id={utterance_id} text={response_text!r}"
+                )
                 tts_pcm16, tts_sample_rate, tts_latency_ms = await asyncio.to_thread(
                     self._tts_service.synthesize,
                     response_text,
                 )
+                self._log(
+                    f"tts synth done participant={self._participant.identity} "
+                    f"utterance_id={utterance_id} samples={len(tts_pcm16)} sample_rate={tts_sample_rate}"
+                )
+                self._log(
+                    f"tts publish start participant={self._participant.identity} "
+                    f"utterance_id={utterance_id}"
+                )
                 await self._audio_publisher.speak_pcm(tts_pcm16, tts_sample_rate)
+                self._log(
+                    f"tts publish done participant={self._participant.identity} "
+                    f"utterance_id={utterance_id}"
+                )
         except Exception as exc:
             error_stage = "stt"
             self._log(f"utterance processing failed participant={self._participant.identity}: {exc}")
