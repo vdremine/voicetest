@@ -89,6 +89,7 @@ def ensure_audio_subscription(publication: rtc.RemoteTrackPublication, participa
 
 async def run() -> None:
     stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
     room = rtc.Room()
     pipeline_config = VoicePipelineConfig.from_env()
     event_bus = AgentEventBus(room, topic=pipeline_config.events_topic, log=log)
@@ -99,6 +100,22 @@ async def run() -> None:
         log=log,
     )
 
+    def schedule(coro: Any, *, label: str) -> None:
+        def _spawn() -> None:
+            task = loop.create_task(coro)
+
+            def _on_done(done_task: asyncio.Task[Any]) -> None:
+                try:
+                    done_task.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    log(f"scheduled task failed label={label}: {exc}")
+
+            task.add_done_callback(_on_done)
+
+        loop.call_soon_threadsafe(_spawn)
+
     @room.on("participant_connected")
     def on_participant_connected(participant: rtc.RemoteParticipant) -> None:
         log(f"participant connected: {participant.identity}")
@@ -108,20 +125,24 @@ async def run() -> None:
     @room.on("participant_active")
     def on_participant_active(participant: rtc.RemoteParticipant) -> None:
         log(f"participant active: {participant.identity}")
-        asyncio.create_task(publish_ready(room, [participant.identity]))
-        asyncio.create_task(
+        schedule(publish_ready(room, [participant.identity]), label="publish_ready_participant_active")
+        schedule(
             event_bus.publish_status(
                 "agent_ready",
                 participant_identity=participant.identity,
                 status="ready",
                 destination_identities=[participant.identity],
-            )
+            ),
+            label="publish_status_agent_ready",
         )
 
     @room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant) -> None:
         log(f"participant disconnected: {participant.identity}")
-        asyncio.create_task(voice_sessions.participant_disconnected(participant.identity))
+        schedule(
+            voice_sessions.participant_disconnected(participant.identity),
+            label="participant_disconnected_cleanup",
+        )
 
     @room.on("data_received")
     def on_data_received(data_packet: rtc.DataPacket) -> None:
@@ -151,15 +172,19 @@ async def run() -> None:
         if not is_audio_kind(publication.kind):
             return
 
-        asyncio.create_task(
+        schedule(
             publish_agent_event(
                 room,
                 payload=f"user_audio_track_detected:{participant.identity}",
                 topic="agent_status",
                 destination_identities=[participant.identity],
-            )
+            ),
+            label="publish_user_audio_track_detected",
         )
-        asyncio.create_task(voice_sessions.start_audio_track(track=track, participant=participant))
+        schedule(
+            voice_sessions.start_audio_track(track=track, participant=participant),
+            label="start_audio_track",
+        )
 
     @room.on("track_unsubscribed")
     def on_track_unsubscribed(
