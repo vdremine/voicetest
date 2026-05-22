@@ -529,6 +529,31 @@ def parse_llm_reply(
     )
 
 
+def is_low_information_transcript(raw_text: str, normalized_text: str) -> bool:
+    if not raw_text.strip():
+        return True
+
+    normalized = normalized_text.strip()
+    if not normalized:
+        return True
+
+    raw_compact = re.sub(r"[^а-яa-z]", "", raw_text.lower().replace("ё", "е"))
+    if not raw_compact:
+        return True
+
+    if len(raw_compact) >= 4 and len(set(raw_compact)) == 1:
+        return True
+
+    if len(normalized.split()) == 1:
+        token = normalized
+        if len(token) >= 4 and set(token) <= set("аоуыэеияюм"):
+            return True
+        if len(token) >= 4 and len(set(token)) == 1:
+            return True
+
+    return False
+
+
 class SileroTtsService:
     def __init__(self, config: VoicePipelineConfig, log: Callable[[str], None]) -> None:
         self._config = config
@@ -586,6 +611,7 @@ class LiveKitAudioPublisher:
         self._track: rtc.LocalAudioTrack | None = None
         self._published = False
         self._lock = asyncio.Lock()
+        self._playback_generation = 0
 
     async def ensure_published(self) -> None:
         if self._published:
@@ -616,9 +642,16 @@ class LiveKitAudioPublisher:
             self._published = True
             self._log("published local audio track for agent voice")
 
-    async def speak_pcm(self, pcm16: np.ndarray, sample_rate: int) -> None:
+    def interrupt_playback(self) -> None:
+        self._playback_generation += 1
+        if self._source is not None:
+            self._source.clear_queue()
+        self._log("interrupted current agent audio playback")
+
+    async def speak_pcm(self, pcm16: np.ndarray, sample_rate: int) -> bool:
         await self.ensure_published()
         assert self._source is not None
+        playback_generation = self._playback_generation
 
         target = pcm16
         if sample_rate != self._config.tts_publish_sample_rate:
@@ -634,6 +667,9 @@ class LiveKitAudioPublisher:
 
         cursor = 0
         while cursor < len(target):
+            if playback_generation != self._playback_generation:
+                return False
+
             chunk = target[cursor : cursor + samples_per_channel]
             if len(chunk) < samples_per_channel:
                 chunk = np.pad(chunk, (0, samples_per_channel - len(chunk)))
@@ -647,7 +683,11 @@ class LiveKitAudioPublisher:
             await self._source.capture_frame(frame)
             cursor += samples_per_channel
 
+        if playback_generation != self._playback_generation:
+            return False
+
         await self._source.wait_for_playout()
+        return playback_generation == self._playback_generation
 
     @staticmethod
     def _resample(pcm16: np.ndarray, *, orig_rate: int, target_rate: int) -> np.ndarray:
@@ -920,6 +960,7 @@ class ParticipantAudioSession:
         self._state = "agent_ready"
         self._speech_started_at_ms = 0
         self._speech_detected_published = False
+        self._interrupt_speech_ms = 0
 
         self._chunk_ms = int(self._vad.window_size * 1000 / self._config.sample_rate)
         self._pad_chunks = max(1, math.ceil(self._config.vad_speech_pad_ms / self._chunk_ms))
@@ -1049,14 +1090,18 @@ class ParticipantAudioSession:
                         await result
 
     async def _push_frame(self, frame: rtc.AudioFrame) -> None:
-        if self._is_speaking or self._is_processing:
-            self._sample_buffer = np.empty(0, dtype=np.int16)
-            self._pre_speech_chunks.clear()
-            return
-
         samples = np.array(frame.data, dtype=np.int16, copy=True)
         if frame.num_channels > 1:
             samples = samples.reshape(-1, frame.num_channels).mean(axis=1).astype(np.int16)
+
+        if self._is_speaking:
+            await self._handle_barge_in_samples(samples)
+            return
+
+        if self._is_processing:
+            self._sample_buffer = np.empty(0, dtype=np.int16)
+            self._pre_speech_chunks.clear()
+            return
 
         if self._sample_buffer.size == 0:
             self._sample_buffer = samples
@@ -1067,6 +1112,37 @@ class ParticipantAudioSession:
             window = self._sample_buffer[: self._vad.window_size]
             self._sample_buffer = self._sample_buffer[self._vad.window_size :]
             await self._process_vad_window(window)
+
+    async def _handle_barge_in_samples(self, samples: np.ndarray) -> None:
+        if self._sample_buffer.size == 0:
+            self._sample_buffer = samples
+        else:
+            self._sample_buffer = np.concatenate((self._sample_buffer, samples))
+
+        while self._sample_buffer.size >= self._vad.window_size:
+            window = self._sample_buffer[: self._vad.window_size]
+            self._sample_buffer = self._sample_buffer[self._vad.window_size :]
+            probability = self._vad.speech_probability(window)
+            if probability >= self._config.vad_threshold:
+                self._interrupt_speech_ms += self._chunk_ms
+            else:
+                self._interrupt_speech_ms = 0
+
+            if self._interrupt_speech_ms < self._config.vad_min_speech_duration_ms:
+                continue
+
+            self._log(
+                f"barge-in detected participant={self._participant.identity} "
+                f"vad_probability={probability:.3f}"
+            )
+            self._audio_publisher.interrupt_playback()
+            self._is_speaking = False
+            self._interrupt_speech_ms = 0
+            self._sample_buffer = np.empty(0, dtype=np.int16)
+            self._reset_utterance_state()
+            await self._publish_status("waiting_for_speech")
+            await self._process_vad_window(window)
+            return
 
     def _append_pre_speech(self, chunk: np.ndarray) -> None:
         self._pre_speech_chunks.append(chunk.copy())
@@ -1176,6 +1252,7 @@ class ParticipantAudioSession:
         self._last_speech_chunk_index = 0
         self._speech_ms = 0
         self._silence_ms = 0
+        self._interrupt_speech_ms = 0
         self._active_utterance_id = None
         self._speech_detected_published = False
         self._pre_speech_chunks.clear()
@@ -1208,6 +1285,7 @@ class ParticipantAudioSession:
         llm_reply: LlmReply | None = None
         error_stage = ""
         response_published = False
+        suppress_response = False
         llm_latency_ms = 0
         tts_latency_ms = 0
 
@@ -1233,6 +1311,15 @@ class ParticipantAudioSession:
             )
 
             normalized_text = self._normalizer.normalize(transcript.text)
+            if is_low_information_transcript(transcript.text, normalized_text):
+                suppress_response = True
+                error_stage = "ignored_low_information"
+                self._log(
+                    f"ignored low-information transcript participant={self._participant.identity} "
+                    f"utterance_id={utterance_id} text={transcript.text!r}"
+                )
+                return
+
             if transcript.text:
                 self._history.append({"role": "user", "text": normalized_text or transcript.text})
                 self._history = self._history[-12:]
@@ -1318,11 +1405,16 @@ class ParticipantAudioSession:
                     f"tts publish start participant={self._participant.identity} "
                     f"utterance_id={utterance_id}"
                 )
-                await self._audio_publisher.speak_pcm(tts_pcm16, tts_sample_rate)
+                playback_completed = await self._audio_publisher.speak_pcm(tts_pcm16, tts_sample_rate)
                 self._log(
                     f"tts publish done participant={self._participant.identity} "
                     f"utterance_id={utterance_id}"
                 )
+                if not playback_completed:
+                    self._log(
+                        f"tts publish interrupted participant={self._participant.identity} "
+                        f"utterance_id={utterance_id}"
+                    )
         except Exception as exc:
             error_stage = "stt"
             self._log(f"utterance processing failed participant={self._participant.identity}: {exc}")
@@ -1350,7 +1442,7 @@ class ParticipantAudioSession:
             response_published = True
         finally:
             total_latency_ms = int((time.perf_counter() - started_at) * 1000)
-            if not response_published:
+            if not response_published and not suppress_response:
                 await self._event_bus.publish_json(
                     {
                         "type": "agent_response_text",
