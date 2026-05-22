@@ -476,21 +476,42 @@ class ParticipantAudioSession:
         )
 
     async def _consume_audio(self, track: rtc.Track) -> None:
+        stream = None
         try:
+            self._log(
+                "starting audio stream: "
+                f"participant={self._participant.identity} "
+                f"track_sid={getattr(track, 'sid', '-')}"
+            )
             try:
-                stream = rtc.AudioStream.from_track(
-                    track=track,
+                stream = rtc.AudioStream.from_participant(
+                    participant=self._participant,
+                    track_source=rtc.TrackSource.SOURCE_MICROPHONE,
                     sample_rate=self._config.sample_rate,
                     num_channels=self._config.num_channels,
                     frame_size_ms=self._config.frame_size_ms,
                 )
-            except Exception:
-                # Keep compatibility with older Python SDK builds that only expose the constructor.
-                stream = rtc.AudioStream(
-                    track=track,
-                    sample_rate=self._config.sample_rate,
-                    num_channels=self._config.num_channels,
+                self._log(f"audio stream source=participant participant={self._participant.identity}")
+            except Exception as participant_exc:
+                self._log(
+                    f"audio stream from_participant failed for {self._participant.identity}: {participant_exc}"
                 )
+                try:
+                    stream = rtc.AudioStream.from_track(
+                        track=track,
+                        sample_rate=self._config.sample_rate,
+                        num_channels=self._config.num_channels,
+                        frame_size_ms=self._config.frame_size_ms,
+                    )
+                    self._log(f"audio stream source=track participant={self._participant.identity}")
+                except Exception:
+                    # Keep compatibility with older Python SDK builds that only expose the constructor.
+                    stream = rtc.AudioStream(
+                        track=track,
+                        sample_rate=self._config.sample_rate,
+                        num_channels=self._config.num_channels,
+                    )
+                    self._log(f"audio stream source=ctor participant={self._participant.identity}")
 
             async for frame_event in stream:
                 frame = frame_event.frame
@@ -515,11 +536,12 @@ class ParticipantAudioSession:
                 destination_identities=[self._participant.identity],
             )
         finally:
-            maybe_aclose = getattr(stream, "aclose", None)
-            if callable(maybe_aclose):
-                result = maybe_aclose()
-                if asyncio.iscoroutine(result):
-                    await result
+            if stream is not None:
+                maybe_aclose = getattr(stream, "aclose", None)
+                if callable(maybe_aclose):
+                    result = maybe_aclose()
+                    if asyncio.iscoroutine(result):
+                        await result
 
     async def _push_frame(self, frame: rtc.AudioFrame) -> None:
         samples = np.array(frame.data, dtype=np.int16, copy=True)
