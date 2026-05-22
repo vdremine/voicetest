@@ -49,11 +49,13 @@ class VoicePipelineConfig:
     stt_beam_size: int
     stt_confidence_floor: float
     llm_enabled: bool
+    llm_provider: str
     llm_model: str
     llm_reasoning_effort: str
     llm_timeout_seconds: float
     llm_base_url: str
     llm_api_key: str
+    llm_project: str
     llm_temperature: float
     llm_max_tokens: int
     tts_enabled: bool
@@ -91,11 +93,13 @@ class VoicePipelineConfig:
             stt_beam_size=int(os.getenv("STT_BEAM_SIZE", "1")),
             stt_confidence_floor=float(os.getenv("STT_CONFIDENCE_FLOOR", "0.35")),
             llm_enabled=env_bool("LLM_ENABLED", True),
+            llm_provider=os.getenv("LLM_PROVIDER", "openai").strip().lower(),
             llm_model=os.getenv("LLM_MODEL", "Qwen/Qwen3-8B"),
             llm_reasoning_effort=os.getenv("LLM_REASONING_EFFORT", "low"),
             llm_timeout_seconds=float(os.getenv("LLM_TIMEOUT_SECONDS", "15")),
             llm_base_url=os.getenv("LLM_BASE_URL", "http://127.0.0.1:8001/v1").strip(),
             llm_api_key=os.getenv("LLM_API_KEY", "local-token").strip(),
+            llm_project=os.getenv("LLM_PROJECT", os.getenv("YANDEX_CLOUD_FOLDER", "")).strip(),
             llm_temperature=float(os.getenv("LLM_TEMPERATURE", "0.2")),
             llm_max_tokens=int(os.getenv("LLM_MAX_TOKENS", "96")),
             tts_enabled=env_bool("TTS_ENABLED", True),
@@ -225,6 +229,31 @@ class SessionLogger:
 
 
 class OpenAiLlmService:
+    _LLM_JSON_SCHEMA: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "reply_tts": {
+                "type": "string",
+                "description": "Одна короткая реплика для клиента, готовая для озвучки.",
+            },
+            "search_index": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Короткие поисковые/контекстные ключи без дублей.",
+            },
+            "intent": {
+                "type": "string",
+                "description": "Короткий смысловой интент клиента.",
+            },
+            "next_step": {
+                "type": "string",
+                "description": "Один короткий следующий шаг менеджера.",
+            },
+        },
+        "required": ["reply_tts", "search_index", "intent", "next_step"],
+        "additionalProperties": False,
+    }
+
     _LOCAL_MANAGER_PROMPT = """Ты — Влад+имир, дежурный менеджер компании МосИнвестФинанс.
 Если спрашивают, живой ли ты, отвечай: да.
 
@@ -337,12 +366,19 @@ TTS:
     def enabled(self) -> bool:
         return self._config.llm_enabled and bool(self._config.llm_model)
 
+    def _is_yandex_provider(self) -> bool:
+        if self._config.llm_provider == "yandex":
+            return True
+        return "yandex.cloud" in self._config.llm_base_url or "ai.api.cloud.yandex.net" in self._config.llm_base_url
+
     def _ensure_client(self) -> AsyncOpenAI:
         if self._client is None:
             kwargs: dict[str, Any] = {"timeout": self._config.llm_timeout_seconds}
             if self._config.llm_base_url:
                 kwargs["base_url"] = self._config.llm_base_url
                 kwargs["api_key"] = self._config.llm_api_key or "local-token"
+                if self._config.llm_project:
+                    kwargs["default_headers"] = {"OpenAI-Project": self._config.llm_project}
             else:
                 api_key = os.getenv("OPENAI_API_KEY", "").strip()
                 if not api_key:
@@ -393,11 +429,15 @@ TTS:
         if not messages or messages[-1]["role"] != "user":
             messages.append({"role": "user", "content": normalized_text})
 
+        response_format: dict[str, Any] = {"type": "json_object"}
+        if self._is_yandex_provider():
+            response_format = {"type": "json_schema", "json_schema": self._LLM_JSON_SCHEMA}
+
         completion = await client.chat.completions.create(
             model=self._config.llm_model,
             temperature=self._config.llm_temperature,
             max_tokens=self._config.llm_max_tokens,
-            response_format={"type": "json_object"},
+            response_format=response_format,
             messages=messages,
         )
         latency_ms = int((time.perf_counter() - started_at) * 1000)
