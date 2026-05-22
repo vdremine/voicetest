@@ -267,7 +267,10 @@ class OpenAiLlmService:
                     "role": "system",
                     "content": (
                         "Ты голосовой помощник. Отвечай по-русски коротко, естественно, без канцелярита. "
-                        "Ответ должен быть удобен для озвучивания: 1-2 коротких предложения."
+                        "Ответ должен быть удобен для озвучивания: 1-2 коротких предложения. "
+                        "Не показывай размышления, рассуждения, служебные теги, XML, markdown, "
+                        "скрытые планы, chain-of-thought и текст в стиле <think>...</think>. "
+                        "Верни только финальный ответ для пользователя."
                     ),
                 },
                 {
@@ -289,7 +292,30 @@ class OpenAiLlmService:
             )
         else:
             text = str(content)
-        return text.strip(), latency_ms
+        return sanitize_voice_response(text, fallback="Уточните, пожалуйста, что именно вы хотите сделать."), latency_ms
+
+
+def sanitize_voice_response(text: str, *, fallback: str) -> str:
+    value = text.strip()
+    if not value:
+        return fallback
+
+    value = re.sub(r"<think>.*?</think>", " ", value, flags=re.IGNORECASE | re.DOTALL)
+    value = re.sub(r"</?think>", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"```.*?```", " ", value, flags=re.DOTALL)
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = re.sub(r"(?im)^(assistant|system|user)\s*:\s*", "", value)
+    value = re.sub(r"\s+", " ", value).strip()
+
+    if not value:
+        return fallback
+
+    if value.startswith(("Хорошо, пользователь", "Пользователь", "Нужно ", "Стоит ")):
+        return fallback
+
+    sentences = re.split(r"(?<=[.!?])\s+", value)
+    short_text = " ".join(sentence.strip() for sentence in sentences[:2] if sentence.strip()).strip()
+    return short_text or fallback
 
 
 class SileroTtsService:
@@ -539,6 +565,16 @@ class TranscriptNormalizer:
 
 class SimpleIntentRouter:
     def __init__(self) -> None:
+        self._greeting = {
+            "алло",
+            "ало",
+            "привет",
+            "здравствуйте",
+            "добрый день",
+            "добрый вечер",
+            "доброе утро",
+            "доброй ночи",
+        }
         self._confirm = {"да", "угу", "ага", "подтверждаю", "конечно", "хорошо"}
         self._reject = {"нет", "неа", "не надо"}
         self._cancel = {"отмена", "отменить", "отбой"}
@@ -551,6 +587,8 @@ class SimpleIntentRouter:
         if not text:
             return IntentResult("clarify", 0.0, False, "ask_repeat")
 
+        if text in self._greeting:
+            return IntentResult("greeting", 0.99, False, "ack_greeting")
         if text in self._confirm:
             return IntentResult("confirm", 0.99, False, "ack_confirm")
         if text in self._reject:
@@ -576,6 +614,8 @@ class CannedResponseEngine:
         self._config = config
 
     def choose(self, intent: IntentResult, *, last_agent_message: str | None) -> str:
+        if intent.intent == "greeting":
+            return "Добрый день. Слушаю вас."
         if intent.intent == "confirm":
             return "Хорошо."
         if intent.intent == "reject":
