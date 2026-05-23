@@ -2,3 +2,5 @@
 backlog.txt
 caddy_data/
 livekit.vdremin.ru/
+.DS_Store
+__pycache__/

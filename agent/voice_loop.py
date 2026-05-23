@@ -16,7 +16,7 @@ from typing import Any, Callable
 
 import numpy as np
 import torch
-from agent_core import DialogueState, StaticRagIndex, build_context_messages, validate_llm_reply
+from agent_core import DialogueState, KnowledgeBase, build_context_messages, validate_llm_reply
 from faster_whisper import WhisperModel
 from livekit import rtc
 from openai import AsyncOpenAI
@@ -80,6 +80,7 @@ class VoicePipelineConfig:
     tts_sample_rate: int
     tts_publish_sample_rate: int
     tts_frame_ms: int
+    data_dir: Path
     utterance_dir: Path
     session_log_dir: Path
     events_topic: str
@@ -146,6 +147,7 @@ class VoicePipelineConfig:
             tts_sample_rate=int(os.getenv("TTS_SAMPLE_RATE", "24000")),
             tts_publish_sample_rate=int(os.getenv("TTS_PUBLISH_SAMPLE_RATE", "24000")),
             tts_frame_ms=int(os.getenv("TTS_FRAME_MS", "20")),
+            data_dir=Path(os.getenv("AGENT_DATA_DIR", "/app/data")),
             utterance_dir=Path(os.getenv("UTTERANCE_DIR", "/tmp/voice-agent/utterances")),
             session_log_dir=Path(os.getenv("SESSION_LOG_DIR", "/tmp/voice-agent/session-logs")),
             events_topic=os.getenv("AGENT_EVENTS_TOPIC", "agent_events"),
@@ -441,6 +443,8 @@ TTS:
         history: list[dict[str, str]],
         dialogue_state: dict[str, Any] | None = None,
         knowledge: list[KnowledgeSnippet] | None = None,
+        truth_rules: tuple[str, ...] = (),
+        examples: list[list[dict[str, str]]] | None = None,
     ) -> tuple[LlmReply, int]:
         if not self.enabled:
             raise RuntimeError("LLM is disabled by configuration")
@@ -463,6 +467,8 @@ TTS:
             *build_context_messages(
                 state=dialogue_state or {},
                 knowledge=knowledge or [],
+                truth_rules=truth_rules,
+                examples=examples or [],
             ),
             *self._history_to_messages(history),
         ]
@@ -1198,7 +1204,12 @@ class ParticipantAudioSession:
         self._responses = CannedResponseEngine(config)
         self._vad = SileroVadEngine(config)
         self._dialogue_state = DialogueState()
-        self._rag = StaticRagIndex.default()
+        try:
+            self._kb = KnowledgeBase.load(config.data_dir)
+            self._log(f"loaded agent knowledge base from {config.data_dir}")
+        except Exception as exc:
+            self._log(f"failed to load knowledge base from {config.data_dir}: {exc}")
+            self._kb = KnowledgeBase.default()
 
         self._session_id = f"{participant.identity}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
         self._session_logger = SessionLogger(config.session_log_dir / f"{self._session_id}.jsonl")
@@ -1588,6 +1599,13 @@ class ParticipantAudioSession:
             handle.setframerate(self._config.sample_rate)
             handle.writeframes(samples.astype(np.int16).tobytes())
 
+    def _state_fallback_reply(self) -> str:
+        snapshot = self._dialogue_state.snapshot()
+        next_field = self._kb.next_required_field(snapshot) or self._dialogue_state.next_required_field
+        if next_field:
+            return self._kb.question_for_field(next_field)
+        return self._config.fallback_complex_text
+
     async def _process_utterance(
         self,
         *,
@@ -1660,8 +1678,9 @@ class ParticipantAudioSession:
                 return
 
             if not rescue_only:
+                faq_answer = self._kb.match_faq(normalized_text)
                 if transcript.text:
-                    self._dialogue_state.update_from_user(transcript.text, normalized_text)
+                    self._dialogue_state.update_from_user(transcript.text, normalized_text, kb=self._kb)
                     self._history.append({"role": "user", "text": normalized_text or transcript.text})
                     self._history = self._history[-12:]
                 await self._publish_status("routing_intent")
@@ -1681,36 +1700,36 @@ class ParticipantAudioSession:
 
                 if not transcript.text or transcript.confidence < self._config.stt_confidence_floor:
                     response_text = self._config.fallback_low_confidence_text
+                elif faq_answer:
+                    response_text = faq_answer
                 else:
                     if intent.use_llm:
                         await self._publish_status("complex_request_detected")
                         if self._llm_service.enabled:
                             try:
                                 state_snapshot = self._dialogue_state.snapshot()
-                                knowledge = self._rag.retrieve(normalized_text, state_snapshot)
+                                knowledge = self._kb.retrieve(normalized_text, state_snapshot)
+                                examples = self._kb.relevant_examples(normalized_text)
                                 llm_reply, llm_latency_ms = await self._llm_service.generate_response(
                                     normalized_text=normalized_text,
                                     history=self._history,
                                     dialogue_state=state_snapshot,
                                     knowledge=knowledge,
+                                    truth_rules=self._kb.truth_rules,
+                                    examples=examples,
                                 )
                                 response_text = validate_llm_reply(
                                     reply_tts=llm_reply.reply_tts,
-                                    fallback_reply=self._config.fallback_complex_text,
+                                    fallback_reply=self._state_fallback_reply(),
                                     state=state_snapshot,
                                     knowledge=knowledge,
+                                    truth_rules=self._kb.truth_rules,
                                 )
                             except Exception as exc:
                                 self._log(f"llm fallback failed for {self._participant.identity}: {exc}")
-                                response_text = self._responses.choose(
-                                    intent,
-                                    last_agent_message=self._last_agent_message,
-                                )
+                                response_text = self._state_fallback_reply()
                         else:
-                            response_text = self._responses.choose(
-                                intent,
-                                last_agent_message=self._last_agent_message,
-                            )
+                            response_text = self._state_fallback_reply()
                     else:
                         await self._publish_status("simple_intent_detected")
                         response_text = self._responses.choose(
@@ -1731,6 +1750,7 @@ class ParticipantAudioSession:
             self._dialogue_state.update_from_agent(
                 response_text,
                 llm_reply.next_step if llm_reply else "",
+                kb=self._kb,
             )
             self._history.append({"role": "assistant", "text": response_text})
             self._history = self._history[-12:]

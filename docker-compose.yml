@@ -50,7 +50,10 @@ services:
       AGENT_NAME: ${AGENT_NAME:-Room Agent}
       AGENT_READY_TOPIC: ${AGENT_READY_TOPIC:-presence}
       TOKEN_REQUEST_TIMEOUT: ${TOKEN_REQUEST_TIMEOUT:-10}
+      AGENT_DATA_DIR: /app/data
     depends_on:
       - livekit
       - token_server
+    volumes:
+      - ./data:/app/data:ro
     restart: unless-stopped

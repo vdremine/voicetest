@@ -11,6 +11,7 @@ def validate_llm_reply(
     fallback_reply: str,
     state: dict[str, Any],
     knowledge: list[KnowledgeSnippet],
+    truth_rules: tuple[str, ...] = (),
 ) -> str:
     text = reply_tts.strip()
     if not text:
@@ -36,5 +37,9 @@ def validate_llm_reply(
 
     if "покупка автомобиля" in state_summary and "птс" in lowered:
         return fallback_reply
+
+    if truth_rules:
+        if "стопроцент" in lowered or "гарантир" in lowered:
+            return fallback_reply
 
     return text
