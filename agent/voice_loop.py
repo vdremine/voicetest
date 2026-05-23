@@ -18,7 +18,7 @@ from typing import Any, Callable
 import numpy as np
 import torch
 import torchaudio.functional as torchaudio_f
-from agent_core import DialogueState, KnowledgeBase, build_context_messages, validate_llm_reply
+from agent_core import DialogueState, KnowledgeBase, ToolGraphRuntime, build_context_messages, validate_llm_reply
 from faster_whisper import WhisperModel
 from livekit import rtc
 from openai import AsyncOpenAI
@@ -159,7 +159,7 @@ class VoicePipelineConfig:
             llm_api_key=env_nonempty("LLM_API_KEY", default_llm_api_key),
             llm_project=llm_project,
             llm_temperature=float(os.getenv("LLM_TEMPERATURE", "0.2")),
-            llm_max_tokens=int(os.getenv("LLM_MAX_TOKENS", "96")),
+            llm_max_tokens=int(os.getenv("LLM_MAX_TOKENS", "180")),
             adaptive_classifier_enabled=env_bool("ADAPTIVE_CLASSIFIER_ENABLED", False),
             tts_enabled=env_bool("TTS_ENABLED", True),
             tts_model_path=Path(os.getenv("TTS_MODEL_PATH", "/models/silero-tts/ru/v5_4_ru.pt")),
@@ -764,20 +764,15 @@ TTS:
         fallback_use_llm: bool,
         fallback_confidence: float,
     ) -> IntentResult:
-        payload_text = extract_first_json_object(raw_text)
-        parsed: dict[str, Any] = {}
-        try:
-            maybe_parsed = json.loads(payload_text)
-            if isinstance(maybe_parsed, dict):
-                parsed = maybe_parsed
-        except Exception:
-            parsed = {}
+        parsed, _ = try_parse_json_object(raw_text)
 
-        intent = str(parsed.get("intent", "")).strip() or fallback_intent
+        raw_intent = parsed.get("intent")
+        intent = raw_intent.strip() if isinstance(raw_intent, str) else fallback_intent
         if intent not in cls._CLASSIFIER_ALLOWED_INTENTS:
             intent = fallback_intent
 
-        action = str(parsed.get("action", "")).strip() or fallback_action
+        raw_action = parsed.get("action")
+        action = raw_action.strip() if isinstance(raw_action, str) else fallback_action
         if action not in cls._CLASSIFIER_ALLOWED_ACTIONS:
             action = fallback_action
 
@@ -868,6 +863,7 @@ TTS:
         knowledge: list[KnowledgeSnippet] | None = None,
         truth_rules: tuple[str, ...] = (),
         examples: list[list[dict[str, str]]] | None = None,
+        graph_context: dict[str, Any] | None = None,
     ) -> tuple[LlmReply, int]:
         if not self.enabled:
             raise RuntimeError("LLM is disabled by configuration")
@@ -887,6 +883,21 @@ TTS:
                     "Никакого текста вне JSON."
                 ),
             },
+            *(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Текущий runtime-узел сценария.\n"
+                            f"{json.dumps(graph_context, ensure_ascii=False)}\n"
+                            "Отвечай только в рамках этого узла. "
+                            "Не перепрыгивай через следующий шаг и не расширяй сценарий без причины."
+                        ),
+                    }
+                ]
+                if graph_context
+                else []
+            ),
             *build_context_messages(
                 state=dialogue_state or {},
                 knowledge=knowledge or [],
@@ -1006,6 +1017,17 @@ def extract_first_json_object(text: str) -> str:
     return value
 
 
+def try_parse_json_object(text: str) -> tuple[dict[str, Any], str]:
+    payload_text = extract_first_json_object(text)
+    try:
+        maybe_parsed = json.loads(payload_text)
+    except Exception:
+        return {}, payload_text
+    if not isinstance(maybe_parsed, dict):
+        return {}, payload_text
+    return maybe_parsed, payload_text
+
+
 def dedupe_compact_strings(items: list[str], *, limit: int) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
@@ -1031,31 +1053,29 @@ def parse_llm_reply(
     fallback_next_step: str,
     fallback_search_seed: str,
 ) -> LlmReply:
-    payload_text = extract_first_json_object(raw_text)
-    parsed: dict[str, Any] = {}
-    json_like_response = raw_text.lstrip().startswith("{") or payload_text.lstrip().startswith("{")
-    try:
-        maybe_parsed = json.loads(payload_text)
-        if isinstance(maybe_parsed, dict):
-            parsed = maybe_parsed
-    except Exception:
-        parsed = {}
+    parsed, _ = try_parse_json_object(raw_text)
 
-    raw_reply_value = parsed.get("reply_tts", "")
-    reply_source = str(raw_reply_value).strip() if raw_reply_value is not None else ""
-    if not reply_source:
-        reply_source = fallback_reply if json_like_response else raw_text
-    if reply_source.lstrip().startswith("{") or '"reply_tts"' in reply_source:
+    raw_reply_value = parsed.get("reply_tts")
+    reply_source = raw_reply_value.strip() if isinstance(raw_reply_value, str) else ""
+    if not reply_source or reply_source.lstrip().startswith("{") or '"reply_tts"' in reply_source:
         reply_source = fallback_reply
 
     reply_tts = sanitize_voice_response(reply_source, fallback=fallback_reply)
-    intent = str(parsed.get("intent", "")).strip() or fallback_intent
-    next_step = str(parsed.get("next_step", "")).strip() or fallback_next_step
+
+    raw_intent = parsed.get("intent")
+    intent = raw_intent.strip() if isinstance(raw_intent, str) else ""
+    if not intent:
+        intent = fallback_intent
+
+    raw_next_step = parsed.get("next_step")
+    next_step = raw_next_step.strip() if isinstance(raw_next_step, str) else ""
+    if not next_step:
+        next_step = fallback_next_step
 
     raw_search_index = parsed.get("search_index", [])
     search_values: list[str] = []
     if isinstance(raw_search_index, list):
-        search_values = [str(item) for item in raw_search_index]
+        search_values = [item for item in raw_search_index if isinstance(item, str)]
     elif isinstance(raw_search_index, str):
         search_values = [raw_search_index]
 
@@ -1858,6 +1878,22 @@ class ParticipantAudioSession:
         except Exception as exc:
             self._log(f"failed to load knowledge base from {config.data_dir}: {exc}")
             self._kb = KnowledgeBase.default()
+        try:
+            graph_path = Path(
+                os.getenv(
+                    "TOOL_GRAPH_PATH",
+                    str(config.data_dir / "tool_graph.json"),
+                )
+            )
+            self._tool_graph = ToolGraphRuntime.load(
+                graph_path=graph_path,
+                agent_name="Влад+имир",
+            )
+            self._dialogue_state.current_node = self._tool_graph.start_node
+            self._log("loaded tool graph runtime")
+        except Exception as exc:
+            self._log(f"failed to load tool graph runtime: {exc}")
+            self._tool_graph = None
 
         self._session_id = f"{participant.identity}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
         self._session_logger = SessionLogger(config.session_log_dir / f"{self._session_id}.jsonl")
@@ -2245,6 +2281,12 @@ class ParticipantAudioSession:
 
     def _state_fallback_reply(self) -> str:
         snapshot = self._dialogue_state.snapshot()
+        if self._tool_graph is not None:
+            graph_question = self._tool_graph.question_for_state(snapshot)
+            if graph_question is not None:
+                node_name, question = graph_question
+                self._dialogue_state.current_node = node_name
+                return question
         next_field = self._kb.next_required_field(snapshot) or self._dialogue_state.next_required_field
         if next_field:
             return self._kb.question_for_field(next_field)
@@ -2412,6 +2454,7 @@ class ParticipantAudioSession:
         filler_type = ""
         llm_latency_ms = 0
         tts_latency_ms = 0
+        next_graph_node = self._dialogue_state.current_node
 
         try:
             if not self._config.stt_enabled:
@@ -2465,7 +2508,15 @@ class ParticipantAudioSession:
                 return
 
             if not rescue_only:
-                faq_answer = self._kb.match_faq(normalized_text)
+                graph_cached_reply = None
+                if self._tool_graph is not None:
+                    graph_cached_reply = self._tool_graph.cached_reply_for_text(
+                        normalized_text,
+                        self._dialogue_state.snapshot(),
+                    )
+                faq_answer = graph_cached_reply.reply_text if graph_cached_reply else self._kb.match_faq(normalized_text)
+                if graph_cached_reply is not None:
+                    next_graph_node = graph_cached_reply.next_node
                 if transcript.text:
                     updated_fields = self._dialogue_state.update_from_user(
                         transcript.text,
@@ -2534,6 +2585,7 @@ class ParticipantAudioSession:
                 elif self._should_advance_by_state(intent, updated_fields):
                     await self._publish_status("simple_intent_detected")
                     response_text = self._state_fallback_reply()
+                    next_graph_node = self._dialogue_state.current_node
                 elif intent.use_llm:
                     await self._publish_status("complex_request_detected")
                     if self._llm_service.enabled:
@@ -2541,6 +2593,13 @@ class ParticipantAudioSession:
                             state_snapshot = self._dialogue_state.snapshot()
                             knowledge = self._kb.retrieve(normalized_text, state_snapshot)
                             examples = self._kb.relevant_examples(normalized_text)
+                            graph_context = (
+                                self._tool_graph.llm_context_for_text(normalized_text, state_snapshot)
+                                if self._tool_graph is not None
+                                else None
+                            )
+                            if graph_context:
+                                next_graph_node = str(graph_context.get("node_name", "")).strip() or next_graph_node
                             llm_task = asyncio.create_task(
                                 self._llm_service.generate_response(
                                     normalized_text=normalized_text,
@@ -2549,6 +2608,7 @@ class ParticipantAudioSession:
                                     knowledge=knowledge,
                                     truth_rules=self._kb.truth_rules,
                                     examples=examples,
+                                    graph_context=graph_context,
                                 )
                             )
                             if self._config.voice_bridge_on_llm and self._config.tts_enabled:
@@ -2586,9 +2646,11 @@ class ParticipantAudioSession:
                             response_text = self._state_fallback_reply()
                     else:
                         response_text = self._state_fallback_reply()
+                        next_graph_node = self._dialogue_state.current_node
                 else:
                     if intent.action == "ask_next_slot":
                         response_text = self._state_fallback_reply()
+                        next_graph_node = self._dialogue_state.current_node
                     else:
                         await self._publish_status("simple_intent_detected")
                         response_text = self._responses.choose(
@@ -2618,6 +2680,7 @@ class ParticipantAudioSession:
                 response_text,
                 llm_reply.next_step if llm_reply else "",
                 kb=self._kb,
+                current_node=next_graph_node,
             )
             self._history.append({"role": "assistant", "text": response_text})
             self._history = self._history[-12:]

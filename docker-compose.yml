@@ -51,9 +51,11 @@ services:
       AGENT_READY_TOPIC: ${AGENT_READY_TOPIC:-presence}
       TOKEN_REQUEST_TIMEOUT: ${TOKEN_REQUEST_TIMEOUT:-10}
       AGENT_DATA_DIR: /app/data
+      TOOL_GRAPH_PATH: ${TOOL_GRAPH_PATH:-/app/voice_agent_graph_v0_1/tool_graph.json}
     depends_on:
       - livekit
       - token_server
     volumes:
       - ./data:/app/data:ro
+      - ./voice_agent_graph_v0_1:/app/voice_agent_graph_v0_1:ro
     restart: unless-stopped

@@ -96,7 +96,8 @@ services:
       LLM_API_KEY: ${LLM_API_KEY:-local-token}
       LLM_PROJECT: ${LLM_PROJECT:-}
       LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.2}
-      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-96}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-180}
+      TOOL_GRAPH_PATH: ${TOOL_GRAPH_PATH:-/app/voice_agent_graph_v0_1/tool_graph.json}
       ADAPTIVE_CLASSIFIER_ENABLED: ${ADAPTIVE_CLASSIFIER_ENABLED:-false}
       TTS_ENABLED: ${TTS_ENABLED:-true}
       TTS_MODEL_PATH: ${TTS_MODEL_PATH:-/models/silero-tts/ru/v5_4_ru.pt}
@@ -124,6 +125,7 @@ services:
       - ${MODEL_CACHE_DIR:-/opt/models}:/models
       - ${VOICE_AGENT_DATA_DIR:-/opt/voice-agent-data}:/tmp/voice-agent
       - ./data:/app/data:ro
+      - ./voice_agent_graph_v0_1:/app/voice_agent_graph_v0_1:ro
 
 volumes:
   caddy_data:

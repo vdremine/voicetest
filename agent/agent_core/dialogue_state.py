@@ -16,6 +16,7 @@ _AMOUNT_RE = re.compile(
 @dataclass(slots=True)
 class DialogueState:
     stage: str = "greeting"
+    current_node: str = "opening"
     scenario: str = ""
     object_type: str = ""
     amount_text: str = ""
@@ -106,8 +107,17 @@ class DialogueState:
             self.next_required_field = kb.next_required_field(self.snapshot())
         return updated_fields
 
-    def update_from_agent(self, reply_tts: str, next_step: str, *, kb: KnowledgeBase | None = None) -> None:
+    def update_from_agent(
+        self,
+        reply_tts: str,
+        next_step: str,
+        *,
+        kb: KnowledgeBase | None = None,
+        current_node: str | None = None,
+    ) -> None:
         self.last_agent_text = reply_tts.strip()
+        if current_node:
+            self.current_node = current_node.strip()
         self.awaiting_field = self._detect_awaiting_field(reply_tts, next_step)
         self._advance_stage()
         if kb is not None:
@@ -137,6 +147,7 @@ class DialogueState:
         summary = "; ".join(summary_parts) if summary_parts else "фактов пока мало"
         return {
             "stage": self.stage,
+            "current_node": self.current_node,
             "scenario": self.scenario,
             "object_type": self.object_type,
             "awaiting_field": self.awaiting_field,

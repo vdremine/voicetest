@@ -322,6 +322,10 @@
           "next": "refinance_collect_current_credit"
         },
         {
+          "condition": "no_collateral_or_wrong_product",
+          "next": "no_collateral_partner_prescreen"
+        },
+        {
           "condition": "new_loan_interest",
           "next": "collect_amount"
         },
@@ -620,6 +624,18 @@
         }
       ]
     },
+    "collect_ownership_share": {
+      "type": "slot_fill",
+      "slot": "ownership_share",
+      "question": "Подскажите, пожалуйста, объект полностью на вас или в доле?",
+      "tool": "save_slot",
+      "transitions": [
+        {
+          "condition": "slot_filled",
+          "next": "pitch_short"
+        }
+      ]
+    },
     "pitch_short": {
       "type": "llm_action",
       "goal": "коротко подтвердить рабочий кейс и назвать максимум 1-2 условия",
@@ -629,6 +645,7 @@
         "не обещать одобрение",
         "формулировать как предварительное рассмотрение",
         "если объект нестандартный, вроде комнаты или малосемейки, не отсеивать его автоматически",
+        "если у клиента только доля объекта и низкая оценка, не обещать точную сумму, а говорить как о предварительном диапазоне после проверки",
         "после короткого питча вести к эксперту"
       ],
       "good_example": "Понял, квартира в регионе, без обременения, собственник — вы. Это похоже на рабочий вариант: можно предварительно рассмотреть сумму до части стоимости объекта, а точные условия посчитает эксперт.",
@@ -643,6 +660,73 @@
         }
       ]
     },
+    "no_collateral_partner_prescreen": {
+      "type": "llm_action",
+      "goal": "если у клиента нет своей недвижимости, автомобиля или иного залога, коротко переключиться на партнерский беззалоговый прескрин",
+      "rules": [
+        "сначала признать, что залогового объекта у клиента нет",
+        "не спорить и не пытаться снова продать залоговый продукт",
+        "разрешено коротко перейти в партнерский беззалоговый сценарий",
+        "собрать только базовые поля: занятость, стаж, доход, кредитная история, текущая нагрузка",
+        "не обещать ставку и не обещать одобрение",
+        "если клиент согласен, переводить на менеджера с пометкой unsecured_partner"
+      ],
+      "good_example": "Понял, если собственности под залог нет, тогда могу коротко проверить, подойдёт ли партнёрский вариант без залога. Подскажите, пожалуйста, у вас есть официальная работа и какой примерно ежемесячный доход?",
+      "transitions": [
+        {
+          "condition": "client_agrees_to_prescreen",
+          "next": "unsecured_partner_collect_minimum"
+        },
+        {
+          "condition": "client_requests_callback",
+          "next": "schedule_callback"
+        },
+        {
+          "condition": "client_rejects",
+          "next": "finish_not_interested"
+        }
+      ]
+    },
+    "unsecured_partner_collect_minimum": {
+      "type": "slot_group",
+      "scenario": "unsecured_partner",
+      "goal": "собрать минимум фактов для передачи в партнерский беззалоговый контур",
+      "slots": [
+        "amount",
+        "requested_product_type",
+        "employment_status",
+        "employment_role",
+        "employment_duration_months",
+        "monthly_income",
+        "credit_history_status",
+        "current_credit_load",
+        "existing_loan_balance"
+      ],
+      "ask_order": [
+        "employment_status",
+        "employment_role",
+        "employment_duration_months",
+        "monthly_income",
+        "credit_history_status",
+        "current_credit_load",
+        "existing_loan_balance"
+      ],
+      "rules": [
+        "не называть этот сценарий основным продуктом компании",
+        "собирать только минимум для экспертного звонка",
+        "если клиенту неудобно, сразу согласовать callback вместо длинного опроса"
+      ],
+      "transitions": [
+        {
+          "condition": "enough_facts_collected",
+          "next": "handoff_unsecured_partner"
+        },
+        {
+          "condition": "client_requests_evening_callback",
+          "next": "schedule_specific_daytime_callback"
+        }
+      ]
+    },
     "handle_questions": {
       "type": "llm_action",
       "goal": "ответить на вопрос клиента и вернуть к передаче эксперту",
@@ -650,6 +734,8 @@
         "rate",
         "commission",
         "bank_or_broker",
+        "branch_visit",
+        "remote_process",
         "documents",
         "safety",
         "monthly_payment",
@@ -677,6 +763,30 @@
         {
           "condition": "more_questions",
           "next": "handle_questions"
+        }
+      ]
+    },
+    "handoff_unsecured_partner": {
+      "type": "tool_call",
+      "tool": "create_lead_transfer",
+      "goal": "передать клиента в партнерский беззалоговый контур",
+      "required_slots_any": [
+        [
+          "amount",
+          "employment_status",
+          "monthly_income"
+        ],
+        [
+          "employment_status",
+          "credit_history_status",
+          "current_credit_load"
+        ]
+      ],
+      "reply_template": "Понял, тогда передам вашу ситуацию специалисту. Он свяжется с вами и уже скажет, какие варианты можно рассмотреть без залога.",
+      "transitions": [
+        {
+          "condition": "lead_created",
+          "next": "finish_success"
         }
       ]
     },

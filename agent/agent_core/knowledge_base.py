@@ -84,15 +84,20 @@ class KnowledgeBase:
             if code:
                 product_synonyms[code] = synonyms
 
-        faq_data = _load_json(data_dir / "faq_knowledge_v2.json")
-        for item in faq_data.get("элементы", []):
-            patterns = tuple(
-                str(pattern).strip().lower()
-                for pattern in item.get("шаблоны_вопросов", [])
-                if str(pattern).strip()
-            )
-            answer = str(item.get("ответ", "")).strip()
-            if patterns and answer:
+        for faq_path in (
+            data_dir / "conversation_faq_v1.json",
+            data_dir / "faq_knowledge_v2.json",
+        ):
+            faq_data = _load_json(faq_path)
+            for item in faq_data.get("элементы", []):
+                patterns = tuple(
+                    str(pattern).strip().lower()
+                    for pattern in item.get("шаблоны_вопросов", [])
+                    if str(pattern).strip()
+                )
+                answer = str(item.get("ответ", "")).strip()
+                if not patterns or not answer:
+                    continue
                 faq_entries.append(
                     FaqEntry(
                         code=str(item.get("код", "")).strip(),
@@ -106,7 +111,9 @@ class KnowledgeBase:
                         text=answer,
                         keywords=tuple(
                             _dedupe_preserve(
-                                list(patterns) + _keywords_from_text(" ".join(patterns)) + _keywords_from_text(answer)
+                                list(patterns)
+                                + _keywords_from_text(" ".join(patterns))
+                                + _keywords_from_text(answer)
                             )
                         ),
                     )
