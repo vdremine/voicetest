@@ -1009,6 +1009,28 @@ TTS:
         lines.append(f"current_user_message={normalized_text}")
         return "\n\n".join(lines)
 
+    def _log_yandex_prompt_context(
+        self,
+        *,
+        normalized_text: str,
+        history: list[dict[str, str]],
+        dialogue_state: dict[str, Any] | None,
+        prompt_input: str,
+    ) -> None:
+        state = dialogue_state or {}
+        self._log(
+            "yandex prompt context "
+            f"role={self._role} "
+            f"user_text={normalized_text!r} "
+            f"assistant_turn_count={self._assistant_turn_count(history)} "
+            f"awaiting_field={state.get('awaiting_field', '')!r} "
+            f"next_required_field={state.get('next_required_field', '')!r} "
+            f"known_facts={state.get('known_facts', {})!r}"
+        )
+        self._log(
+            f"yandex prompt payload role={self._role} input_text={prompt_input!r}"
+        )
+
     def _stabilize_yandex_prompt_reply(
         self,
         reply: LlmReply,
@@ -1020,6 +1042,7 @@ TTS:
         if assistant_turn_count == 0:
             return reply
 
+        original_text = reply.reply_tts.strip()
         text = reply.reply_tts.strip()
         opening_prefixes = (
             "алл+о",
@@ -1043,6 +1066,13 @@ TTS:
             text = sanitize_voice_response(
                 text,
                 fallback="Все хорошо, спасибо. Подскажите, пожалуйста, какая сумма вам нужна?",
+            )
+        if text != original_text:
+            self._log(
+                "yandex reply stabilized "
+                f"role={self._role} "
+                f"user_text={normalized_text!r} "
+                f"before={original_text!r} after={text!r}"
             )
         return LlmReply(
             reply_tts=text,
@@ -1275,6 +1305,12 @@ TTS:
             dialogue_state=dialogue_state,
             truth_rules=truth_rules,
         )
+        self._log_yandex_prompt_context(
+            normalized_text=normalized_text,
+            history=history,
+            dialogue_state=dialogue_state,
+            prompt_input=history_text,
+        )
         response = await client.responses.create(
             prompt={
                 "id": prompt_id,
@@ -1289,6 +1325,10 @@ TTS:
             } if self._project().strip() else None,
         )
         text = self._extract_responses_output_text(response)
+        self._log(
+            f"yandex prompt raw response role={self._role} prompt_id={prompt_id} "
+            f"user_message={user_message!r} raw_text={text!r}"
+        )
         latency_ms = int((time.perf_counter() - started_at) * 1000)
         reply = parse_llm_reply(
             text,
@@ -3088,7 +3128,16 @@ class ParticipantAudioSession:
         snapshot = self._dialogue_state.snapshot()
         next_field = self._kb.next_required_field(snapshot) or self._dialogue_state.next_required_field
         if next_field:
-            return self._kb.question_for_field(next_field)
+            reply = self._kb.question_for_field(next_field)
+            self._log(
+                f"state fallback reply participant={self._participant.identity} "
+                f"next_field={next_field!r} reply={reply!r}"
+            )
+            return reply
+        self._log(
+            f"state fallback reply participant={self._participant.identity} "
+            f"next_field=None reply={self._config.fallback_complex_text!r}"
+        )
         return self._config.fallback_complex_text
 
     def _llm_bridge_text(self) -> str:
@@ -3373,7 +3422,10 @@ class ParticipantAudioSession:
                     error_stage = "ignored_low_information"
                     self._log(
                         f"ignored low-information transcript participant={self._participant.identity} "
-                        f"utterance_id={utterance_id} text={transcript.text!r}"
+                        f"utterance_id={utterance_id} text={transcript.text!r} "
+                        f"normalized_text={normalized_text!r} "
+                        f"awaiting_field={self._dialogue_state.awaiting_field!r} "
+                        f"next_required_field={self._dialogue_state.next_required_field!r}"
                     )
                     return
             if self._is_stale_turn(turn_revision):
@@ -3387,6 +3439,7 @@ class ParticipantAudioSession:
 
             if not rescue_only:
                 if transcript.text:
+                    state_before_user = self._dialogue_state.snapshot()
                     updated_fields = self._dialogue_state.update_from_user(
                         transcript.text,
                         normalized_text,
@@ -3394,6 +3447,12 @@ class ParticipantAudioSession:
                     )
                     self._history.append({"role": "user", "text": normalized_text or transcript.text})
                     self._history = self._history[-12:]
+                    state_after_user = self._dialogue_state.snapshot()
+                    self._log(
+                        f"state delta user participant={self._participant.identity} "
+                        f"utterance_id={utterance_id} before={state_before_user!r} "
+                        f"after={state_after_user!r}"
+                    )
                 state_snapshot = self._dialogue_state.snapshot()
                 self._log(
                     f"turn state participant={self._participant.identity} "
@@ -3630,14 +3689,21 @@ class ParticipantAudioSession:
                 return
 
             self._last_agent_message = response_text
+            state_before_agent = self._dialogue_state.snapshot()
             self._dialogue_state.update_from_agent(
                 response_text,
                 llm_reply.next_step if llm_reply else "",
                 kb=self._kb,
             )
+            state_after_agent = self._dialogue_state.snapshot()
             self._history.append({"role": "assistant", "text": response_text})
             self._history = self._history[-12:]
             self._needs_rescue_prompt = False
+            self._log(
+                f"state delta agent participant={self._participant.identity} "
+                f"utterance_id={utterance_id} before={state_before_agent!r} "
+                f"after={state_after_agent!r}"
+            )
 
             await self._event_bus.publish_json(
                 {
