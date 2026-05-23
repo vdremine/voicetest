@@ -1,7 +1,7 @@
 vdremin.ru {
-  reverse_proxy frontend:8080
+  reverse_proxy 127.0.0.1:8080
 }
 
 livekit.vdremin.ru {
-  reverse_proxy livekit:7880
+  reverse_proxy 127.0.0.1:7880
 }

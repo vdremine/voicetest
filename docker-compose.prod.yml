@@ -1,14 +1,11 @@
 services:
   caddy:
     image: caddy:2.9-alpine
-    profiles: ["edge"]
+    network_mode: host
     restart: unless-stopped
     depends_on:
       - frontend
       - livekit
-    ports:
-      - "80:80"
-      - "443:443"
     volumes:
       - ./Caddyfile.prod:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
@@ -16,22 +13,28 @@ services:
 
   livekit:
     image: livekit/livekit-server:latest
+    network_mode: host
     restart: unless-stopped
-    command:
-      - --dev
-      - --bind
-      - 0.0.0.0
-    ports:
-      - "7880:7880/tcp"
-      - "7881:7881/tcp"
+    environment:
+      LIVEKIT_CONFIG: |
+        port: 7880
+        log_level: info
+        rtc:
+          tcp_port: 7881
+          port_range_start: ${LIVEKIT_RTC_PORT_RANGE_START:-50000}
+          port_range_end: ${LIVEKIT_RTC_PORT_RANGE_END:-60000}
+          use_external_ip: ${LIVEKIT_USE_EXTERNAL_IP:-true}
+        keys:
+          "${LIVEKIT_API_KEY:-voice-agent-prod}": "${LIVEKIT_API_SECRET:-replace-with-long-random-secret}"
 
   token_server:
     build:
       context: ./token_server
+    network_mode: host
     restart: unless-stopped
     depends_on:
       - livekit
-    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    command: uvicorn main:app --host 127.0.0.1 --port 8000
     environment:
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-voice-agent-prod}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-replace-with-long-random-secret}
@@ -41,11 +44,10 @@ services:
 
   frontend:
     image: nginx:1.27-alpine
+    network_mode: host
     restart: unless-stopped
     depends_on:
       - token_server
-    ports:
-      - "8080:8080"
     volumes:
       - ./frontend/index.html:/usr/share/nginx/html/index.html:ro
       - ./frontend/nginx.prod.conf:/etc/nginx/nginx.conf:ro
@@ -53,13 +55,14 @@ services:
   agent:
     build:
       context: ./agent
+    network_mode: host
     restart: unless-stopped
     depends_on:
       - livekit
       - token_server
     environment:
-      TOKEN_SERVER_URL: http://token_server:8000/token
-      LIVEKIT_URL_INTERNAL: ws://livekit:7880
+      TOKEN_SERVER_URL: http://127.0.0.1:8000/token
+      LIVEKIT_URL_INTERNAL: ws://127.0.0.1:7880
       AGENT_ROOM: ${AGENT_ROOM:-demo-room}
       AGENT_IDENTITY: ${AGENT_IDENTITY:-agent-001}
       AGENT_NAME: ${AGENT_NAME:-Room Agent}
@@ -92,7 +95,7 @@ services:
       LLM_MODEL: ${LLM_MODEL:-}
       LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-low}
       LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-15}
-      LLM_BASE_URL: ${LLM_BASE_URL:-http://llm:8001/v1}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://127.0.0.1:8001/v1}
       LLM_API_KEY: ${LLM_API_KEY:-local-token}
       LLM_PROJECT: ${LLM_PROJECT:-}
       LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.2}
