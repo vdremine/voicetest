@@ -210,6 +210,74 @@ class DialogueState:
             "last_agent_text": self.last_agent_text,
         }
 
+    def force_capture_expected_slot(self, raw_text: str, normalized_text: str) -> set[str]:
+        expected = (self.next_required_field or "").strip()
+        if not expected:
+            return set()
+
+        text = normalized_text.strip().lower()
+        updated_fields: set[str] = set()
+
+        if expected == "регион":
+            city = self._detect_city(raw_text)
+            if city and city != self.city:
+                self.city = city
+                self.known_facts["region"] = city
+                self.known_facts["регион"] = city
+                updated_fields.add("регион")
+
+        elif expected == "обременение":
+            collateral = self._detect_collateral(text)
+            if collateral and collateral != self.collateral:
+                self.collateral = collateral
+                self.known_facts["collateral"] = collateral
+                self.known_facts["обременение"] = collateral
+                updated_fields.add("обременение")
+
+        elif expected == "вид_объекта":
+            object_type = self._detect_object_type(text)
+            if object_type and object_type != self.object_type:
+                self.object_type = object_type
+                self.known_facts["вид_объекта"] = object_type
+                updated_fields.add("вид_объекта")
+
+        elif expected == "собственники":
+            owner = self._detect_owner(text)
+            if owner and self.known_facts.get("owners") != owner:
+                self.known_facts["owner"] = owner
+                self.known_facts["owners"] = owner
+                self.known_facts["собственники"] = owner
+                updated_fields.add("собственники")
+
+        elif expected == "priority":
+            priority = self._detect_priority(text)
+            if priority and self.known_facts.get("priority") != priority:
+                self.known_facts["priority"] = priority
+                updated_fields.add("priority")
+
+        elif expected == "credit_closed":
+            credit_closed = self._detect_credit_closed(text)
+            if credit_closed and self.known_facts.get("credit_closed") != credit_closed:
+                self.known_facts["credit_closed"] = credit_closed
+                updated_fields.add("credit_closed")
+
+        elif expected == "остаток_долга":
+            remaining_debt = self._detect_remaining_debt(normalized_text)
+            if remaining_debt and self.known_facts.get("remaining_debt") != remaining_debt:
+                self.known_facts["remaining_debt"] = remaining_debt
+                self.known_facts["остаток_долга"] = remaining_debt
+                updated_fields.add("остаток_долга")
+
+        elif expected == "нужная_сумма":
+            amount = self._extract_amount(normalized_text)
+            if amount and amount != self.amount_text:
+                self.amount_text = amount
+                self.known_facts["amount"] = amount
+                self.known_facts["нужная_сумма"] = amount
+                updated_fields.add("нужная_сумма")
+
+        return updated_fields
+
     @staticmethod
     def _extract_amount(text: str) -> str:
         best = ""
@@ -267,6 +335,20 @@ class DialogueState:
     def _detect_collateral(text: str) -> str:
         if any(marker in text for marker in ("нет недвижимости", "без недвижимости", "ничего нет", "машины нет")):
             return "нет залога"
+        if any(
+            marker in text
+            for marker in (
+                "не в залоге",
+                "без обременения",
+                "свободен от залога",
+                "свободна от залога",
+                "свободно от залога",
+                "свободен",
+                "свободна",
+                "свободно",
+            )
+        ):
+            return "без обременения"
         if "залог" in text and any(marker in text for marker in ("недвижим", "квартир", "дом", "участ", "земл", "коммерчес")):
             return "недвижимость"
         if "птс" in text or ("залог" in text and any(marker in text for marker in ("автомоб", "машин"))):
@@ -333,6 +415,16 @@ class DialogueState:
             return "goal"
         if "как к вам обращаться" in text or "как вас зовут" in text:
             return "name"
+        if "какая недвижимость" in text or "квартира, дом" in text or "какой объект" in text:
+            return "object_type"
+        if "в каком регионе" in text or "где находится объект" in text:
+            return "region"
+        if "свободен от залога" in text or "в обременении" in text or "есть ли залог" in text:
+            return "collateral"
+        if "кто собственник" in text or "кто является собственником" in text:
+            return "owner"
+        if "что для вас важнее" in text and "ставка" in text:
+            return "priority"
         if "удобнее, чтобы он связался" in text or "в какое время" in text:
             return "callback_time"
         return ""

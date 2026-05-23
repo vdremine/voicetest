@@ -1692,6 +1692,10 @@ class SimpleIntentRouter:
             "плохо пообщалась",
             "нехорошая",
             "девушка",
+            "один и тот же ответ",
+            "один и тот же вопрос",
+            "повторяете одно и то же",
+            "нельзя один и тот же ответ",
         }
         self._abuse_markers = {
             "тупец",
@@ -2406,6 +2410,14 @@ class ParticipantAudioSession:
 
         return next_question
 
+    def _repair_and_resume_reply(self, intent: IntentResult) -> str:
+        next_question = self._state_fallback_reply()
+        if intent.intent == Intent.WHY_NEED_INFO.value:
+            return f"Да, поясню. Это нужно, чтобы сразу понять, подойдём ли мы вам по условиям. {next_question}"
+        if intent.intent == Intent.SERVICE_COMPLAINT.value:
+            return f"Да, понимаю. Извините, если прозвучало неудачно. Давайте коротко и по делу. {next_question}"
+        return next_question
+
     def _llm_bridge_text(self) -> str:
         name = self._dialogue_state.name.strip()
         if name:
@@ -2527,6 +2539,93 @@ class ParticipantAudioSession:
             Intent.COMPLEX_REQUEST.value,
         }
 
+    def _should_try_stalled_slot_rescue(
+        self,
+        *,
+        normalized_text: str,
+        intent: IntentResult,
+        updated_fields: set[str],
+        state_snapshot: dict[str, Any],
+    ) -> bool:
+        if updated_fields or not normalized_text.strip():
+            return False
+        if intent.intent in {
+            Intent.GREETING.value,
+            Intent.READY_TO_TALK.value,
+            Intent.IDENTIFY_SELF.value,
+            Intent.LINE_ISSUE.value,
+            Intent.WAIT.value,
+            Intent.REPEAT.value,
+            Intent.END_SESSION.value,
+            Intent.REJECT.value,
+            Intent.CANCEL.value,
+            Intent.HUMAN_HANDOFF.value,
+        }:
+            return False
+        next_field = str(state_snapshot.get("next_required_field", "")).strip()
+        current_node = str(state_snapshot.get("current_node", "")).strip()
+        if not next_field and not current_node.startswith("collect_"):
+            return False
+        if is_low_information_transcript(normalized_text, normalized_text):
+            return False
+        return True
+
+    async def _generate_stalled_slot_rescue(
+        self,
+        *,
+        normalized_text: str,
+        history: list[dict[str, str]],
+        state_snapshot: dict[str, Any],
+        utterance_id: str,
+    ) -> tuple[str, LlmReply | None, int]:
+        resume_question = self._state_fallback_reply()
+        if not self._llm_service.enabled:
+            return self._repair_and_resume_reply(IntentResult(Intent.SERVICE_COMPLAINT.value, 0.0, False, "")), None, 0
+        try:
+            knowledge = self._kb.retrieve(normalized_text, state_snapshot)
+            examples = self._kb.relevant_examples(normalized_text)
+            graph_context = (
+                self._tool_graph.llm_context_for_text(normalized_text, state_snapshot)
+                if self._tool_graph is not None
+                else {}
+            )
+            graph_context = dict(graph_context or {})
+            graph_context["node_name"] = graph_context.get("node_name") or "repair_stalled_slot"
+            graph_context["goal"] = "Если клиент уже, вероятно, ответил по текущему шагу, мягко признай возможную ошибку, коротко переформулируй и продолжи."
+            graph_context["resume_question"] = resume_question
+            graph_context["next_required_field"] = str(state_snapshot.get("next_required_field", "")).strip()
+            graph_context["stalled_slot_recovery"] = True
+            graph_context["rules"] = list(graph_context.get("rules", [])) + [
+                "Не начинай сценарий заново.",
+                "Если клиент уже дал ответ по текущему шагу, кратко это признай.",
+                "Если ответ недостаточно точный, переформулируй только текущий вопрос.",
+                "Не перепрыгивай на другой слот без причины.",
+            ]
+            llm_reply, llm_latency_ms = await self._llm_service.generate_response(
+                normalized_text=normalized_text,
+                history=history,
+                dialogue_state=state_snapshot,
+                knowledge=knowledge,
+                truth_rules=self._kb.truth_rules,
+                examples=examples,
+                graph_context=graph_context,
+            )
+            response_text = validate_llm_reply(
+                reply_tts=llm_reply.reply_tts,
+                fallback_reply=f"Да, возможно, я неточно понял. {resume_question}",
+                state=state_snapshot,
+                knowledge=knowledge,
+                truth_rules=self._kb.truth_rules,
+            )
+            self._log(
+                f"stalled-slot rescue participant={self._participant.identity} "
+                f"utterance_id={utterance_id} next_required_field={state_snapshot.get('next_required_field', '')!r}"
+            )
+            return response_text, llm_reply, llm_latency_ms
+        except Exception as exc:
+            self._log(f"stalled-slot rescue fallback for {self._participant.identity}: {exc}")
+            return f"Да, возможно, я неточно понял. {resume_question}", None, 0
+
     async def _process_utterance(
         self,
         *,
@@ -2638,6 +2737,16 @@ class ParticipantAudioSession:
                         normalized_text,
                         kb=self._kb,
                     )
+                    if not updated_fields:
+                        forced_fields = self._dialogue_state.force_capture_expected_slot(
+                            transcript.text,
+                            normalized_text,
+                        )
+                        if forced_fields:
+                            updated_fields |= forced_fields
+                            self._dialogue_state.next_required_field = self._dialogue_state._resolve_next_required_field(
+                                self._kb
+                            )
                     self._history.append({"role": "user", "text": normalized_text or transcript.text})
                     self._history = self._history[-12:]
                 state_snapshot = self._dialogue_state.snapshot()
@@ -2716,12 +2825,30 @@ class ParticipantAudioSession:
                     await self._publish_status("simple_intent_detected")
                     response_text = self._state_guided_reply(intent)
                     next_graph_node = self._dialogue_state.current_node
+                elif intent.intent in {Intent.WHY_NEED_INFO.value, Intent.SERVICE_COMPLAINT.value}:
+                    await self._publish_status("simple_intent_detected")
+                    response_text = self._repair_and_resume_reply(intent)
+                    next_graph_node = self._dialogue_state.current_node
                 elif faq_answer:
                     await self._publish_status("simple_intent_detected")
                     response_text = faq_answer
                 elif self._should_advance_by_state(intent, updated_fields):
                     await self._publish_status("simple_intent_detected")
                     response_text = self._state_guided_reply(intent)
+                    next_graph_node = self._dialogue_state.current_node
+                elif self._should_try_stalled_slot_rescue(
+                    normalized_text=normalized_text,
+                    intent=intent,
+                    updated_fields=updated_fields,
+                    state_snapshot=state_snapshot,
+                ):
+                    await self._publish_status("complex_request_detected")
+                    response_text, llm_reply, llm_latency_ms = await self._generate_stalled_slot_rescue(
+                        normalized_text=normalized_text,
+                        history=self._history,
+                        state_snapshot=state_snapshot,
+                        utterance_id=utterance_id,
+                    )
                     next_graph_node = self._dialogue_state.current_node
                 elif intent.use_llm:
                     await self._publish_status("complex_request_detected")
