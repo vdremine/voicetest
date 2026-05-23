@@ -18,6 +18,7 @@ from typing import Any, Callable
 import numpy as np
 import torch
 import torchaudio.functional as torchaudio_f
+import httpx
 from agent_core import DialogueState, KnowledgeBase, build_context_messages, inspect_llm_reply
 from faster_whisper import WhisperModel
 from livekit import rtc
@@ -76,6 +77,9 @@ class VoicePipelineConfig:
     llm_base_url: str
     llm_api_key: str
     llm_project: str
+    yandex_assistant_id: str
+    yandex_assistant_base_url: str
+    yandex_assistant_poll_interval_ms: int
     llm_temperature: float
     llm_max_tokens: int
     adaptive_classifier_enabled: bool
@@ -131,6 +135,10 @@ class VoicePipelineConfig:
         default_llm_api_key = "local-token"
         llm_project = env_nonempty("LLM_PROJECT")
         supervisor_project = env_nonempty("SUPERVISOR_PROJECT")
+        yandex_assistant_base_url = env_nonempty(
+            "YANDEX_ASSISTANT_BASE_URL",
+            "https://rest-assistant.api.cloud.yandex.net/assistants/v1",
+        )
 
         if llm_provider == "yandex":
             yandex_api_key = env_nonempty("YANDEX_API_KEY")
@@ -173,6 +181,9 @@ class VoicePipelineConfig:
             llm_base_url=env_nonempty("LLM_BASE_URL", default_llm_base_url),
             llm_api_key=env_nonempty("LLM_API_KEY", default_llm_api_key),
             llm_project=llm_project,
+            yandex_assistant_id=env_nonempty("YANDEX_ASSISTANT_ID"),
+            yandex_assistant_base_url=yandex_assistant_base_url,
+            yandex_assistant_poll_interval_ms=int(os.getenv("YANDEX_ASSISTANT_POLL_INTERVAL_MS", "350")),
             llm_temperature=float(os.getenv("LLM_TEMPERATURE", "0.2")),
             llm_max_tokens=int(os.getenv("LLM_MAX_TOKENS", "4096")),
             adaptive_classifier_enabled=env_bool("ADAPTIVE_CLASSIFIER_ENABLED", False),
@@ -822,6 +833,8 @@ TTS:
         self._log = log
         self._role = role
         self._client: AsyncOpenAI | None = None
+        self._assistant_threads: dict[str, str] = {}
+        self._assistant_thread_lock = asyncio.Lock()
 
     @property
     def enabled(self) -> bool:
@@ -861,6 +874,204 @@ TTS:
 
     def _max_tokens(self) -> int:
         return self._config.supervisor_max_tokens if self._role == "supervisor" else self._config.llm_max_tokens
+
+    def _uses_yandex_assistant_api(self) -> bool:
+        return (
+            self._role == "talker"
+            and self._provider_name() == "yandex"
+            and bool(self._config.yandex_assistant_id.strip())
+        )
+
+    def _yandex_auth_headers(self) -> dict[str, str]:
+        api_key = self._api_key().strip()
+        if not api_key:
+            raise RuntimeError("Yandex assistant API key is not configured")
+        if api_key.lower().startswith(("bearer ", "api-key ")):
+            auth_value = api_key
+        else:
+            auth_value = f"Api-Key {api_key}"
+        return {
+            "Authorization": auth_value,
+            "Content-Type": "application/json",
+        }
+
+    @staticmethod
+    def _extract_yandex_message_text(message_payload: dict[str, Any]) -> str:
+        content = message_payload.get("content", {})
+        parts = content.get("content", []) if isinstance(content, dict) else []
+        texts: list[str] = []
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            text_part = part.get("text", {})
+            if not isinstance(text_part, dict):
+                continue
+            value = str(text_part.get("content", "")).strip()
+            if value:
+                texts.append(value)
+        return " ".join(texts).strip()
+
+    def _build_yandex_assistant_input(
+        self,
+        *,
+        normalized_text: str,
+        history: list[dict[str, str]],
+        dialogue_state: dict[str, Any] | None,
+        truth_rules: tuple[str, ...],
+    ) -> str:
+        recent_turns = history[-6:]
+        history_lines = [
+            f"{item.get('role', 'user')}: {str(item.get('text', '')).strip()}"
+            for item in recent_turns
+            if str(item.get("text", "")).strip()
+        ]
+        state_json = json.dumps(dialogue_state or {}, ensure_ascii=False)
+        rules_text = "; ".join(rule.strip() for rule in truth_rules[:8] if rule.strip())
+        chunks = [
+            "Служебный контекст звонка. Используй его, но не озвучивай буквально.",
+            f"Состояние диалога: {state_json}",
+        ]
+        if history_lines:
+            chunks.append("Последние реплики:\n" + "\n".join(history_lines))
+        if rules_text:
+            chunks.append(f"Ключевые ограничения: {rules_text}")
+        chunks.append(f"Текущая реплика клиента: {normalized_text}")
+        chunks.append("Сформируй только следующую короткую реплику агента для озвучки.")
+        return "\n\n".join(chunks)
+
+    async def _get_or_create_yandex_thread(self, conversation_key: str) -> str:
+        if conversation_key in self._assistant_threads:
+            return self._assistant_threads[conversation_key]
+
+        async with self._assistant_thread_lock:
+            if conversation_key in self._assistant_threads:
+                return self._assistant_threads[conversation_key]
+
+            folder_id = self._project().strip()
+            if not folder_id:
+                raise RuntimeError("YANDEX_PROJECT_ID or LLM_PROJECT is required for Yandex assistant threads")
+
+            payload = {
+                "folderId": folder_id,
+                "name": conversation_key[:63],
+                "defaultMessageAuthorId": conversation_key[:120],
+            }
+            timeout = httpx.Timeout(self._timeout_seconds())
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    f"{self._config.yandex_assistant_base_url.rstrip('/')}/threads",
+                    headers=self._yandex_auth_headers(),
+                    json=payload,
+                )
+                response.raise_for_status()
+                body = response.json()
+
+            thread_id = str(body.get("id", "")).strip()
+            if not thread_id:
+                raise RuntimeError("Yandex assistant thread creation returned no thread id")
+            self._assistant_threads[conversation_key] = thread_id
+            return thread_id
+
+    async def _generate_response_via_yandex_assistant(
+        self,
+        *,
+        conversation_key: str,
+        normalized_text: str,
+        history: list[dict[str, str]],
+        dialogue_state: dict[str, Any] | None,
+        truth_rules: tuple[str, ...],
+    ) -> tuple[LlmReply, int]:
+        assistant_id = self._config.yandex_assistant_id.strip()
+        if not assistant_id:
+            raise RuntimeError("YANDEX_ASSISTANT_ID is not configured")
+
+        started_at = time.perf_counter()
+        thread_id = await self._get_or_create_yandex_thread(conversation_key)
+        input_text = self._build_yandex_assistant_input(
+            normalized_text=normalized_text,
+            history=history,
+            dialogue_state=dialogue_state,
+            truth_rules=truth_rules,
+        )
+        headers = self._yandex_auth_headers()
+        base_url = self._config.yandex_assistant_base_url.rstrip("/")
+        timeout = httpx.Timeout(self._timeout_seconds())
+
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            message_response = await client.post(
+                f"{base_url}/messages",
+                headers=headers,
+                json={
+                    "threadId": thread_id,
+                    "author": {"id": conversation_key[:120], "role": "USER"},
+                    "content": {
+                        "content": [
+                            {
+                                "text": {
+                                    "content": input_text,
+                                }
+                            }
+                        ]
+                    },
+                },
+            )
+            message_response.raise_for_status()
+
+            run_response = await client.post(
+                f"{base_url}/runs",
+                headers=headers,
+                json={
+                    "assistantId": assistant_id,
+                    "threadId": thread_id,
+                },
+            )
+            run_response.raise_for_status()
+            run_body = run_response.json()
+            run_id = str(run_body.get("id", "")).strip()
+            if not run_id:
+                raise RuntimeError("Yandex assistant run creation returned no run id")
+
+            deadline = time.perf_counter() + max(1.0, self._timeout_seconds())
+            poll_interval = max(0.1, self._config.yandex_assistant_poll_interval_ms / 1000.0)
+            last_status = str(run_body.get("state", {}).get("status", "")).strip().upper()
+            while True:
+                current_response = await client.get(f"{base_url}/runs/{run_id}", headers=headers)
+                current_response.raise_for_status()
+                current_body = current_response.json()
+                state = current_body.get("state", {})
+                if not isinstance(state, dict):
+                    state = {}
+                last_status = str(state.get("status", "")).strip().upper()
+
+                if last_status == "COMPLETED":
+                    completed_message = state.get("completedMessage", {})
+                    if not isinstance(completed_message, dict):
+                        completed_message = {}
+                    raw_text = self._extract_yandex_message_text(completed_message)
+                    latency_ms = int((time.perf_counter() - started_at) * 1000)
+                    return parse_llm_reply(
+                        raw_text,
+                        fallback_reply=self._config.fallback_complex_text,
+                        fallback_intent="complex_request",
+                        fallback_next_step="уточнить потребность клиента",
+                        fallback_search_seed=normalized_text,
+                        prefer_raw_text=True,
+                    ), latency_ms
+
+                if last_status == "FAILED":
+                    error = state.get("error", {})
+                    message = ""
+                    if isinstance(error, dict):
+                        message = str(error.get("message", "")).strip()
+                    raise RuntimeError(message or "Yandex assistant run failed")
+
+                if last_status == "TOOL_CALLS":
+                    raise RuntimeError("Yandex assistant requested tool calls, which are not supported in this agent")
+
+                if time.perf_counter() >= deadline:
+                    raise TimeoutError(f"Yandex assistant run timed out with status={last_status or 'unknown'}")
+
+                await asyncio.sleep(poll_interval)
 
     def _ensure_client(self) -> AsyncOpenAI:
         if self._client is None:
@@ -1018,6 +1229,7 @@ TTS:
     async def generate_response(
         self,
         *,
+        conversation_key: str | None = None,
         normalized_text: str,
         history: list[dict[str, str]],
         dialogue_state: dict[str, Any] | None = None,
@@ -1027,6 +1239,15 @@ TTS:
     ) -> tuple[LlmReply, int]:
         if not self.enabled:
             raise RuntimeError("LLM is disabled by configuration")
+
+        if self._uses_yandex_assistant_api():
+            return await self._generate_response_via_yandex_assistant(
+                conversation_key=conversation_key or "default",
+                normalized_text=normalized_text,
+                history=history,
+                dialogue_state=dialogue_state,
+                truth_rules=truth_rules,
+            )
 
         client = self._ensure_client()
         started_at = time.perf_counter()
@@ -3009,6 +3230,7 @@ class ParticipantAudioSession:
                         examples = self._kb.relevant_examples(normalized_text)
                         llm_task = asyncio.create_task(
                             self._llm_service.generate_response(
+                                conversation_key=self._session_id,
                                 normalized_text=normalized_text,
                                 history=self._history,
                                 dialogue_state=state_snapshot,
@@ -3076,6 +3298,7 @@ class ParticipantAudioSession:
                             examples = self._kb.relevant_examples(normalized_text)
                             llm_task = asyncio.create_task(
                                 self._llm_service.generate_response(
+                                    conversation_key=self._session_id,
                                     normalized_text=normalized_text,
                                     history=self._history,
                                     dialogue_state=state_snapshot,

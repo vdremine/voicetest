@@ -216,7 +216,8 @@ docker compose -f docker-compose.prod.yml -f docker-compose.gpu.yml up --build -
 
 - `LLM_PROVIDER=yandex`
 - `YANDEX_API_KEY`
-- `YANDEX_PROJECT_ID` или `YANDEX_CLOUD_FOLDER`
+- `YANDEX_PROJECT_ID`
+- `YANDEX_ASSISTANT_ID`
 - отдельный `AGENT_IDENTITY=agent-yandex-gpu-001`
 - `STT_DEVICE=cuda`
 - `TTS_DEVICE=cuda`
