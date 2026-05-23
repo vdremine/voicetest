@@ -1670,27 +1670,27 @@ class SimpleIntentRouter:
             return IntentResult(Intent.CLARIFY.value, 0.0, False, Action.ASK_REPEAT.value)
 
         if text in self._greeting or text.startswith(("привет", "здравствуйте", "добрый ", "алло", "ало")):
-            return IntentResult(Intent.GREETING.value, 0.99, False, Action.ACK_GREETING.value)
+            return IntentResult(Intent.GREETING.value, 0.99, True, Action.CALL_LLM.value)
         if text in self._ready_to_talk or text.startswith(("я слушаю", "слушаю вас", "говорите", "да слушаю")):
-            return IntentResult(Intent.READY_TO_TALK.value, 0.99, False, Action.CONTINUE_OPENING.value)
+            return IntentResult(Intent.READY_TO_TALK.value, 0.99, True, Action.CALL_LLM.value)
         if text in self._identify or text.startswith(("это кто", "кто это", "кто вы", "представьтесь", "кто со мной")):
-            return IntentResult(Intent.IDENTIFY_SELF.value, 0.99, False, Action.INTRODUCE_SELF.value)
+            return IntentResult(Intent.IDENTIFY_SELF.value, 0.99, True, Action.CALL_LLM.value)
         if any(marker in text for marker in self._identity_mismatch_markers):
-            return IntentResult(Intent.IDENTITY_MISMATCH.value, 0.95, False, Action.CLARIFY_IDENTITY.value)
+            return IntentResult(Intent.IDENTITY_MISMATCH.value, 0.95, True, Action.CALL_LLM.value)
         if text in self._line_issue or "не слышу" in text or "вас не слышно" in text:
             return IntentResult(Intent.LINE_ISSUE.value, 0.98, False, Action.REPEAT_LAST_AGENT_MESSAGE.value)
         if any(marker in text for marker in self._why_need_info_markers):
-            return IntentResult(Intent.WHY_NEED_INFO.value, 0.95, False, Action.EXPLAIN_QUESTION.value)
+            return IntentResult(Intent.WHY_NEED_INFO.value, 0.95, True, Action.CALL_LLM.value)
         if any(marker in text for marker in self._latency_markers):
-            return IntentResult(Intent.LATENCY_QUESTION.value, 0.94, False, Action.EXPLAIN_DELAY_AND_CONTINUE.value)
+            return IntentResult(Intent.LATENCY_QUESTION.value, 0.94, True, Action.CALL_LLM.value)
         if any(marker in text for marker in self._service_complaint_markers):
-            return IntentResult(Intent.SERVICE_COMPLAINT.value, 0.92, False, Action.ACK_COMPLAINT_AND_REFOCUS.value)
+            return IntentResult(Intent.SERVICE_COMPLAINT.value, 0.92, True, Action.CALL_LLM.value)
         if any(marker in text for marker in self._payment_help_markers):
-            return IntentResult(Intent.PAYMENT_HELP.value, 0.92, False, Action.HANDOFF_PAYMENT_SUPPORT.value)
+            return IntentResult(Intent.PAYMENT_HELP.value, 0.92, True, Action.CALL_LLM.value)
         if text in self._confirm or self._is_affirmation_phrase(text):
-            return IntentResult(Intent.CONFIRM.value, 0.99, False, Action.ACK_CONFIRM.value)
+            return IntentResult(Intent.CONFIRM.value, 0.99, True, Action.CALL_LLM.value)
         if text in self._reject or self._is_rejection_phrase(text):
-            return IntentResult(Intent.REJECT.value, 0.99, False, Action.ACK_REJECT.value)
+            return IntentResult(Intent.REJECT.value, 0.99, True, Action.CALL_LLM.value)
         if text in self._cancel or "отмена" in text:
             return IntentResult(Intent.CANCEL.value, 0.99, False, Action.CANCEL_ACTION.value)
         if text in self._repeat or text.startswith("повтор") or "повтор" in text:
@@ -1702,7 +1702,7 @@ class SimpleIntentRouter:
         if any(token in text for token in self._handoff_tokens):
             return IntentResult(Intent.HUMAN_HANDOFF.value, 0.99, False, Action.HANDOFF_TO_HUMAN.value)
         if self._looks_like_amount(text):
-            return IntentResult(Intent.AMOUNT_PROVIDED.value, 0.94, False, Action.ACK_AMOUNT_AND_CONTINUE.value)
+            return IntentResult(Intent.AMOUNT_PROVIDED.value, 0.94, True, Action.CALL_LLM.value)
         if len(text.split()) <= 2:
             return IntentResult(Intent.UNKNOWN_SHORT.value, 0.45, False, Action.ASK_REPEAT.value)
 
@@ -2339,6 +2339,8 @@ class ParticipantAudioSession:
         }
 
     def _should_advance_by_state(self, intent: IntentResult, updated_fields: set[str]) -> bool:
+        if intent.use_llm:
+            return False
         slot_fields = {
             "нужная_сумма",
             "цель",
@@ -2519,7 +2521,7 @@ class ParticipantAudioSession:
                     and not self._skip_confidence_gate_for(intent)
                 ):
                     response_text = self._config.fallback_low_confidence_text
-                elif faq_answer:
+                elif faq_answer and not intent.use_llm:
                     await self._publish_status("simple_intent_detected")
                     response_text = faq_answer
                 elif self._should_advance_by_state(intent, updated_fields):
