@@ -4,6 +4,7 @@ import asyncio
 import json
 import math
 import os
+import random
 import re
 import threading
 import time
@@ -11,11 +12,13 @@ import uuid
 import wave
 from collections import deque
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
 import torch
+import torch.nn.functional as torch_f
 from agent_core import DialogueState, KnowledgeBase, build_context_messages, validate_llm_reply
 from faster_whisper import WhisperModel
 from livekit import rtc
@@ -53,6 +56,8 @@ class VoicePipelineConfig:
     vad_min_speech_duration_ms: int
     vad_min_silence_duration_ms: int
     vad_speech_pad_ms: int
+    processing_resume_min_speech_duration_ms: int
+    barge_in_min_speech_duration_ms: int
     vad_use_onnx: bool
     torch_num_threads: int
     stt_enabled: bool
@@ -63,6 +68,7 @@ class VoicePipelineConfig:
     stt_language: str
     stt_beam_size: int
     stt_confidence_floor: float
+    debug_save_wav: bool
     llm_enabled: bool
     llm_provider: str
     llm_model: str
@@ -80,6 +86,16 @@ class VoicePipelineConfig:
     tts_sample_rate: int
     tts_publish_sample_rate: int
     tts_frame_ms: int
+    tts_provider: str
+    tts_segment_pause_ms: int
+    tts_normalize_peak: float
+    tts_fade_ms: int
+    half_duplex: bool
+    barge_in_enabled: bool
+    voice_fillers_enabled: bool
+    voice_fillers_level: str
+    voice_fillers_probability: float
+    voice_bridge_on_llm: bool
     data_dir: Path
     utterance_dir: Path
     session_log_dir: Path
@@ -109,8 +125,12 @@ class VoicePipelineConfig:
             frame_size_ms=int(os.getenv("AUDIO_FRAME_SIZE_MS", "20")),
             vad_threshold=float(os.getenv("VAD_THRESHOLD", "0.45")),
             vad_min_speech_duration_ms=int(os.getenv("VAD_MIN_SPEECH_DURATION_MS", "200")),
-            vad_min_silence_duration_ms=int(os.getenv("VAD_MIN_SILENCE_DURATION_MS", "500")),
-            vad_speech_pad_ms=int(os.getenv("VAD_SPEECH_PAD_MS", "120")),
+            vad_min_silence_duration_ms=int(os.getenv("VAD_MIN_SILENCE_DURATION_MS", "800")),
+            vad_speech_pad_ms=int(os.getenv("VAD_SPEECH_PAD_MS", "180")),
+            processing_resume_min_speech_duration_ms=int(
+                os.getenv("PROCESSING_RESUME_MIN_SPEECH_DURATION_MS", "450")
+            ),
+            barge_in_min_speech_duration_ms=int(os.getenv("BARGE_IN_MIN_SPEECH_DURATION_MS", "500")),
             vad_use_onnx=env_bool("VAD_USE_ONNX", False),
             torch_num_threads=int(os.getenv("TORCH_NUM_THREADS", "1")),
             stt_enabled=env_bool("STT_ENABLED", True),
@@ -121,6 +141,7 @@ class VoicePipelineConfig:
             stt_language=os.getenv("STT_LANGUAGE", "ru"),
             stt_beam_size=int(os.getenv("STT_BEAM_SIZE", "1")),
             stt_confidence_floor=float(os.getenv("STT_CONFIDENCE_FLOOR", "0.35")),
+            debug_save_wav=env_bool("DEBUG_SAVE_WAV", True),
             llm_enabled=env_bool("LLM_ENABLED", True),
             llm_provider=llm_provider,
             llm_model=env_nonempty("LLM_MODEL", default_llm_model),
@@ -147,6 +168,16 @@ class VoicePipelineConfig:
             tts_sample_rate=int(os.getenv("TTS_SAMPLE_RATE", "24000")),
             tts_publish_sample_rate=int(os.getenv("TTS_PUBLISH_SAMPLE_RATE", "24000")),
             tts_frame_ms=int(os.getenv("TTS_FRAME_MS", "20")),
+            tts_provider=os.getenv("TTS_PROVIDER", "silero"),
+            tts_segment_pause_ms=int(os.getenv("TTS_SEGMENT_PAUSE_MS", "180")),
+            tts_normalize_peak=float(os.getenv("TTS_NORMALIZE_PEAK", "0.85")),
+            tts_fade_ms=int(os.getenv("TTS_FADE_MS", "10")),
+            half_duplex=env_bool("HALF_DUPLEX", True),
+            barge_in_enabled=env_bool("BARGE_IN_ENABLED", False),
+            voice_fillers_enabled=env_bool("VOICE_FILLERS_ENABLED", True),
+            voice_fillers_level=os.getenv("VOICE_FILLERS_LEVEL", "light").strip().lower() or "light",
+            voice_fillers_probability=float(os.getenv("VOICE_FILLERS_PROBABILITY", "0.35")),
+            voice_bridge_on_llm=env_bool("VOICE_BRIDGE_ON_LLM", True),
             data_dir=Path(os.getenv("AGENT_DATA_DIR", "/app/data")),
             utterance_dir=Path(os.getenv("UTTERANCE_DIR", "/tmp/voice-agent/utterances")),
             session_log_dir=Path(os.getenv("SESSION_LOG_DIR", "/tmp/voice-agent/session-logs")),
@@ -189,6 +220,151 @@ class LlmReply:
     search_index: list[str]
     intent: str
     next_step: str
+
+
+@dataclass(slots=True)
+class TtsRequest:
+    text: str
+    emotion: str = "friendly"
+    style: str = "consultant"
+    speed: float = 1.0
+    speaker: str = "xenia"
+
+
+@dataclass(slots=True)
+class VoiceStyleResult:
+    styled_text: str
+    filler_added: bool
+    filler_type: str
+    original_text: str
+
+
+class Intent(str, Enum):
+    GREETING = "greeting"
+    READY_TO_TALK = "ready_to_talk"
+    CONFIRM_INTEREST = "confirm_interest"
+    SLOT_ANSWER = "slot_answer"
+    IDENTIFY_SELF = "identify_self"
+    IDENTITY_MISMATCH = "identity_mismatch"
+    LINE_ISSUE = "line_issue"
+    WHY_NEED_INFO = "why_need_info"
+    LATENCY_QUESTION = "latency_question"
+    SERVICE_COMPLAINT = "service_complaint"
+    PAYMENT_HELP = "payment_help"
+    REPEAT = "repeat"
+    WAIT = "wait"
+    HUMAN_HANDOFF = "human_handoff"
+    CANCEL = "cancel"
+    REJECT = "reject"
+    END_SESSION = "end_session"
+    UNKNOWN_SHORT = "unknown_short"
+    COMPLEX_REQUEST = "complex_request"
+    CONFIRM = "confirm"
+    AMOUNT_PROVIDED = "amount_provided"
+    CLARIFY = "clarify"
+
+
+class Action(str, Enum):
+    CONTINUE_OPENING = "continue_opening"
+    ASK_NEXT_SLOT = "ask_next_slot"
+    INTRODUCE_SELF = "introduce_self"
+    CLARIFY_IDENTITY = "clarify_identity"
+    REPEAT_LAST_AGENT_MESSAGE = "repeat_last_agent_message"
+    EXPLAIN_QUESTION = "explain_question"
+    EXPLAIN_DELAY_AND_CONTINUE = "explain_delay_and_continue"
+    ACK_COMPLAINT_AND_REFOCUS = "ack_complaint_and_refocus"
+    HANDOFF_PAYMENT_SUPPORT = "handoff_payment_support"
+    HANDOFF_TO_HUMAN = "handoff_to_human"
+    CANCEL_ACTION = "cancel_action"
+    ACK_REJECT = "ack_reject"
+    END_SESSION = "end_session"
+    ACK_WAIT = "ack_wait"
+    ASK_REPEAT = "ask_repeat"
+    CALL_LLM = "call_llm"
+    ACK_GREETING = "ack_greeting"
+    ACK_CONFIRM = "ack_confirm"
+    ACK_AMOUNT_AND_CONTINUE = "ack_amount_and_continue"
+
+
+class Int16ChunkBuffer:
+    def __init__(self) -> None:
+        self._chunks: deque[np.ndarray] = deque()
+        self._size = 0
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    def append(self, samples: np.ndarray, *, limit: int | None = None) -> None:
+        if samples.size == 0:
+            return
+        self._chunks.append(samples.copy())
+        self._size += int(samples.size)
+        if limit is not None:
+            self._trim_left(limit)
+
+    def prepend(self, samples: np.ndarray, *, limit: int | None = None) -> None:
+        if samples.size == 0:
+            return
+        self._chunks.appendleft(samples.copy())
+        self._size += int(samples.size)
+        if limit is not None:
+            self._trim_right(limit)
+
+    def pop_front(self, count: int) -> np.ndarray:
+        count = min(max(0, count), self._size)
+        if count <= 0:
+            return np.empty(0, dtype=np.int16)
+        parts: list[np.ndarray] = []
+        remaining = count
+        while remaining > 0 and self._chunks:
+            chunk = self._chunks[0]
+            if chunk.size <= remaining:
+                parts.append(chunk)
+                self._chunks.popleft()
+                self._size -= int(chunk.size)
+                remaining -= int(chunk.size)
+            else:
+                parts.append(chunk[:remaining].copy())
+                self._chunks[0] = chunk[remaining:].copy()
+                self._size -= remaining
+                remaining = 0
+        return np.concatenate(parts) if len(parts) > 1 else parts[0]
+
+    def to_array(self) -> np.ndarray:
+        if not self._chunks:
+            return np.empty(0, dtype=np.int16)
+        if len(self._chunks) == 1:
+            return self._chunks[0].copy()
+        return np.concatenate(list(self._chunks))
+
+    def clear(self) -> None:
+        self._chunks.clear()
+        self._size = 0
+
+    def _trim_left(self, limit: int) -> None:
+        while self._size > limit and self._chunks:
+            overflow = self._size - limit
+            chunk = self._chunks[0]
+            if chunk.size <= overflow:
+                self._chunks.popleft()
+                self._size -= int(chunk.size)
+            else:
+                self._chunks[0] = chunk[overflow:].copy()
+                self._size -= overflow
+                break
+
+    def _trim_right(self, limit: int) -> None:
+        while self._size > limit and self._chunks:
+            overflow = self._size - limit
+            chunk = self._chunks[-1]
+            if chunk.size <= overflow:
+                self._chunks.pop()
+                self._size -= int(chunk.size)
+            else:
+                self._chunks[-1] = chunk[:-overflow].copy()
+                self._size -= overflow
+                break
 
 
 class AgentEventBus:
@@ -313,43 +489,46 @@ class OpenAiLlmService:
         "additionalProperties": False,
     }
     _CLASSIFIER_ALLOWED_INTENTS = {
-        "greeting",
-        "ready_to_talk",
-        "confirm_interest",
-        "slot_answer",
-        "identify_self",
-        "identity_mismatch",
-        "line_issue",
-        "why_need_info",
-        "latency_question",
-        "service_complaint",
-        "payment_help",
-        "repeat",
-        "wait",
-        "human_handoff",
-        "cancel",
-        "reject",
-        "end_session",
-        "unknown_short",
-        "complex_request",
+        Intent.GREETING.value,
+        Intent.READY_TO_TALK.value,
+        Intent.CONFIRM_INTEREST.value,
+        Intent.SLOT_ANSWER.value,
+        Intent.IDENTIFY_SELF.value,
+        Intent.IDENTITY_MISMATCH.value,
+        Intent.LINE_ISSUE.value,
+        Intent.WHY_NEED_INFO.value,
+        Intent.LATENCY_QUESTION.value,
+        Intent.SERVICE_COMPLAINT.value,
+        Intent.PAYMENT_HELP.value,
+        Intent.REPEAT.value,
+        Intent.WAIT.value,
+        Intent.HUMAN_HANDOFF.value,
+        Intent.CANCEL.value,
+        Intent.REJECT.value,
+        Intent.END_SESSION.value,
+        Intent.UNKNOWN_SHORT.value,
+        Intent.COMPLEX_REQUEST.value,
     }
     _CLASSIFIER_ALLOWED_ACTIONS = {
-        "continue_opening",
-        "ask_next_slot",
-        "introduce_self",
-        "clarify_identity",
-        "repeat_last_agent_message",
-        "explain_question",
-        "explain_delay_and_continue",
-        "ack_complaint_and_refocus",
-        "handoff_payment_support",
-        "handoff_to_human",
-        "cancel_action",
-        "ack_reject",
-        "end_session",
-        "ack_wait",
-        "ask_repeat",
-        "call_llm",
+        Action.CONTINUE_OPENING.value,
+        Action.ASK_NEXT_SLOT.value,
+        Action.INTRODUCE_SELF.value,
+        Action.CLARIFY_IDENTITY.value,
+        Action.REPEAT_LAST_AGENT_MESSAGE.value,
+        Action.EXPLAIN_QUESTION.value,
+        Action.EXPLAIN_DELAY_AND_CONTINUE.value,
+        Action.ACK_COMPLAINT_AND_REFOCUS.value,
+        Action.HANDOFF_PAYMENT_SUPPORT.value,
+        Action.HANDOFF_TO_HUMAN.value,
+        Action.CANCEL_ACTION.value,
+        Action.ACK_REJECT.value,
+        Action.END_SESSION.value,
+        Action.ACK_WAIT.value,
+        Action.ASK_REPEAT.value,
+        Action.CALL_LLM.value,
+        Action.ACK_GREETING.value,
+        Action.ACK_CONFIRM.value,
+        Action.ACK_AMOUNT_AND_CONTINUE.value,
     }
     _CLASSIFIER_PROMPT = """Ты sidecar-классификатор реплик клиента в голосовом кредитном звонке.
 Ты НЕ отвечаешь клиенту. Ты только решаешь, что означает текущая реплика и какой следующий режим обработки нужен.
@@ -908,6 +1087,192 @@ def is_low_information_transcript(raw_text: str, normalized_text: str) -> bool:
     return False
 
 
+def split_into_tts_segments(text: str) -> list[str]:
+    stripped = text.strip()
+    if not stripped:
+        return []
+    segments = [segment.strip() for segment in re.split(r"(?<=[.!?])\s+", stripped) if segment.strip()]
+    if not segments:
+        return [stripped]
+    return segments
+
+
+def silence_ms(ms: int, sample_rate: int) -> np.ndarray:
+    samples = max(0, int(sample_rate * ms / 1000))
+    return np.zeros(samples, dtype=np.int16)
+
+
+def trim_silence(pcm: np.ndarray, *, threshold: int = 96) -> np.ndarray:
+    if len(pcm) == 0:
+        return pcm
+    indexes = np.flatnonzero(np.abs(pcm.astype(np.int32)) > threshold)
+    if indexes.size == 0:
+        return pcm
+    return pcm[indexes[0] : indexes[-1] + 1]
+
+
+def normalize_peak(pcm: np.ndarray, *, target_peak: float) -> np.ndarray:
+    if len(pcm) == 0:
+        return pcm
+    peak = float(np.max(np.abs(pcm.astype(np.float32))))
+    if peak < 1.0:
+        return pcm
+    gain = target_peak * 32767.0 / peak
+    out = pcm.astype(np.float32) * gain
+    return np.clip(out, -32768.0, 32767.0).astype(np.int16)
+
+
+def apply_fade(pcm: np.ndarray, *, sample_rate: int, fade_ms: int) -> np.ndarray:
+    if len(pcm) == 0 or fade_ms <= 0:
+        return pcm
+    n = min(len(pcm), int(sample_rate * fade_ms / 1000))
+    if n <= 1:
+        return pcm
+    out = pcm.astype(np.float32)
+    fade_in = np.linspace(0.0, 1.0, n, dtype=np.float32)
+    fade_out = np.linspace(1.0, 0.0, n, dtype=np.float32)
+    out[:n] *= fade_in
+    out[-n:] *= fade_out
+    return np.clip(out, -32768.0, 32767.0).astype(np.int16)
+
+
+class TtsMarkupService:
+    def __init__(self) -> None:
+        self._pronunciation = {
+            "владимир": "Влад+имир",
+            "мосинвестфинанс": "Мос Инвест Фин+анс",
+            "мфо": "эм эф о",
+            "птс": "пэ тэ эс",
+            "crm": "си ар эм",
+            "livekit": "лайв кит",
+        }
+        self._stress = {
+            "залог": "зал+ог",
+            "договор": "догов+ор",
+            "каталог": "катал+ог",
+            "звонит": "звон+ит",
+        }
+
+    def prepare(self, request: TtsRequest) -> str:
+        text = self._clean(request.text)
+        text = self._normalize_numbers(text)
+        text = self._apply_pronunciation(text)
+        text = self._apply_stress(text)
+        text = self._split_for_speech(text)
+        return text
+
+    @staticmethod
+    def _clean(text: str) -> str:
+        return re.sub(r"\s+", " ", text.strip())
+
+    @staticmethod
+    def _normalize_numbers(text: str) -> str:
+        return text.replace("%", " процентов")
+
+    def _apply_pronunciation(self, text: str) -> str:
+        result = text
+        for source, target in self._pronunciation.items():
+            result = re.sub(rf"\b{re.escape(source)}\b", target, result, flags=re.IGNORECASE)
+        return result
+
+    def _apply_stress(self, text: str) -> str:
+        result = text
+        for source, target in self._stress.items():
+            result = re.sub(rf"\b{re.escape(source)}\b", target, result, flags=re.IGNORECASE)
+        return result
+
+    @staticmethod
+    def _split_for_speech(text: str) -> str:
+        return re.sub(r"\s+", " ", text).strip()
+
+
+class VoiceStyleAdapter:
+    _SENSITIVE_INTENTS = {
+        "service_complaint",
+        "reject",
+        "human_handoff",
+        "payment_help",
+        "cancel",
+        "end_session",
+    }
+
+    def __init__(self, config: VoicePipelineConfig) -> None:
+        self._config = config
+        self._random = random.Random()
+        self._previous_had_filler = False
+
+    def adapt(
+        self,
+        text: str,
+        *,
+        intent: str,
+        stage: str,
+        is_first_message: bool,
+    ) -> VoiceStyleResult:
+        original = text.strip()
+        if not original:
+            return VoiceStyleResult("", False, "", original)
+
+        if is_first_message:
+            styled = original if original.lower().startswith(("алло", "алл")) else f"Алл+о. {original}"
+            self._previous_had_filler = True
+            return VoiceStyleResult(styled, True, "greeting", original)
+
+        if not self._config.voice_fillers_enabled or self._config.voice_fillers_level == "off":
+            self._previous_had_filler = False
+            return VoiceStyleResult(original, False, "", original)
+
+        if self._previous_had_filler or intent in self._SENSITIVE_INTENTS:
+            self._previous_had_filler = False
+            return VoiceStyleResult(original, False, "", original)
+
+        probability = max(0.0, min(1.0, self._config.voice_fillers_probability))
+        if self._random.random() > probability:
+            self._previous_had_filler = False
+            return VoiceStyleResult(original, False, "", original)
+
+        variants = self._variants_for(intent=intent, stage=stage)
+        if not variants:
+            self._previous_had_filler = False
+            return VoiceStyleResult(original, False, "", original)
+
+        prefix = self._random.choice(variants)
+        styled = original if original.startswith(prefix) else f"{prefix} {original}"
+        self._previous_had_filler = True
+        return VoiceStyleResult(styled, True, intent or stage, original)
+
+    def _variants_for(self, *, intent: str, stage: str) -> list[str]:
+        level = self._config.voice_fillers_level
+        light = {
+            "slot_answer": ["Ага, понял.", "Так, понял.", "Хорошо, понял."],
+            "amount_provided": ["Ага, понял.", "Так, понял."],
+            "confirm": ["Хорошо.", "Понял."],
+            "ready_to_talk": ["Да, здравствуйте.", "Хорошо."],
+            "complex_request": ["Смотрите.", "Да, смотрите."],
+            "line_issue": ["Да, конечно.", "Повторю коротко."],
+            "latency_question": ["Так, сейчас.", "Секунду."],
+        }
+        medium = {
+            **light,
+            "slot_answer": ["Ага, понял.", "Так, понял.", "Такс.", "Давайте тогда."],
+            "complex_request": ["Смотрите.", "Нуу, смотрите.", "Так, сейчас сориентирую."],
+            "clarification": ["А, понял.", "Тогда уточню."],
+        }
+        high = {
+            **medium,
+            "slot_answer": ["Ага, понял.", "Так, понял.", "Такс.", "Угу.", "Давайте тогда."],
+            "complex_request": ["Смотрите.", "Нуу, смотрите.", "Так, секунду.", "Сейчас сориентирую."],
+        }
+        table = light if level == "light" else medium if level == "medium" else high
+        if intent in table:
+            return table[intent]
+        if stage == "qualification":
+            return table.get("slot_answer", [])
+        if stage == "need_detection":
+            return table.get("complex_request", [])
+        return []
+
+
 class SileroTtsService:
     def __init__(self, config: VoicePipelineConfig, log: Callable[[str], None]) -> None:
         self._config = config
@@ -935,23 +1300,40 @@ class SileroTtsService:
         )
         return self._model
 
-    def synthesize(self, text: str) -> tuple[np.ndarray, int, int]:
+    def synthesize_segments(self, request: TtsRequest, segments: list[str]) -> tuple[np.ndarray, int, int]:
         started_at = time.perf_counter()
         with self._lock:
             model = self._ensure_model()
-            audio = model.apply_tts(
-                text=text,
-                speaker=self._config.tts_speaker,
-                sample_rate=self._config.tts_sample_rate,
-            )
+            rendered_segments: list[np.ndarray] = []
+            for index, segment in enumerate(segments):
+                audio = model.apply_tts(
+                    text=segment,
+                    speaker=request.speaker or self._config.tts_speaker,
+                    sample_rate=self._config.tts_sample_rate,
+                )
+                if isinstance(audio, torch.Tensor):
+                    audio_np = audio.detach().cpu().numpy()
+                else:
+                    audio_np = np.asarray(audio)
+                audio_np = np.clip(audio_np, -1.0, 1.0)
+                pcm16 = (audio_np * 32767.0).astype(np.int16)
+                pcm16 = trim_silence(pcm16)
+                pcm16 = apply_fade(
+                    pcm16,
+                    sample_rate=self._config.tts_sample_rate,
+                    fade_ms=self._config.tts_fade_ms,
+                )
+                rendered_segments.append(pcm16)
+                if index < len(segments) - 1 and self._config.tts_segment_pause_ms > 0:
+                    rendered_segments.append(
+                        silence_ms(self._config.tts_segment_pause_ms, self._config.tts_sample_rate)
+                    )
 
-        if isinstance(audio, torch.Tensor):
-            audio_np = audio.detach().cpu().numpy()
+        if not rendered_segments:
+            pcm16 = np.zeros(0, dtype=np.int16)
         else:
-            audio_np = np.asarray(audio)
-
-        audio_np = np.clip(audio_np, -1.0, 1.0)
-        pcm16 = (audio_np * 32767.0).astype(np.int16)
+            pcm16 = np.concatenate(rendered_segments)
+        pcm16 = normalize_peak(pcm16, target_peak=self._config.tts_normalize_peak)
         latency_ms = int((time.perf_counter() - started_at) * 1000)
         return pcm16, self._config.tts_sample_rate, latency_ms
 
@@ -1047,13 +1429,15 @@ class LiveKitAudioPublisher:
     def _resample(pcm16: np.ndarray, *, orig_rate: int, target_rate: int) -> np.ndarray:
         if orig_rate == target_rate or len(pcm16) == 0:
             return pcm16
-
-        duration = len(pcm16) / float(orig_rate)
-        target_len = max(1, int(round(duration * target_rate)))
-        source_x = np.linspace(0.0, 1.0, num=len(pcm16), endpoint=False)
-        target_x = np.linspace(0.0, 1.0, num=target_len, endpoint=False)
-        resampled = np.interp(target_x, source_x, pcm16.astype(np.float32))
-        return np.clip(resampled, -32768.0, 32767.0).astype(np.int16)
+        source = torch.from_numpy(pcm16.astype(np.float32)).view(1, 1, -1)
+        target_len = max(1, int(round(len(pcm16) * target_rate / float(orig_rate))))
+        resampled = torch_f.interpolate(
+            source,
+            size=target_len,
+            mode="linear",
+            align_corners=False,
+        )
+        return np.clip(resampled.view(-1).cpu().numpy(), -32768.0, 32767.0).astype(np.int16)
 
 
 class WhisperSttService:
@@ -1123,12 +1507,13 @@ class WhisperSttService:
             return 0.5
         return 0.0
 
-    def transcribe(self, wav_path: Path, duration_ms: int) -> TranscriptResult:
+    def transcribe(self, audio_samples: np.ndarray, duration_ms: int) -> TranscriptResult:
         started_at = time.perf_counter()
+        audio_f32 = audio_samples.astype(np.float32) / 32768.0
         with self._lock:
             model = self._ensure_model()
             segments_iter, info = model.transcribe(
-                str(wav_path),
+                audio_f32,
                 language=self._config.stt_language,
                 beam_size=self._config.stt_beam_size,
                 condition_on_previous_text=False,
@@ -1258,46 +1643,46 @@ class SimpleIntentRouter:
 
     def route(self, text: str) -> IntentResult:
         if not text:
-            return IntentResult("clarify", 0.0, False, "ask_repeat")
+            return IntentResult(Intent.CLARIFY.value, 0.0, False, Action.ASK_REPEAT.value)
 
         if text in self._greeting or text.startswith(("привет", "здравствуйте", "добрый ", "алло", "ало")):
-            return IntentResult("greeting", 0.99, False, "ack_greeting")
+            return IntentResult(Intent.GREETING.value, 0.99, False, Action.ACK_GREETING.value)
         if text in self._ready_to_talk or text.startswith(("я слушаю", "слушаю вас", "говорите", "да слушаю")):
-            return IntentResult("ready_to_talk", 0.99, False, "continue_opening")
+            return IntentResult(Intent.READY_TO_TALK.value, 0.99, False, Action.CONTINUE_OPENING.value)
         if text in self._identify or text.startswith(("это кто", "кто это", "кто вы", "представьтесь", "кто со мной")):
-            return IntentResult("identify_self", 0.99, False, "introduce_self")
+            return IntentResult(Intent.IDENTIFY_SELF.value, 0.99, False, Action.INTRODUCE_SELF.value)
         if any(marker in text for marker in self._identity_mismatch_markers):
-            return IntentResult("identity_mismatch", 0.95, False, "clarify_identity")
+            return IntentResult(Intent.IDENTITY_MISMATCH.value, 0.95, False, Action.CLARIFY_IDENTITY.value)
         if text in self._line_issue or "не слышу" in text or "вас не слышно" in text:
-            return IntentResult("line_issue", 0.98, False, "repeat_last_agent_message")
+            return IntentResult(Intent.LINE_ISSUE.value, 0.98, False, Action.REPEAT_LAST_AGENT_MESSAGE.value)
         if any(marker in text for marker in self._why_need_info_markers):
-            return IntentResult("why_need_info", 0.95, False, "explain_question")
+            return IntentResult(Intent.WHY_NEED_INFO.value, 0.95, False, Action.EXPLAIN_QUESTION.value)
         if any(marker in text for marker in self._latency_markers):
-            return IntentResult("latency_question", 0.94, False, "explain_delay_and_continue")
+            return IntentResult(Intent.LATENCY_QUESTION.value, 0.94, False, Action.EXPLAIN_DELAY_AND_CONTINUE.value)
         if any(marker in text for marker in self._service_complaint_markers):
-            return IntentResult("service_complaint", 0.92, False, "ack_complaint_and_refocus")
+            return IntentResult(Intent.SERVICE_COMPLAINT.value, 0.92, False, Action.ACK_COMPLAINT_AND_REFOCUS.value)
         if any(marker in text for marker in self._payment_help_markers):
-            return IntentResult("payment_help", 0.92, False, "handoff_payment_support")
+            return IntentResult(Intent.PAYMENT_HELP.value, 0.92, False, Action.HANDOFF_PAYMENT_SUPPORT.value)
         if text in self._confirm or self._is_affirmation_phrase(text):
-            return IntentResult("confirm", 0.99, False, "ack_confirm")
+            return IntentResult(Intent.CONFIRM.value, 0.99, False, Action.ACK_CONFIRM.value)
         if text in self._reject or self._is_rejection_phrase(text):
-            return IntentResult("reject", 0.99, False, "ack_reject")
+            return IntentResult(Intent.REJECT.value, 0.99, False, Action.ACK_REJECT.value)
         if text in self._cancel or "отмена" in text:
-            return IntentResult("cancel", 0.99, False, "cancel_action")
+            return IntentResult(Intent.CANCEL.value, 0.99, False, Action.CANCEL_ACTION.value)
         if text in self._repeat or text.startswith("повтори") or text.startswith("повтори"):
-            return IntentResult("repeat", 0.99, False, "repeat_last_agent_message")
+            return IntentResult(Intent.REPEAT.value, 0.99, False, Action.REPEAT_LAST_AGENT_MESSAGE.value)
         if text in self._wait or text.startswith("подожди"):
-            return IntentResult("wait", 0.98, False, "ack_wait")
+            return IntentResult(Intent.WAIT.value, 0.98, False, Action.ACK_WAIT.value)
         if text in self._end_session or text.startswith("заверши") or text.startswith("стоп"):
-            return IntentResult("end_session", 0.98, False, "end_session")
+            return IntentResult(Intent.END_SESSION.value, 0.98, False, Action.END_SESSION.value)
         if any(token in text for token in self._handoff_tokens):
-            return IntentResult("human_handoff", 0.99, False, "handoff_to_human")
+            return IntentResult(Intent.HUMAN_HANDOFF.value, 0.99, False, Action.HANDOFF_TO_HUMAN.value)
         if self._looks_like_amount(text):
-            return IntentResult("amount_provided", 0.94, False, "ack_amount_and_continue")
+            return IntentResult(Intent.AMOUNT_PROVIDED.value, 0.94, False, Action.ACK_AMOUNT_AND_CONTINUE.value)
         if len(text.split()) <= 2:
-            return IntentResult("unknown_short", 0.45, False, "ask_repeat")
+            return IntentResult(Intent.UNKNOWN_SHORT.value, 0.45, False, Action.ASK_REPEAT.value)
 
-        return IntentResult("complex_request", 0.8, True, "call_llm")
+        return IntentResult(Intent.COMPLEX_REQUEST.value, 0.8, True, Action.CALL_LLM.value)
 
 
 class CannedResponseEngine:
@@ -1431,6 +1816,8 @@ class ParticipantAudioSession:
         self._router = SimpleIntentRouter()
         self._responses = CannedResponseEngine(config)
         self._vad = SileroVadEngine(config)
+        self._tts_markup = TtsMarkupService()
+        self._voice_style = VoiceStyleAdapter(config)
         self._dialogue_state = DialogueState()
         try:
             self._kb = KnowledgeBase.load(config.data_dir)
@@ -1444,7 +1831,7 @@ class ParticipantAudioSession:
 
         self._audio_task: asyncio.Task[None] | None = None
         self._active_track_sid: str | None = None
-        self._sample_buffer = np.empty(0, dtype=np.int16)
+        self._sample_buffer = Int16ChunkBuffer()
         self._pre_speech_chunks: deque[np.ndarray] = deque()
         self._utterance_chunks: list[np.ndarray] = []
         self._utterance_probs: list[float] = []
@@ -1466,10 +1853,11 @@ class ParticipantAudioSession:
         self._resume_speech_ms = 0
         self._turn_revision = 0
         self._active_utterance_revision = 0
-        self._resume_buffer = np.empty(0, dtype=np.int16)
-        self._resume_probe_buffer = np.empty(0, dtype=np.int16)
+        self._resume_buffer = Int16ChunkBuffer()
+        self._resume_probe_buffer = Int16ChunkBuffer()
         self._resume_buffer_limit = self._config.sample_rate * 6
         self._needs_rescue_prompt = False
+        self._spoken_turn_count = 0
 
         self._chunk_ms = int(self._vad.window_size * 1000 / self._config.sample_rate)
         self._pad_chunks = max(1, math.ceil(self._config.vad_speech_pad_ms / self._chunk_ms))
@@ -1616,6 +2004,8 @@ class ParticipantAudioSession:
             samples = samples.reshape(-1, frame.num_channels).mean(axis=1).astype(np.int16)
 
         if self._is_speaking:
+            if self._config.half_duplex or not self._config.barge_in_enabled:
+                return
             await self._handle_barge_in_samples(samples)
             return
 
@@ -1623,35 +2013,19 @@ class ParticipantAudioSession:
             await self._handle_processing_samples(samples)
             return
 
-        if self._sample_buffer.size == 0:
-            self._sample_buffer = samples
-        else:
-            self._sample_buffer = np.concatenate((self._sample_buffer, samples))
+        self._sample_buffer.append(samples)
 
         while self._sample_buffer.size >= self._vad.window_size:
-            window = self._sample_buffer[: self._vad.window_size]
-            self._sample_buffer = self._sample_buffer[self._vad.window_size :]
+            window = self._sample_buffer.pop_front(self._vad.window_size)
             await self._process_vad_window(window)
 
     def _append_resume_samples(self, samples: np.ndarray) -> None:
-        if self._resume_buffer.size == 0:
-            self._resume_buffer = samples.copy()
-        else:
-            self._resume_buffer = np.concatenate((self._resume_buffer, samples))
-        if self._resume_buffer.size > self._resume_buffer_limit:
-            self._resume_buffer = self._resume_buffer[-self._resume_buffer_limit :]
-
-        if self._resume_probe_buffer.size == 0:
-            self._resume_probe_buffer = samples.copy()
-        else:
-            self._resume_probe_buffer = np.concatenate((self._resume_probe_buffer, samples))
-        if self._resume_probe_buffer.size > self._resume_buffer_limit:
-            self._resume_probe_buffer = self._resume_probe_buffer[-self._resume_buffer_limit :]
+        self._resume_buffer.append(samples, limit=self._resume_buffer_limit)
+        self._resume_probe_buffer.append(samples, limit=self._resume_buffer_limit)
 
     async def _detect_resumed_speech(self, *, speaking: bool) -> None:
         while self._resume_probe_buffer.size >= self._vad.window_size:
-            window = self._resume_probe_buffer[: self._vad.window_size]
-            self._resume_probe_buffer = self._resume_probe_buffer[self._vad.window_size :]
+            window = self._resume_probe_buffer.pop_front(self._vad.window_size)
             probability = self._vad.speech_probability(window)
             if probability >= self._config.vad_threshold:
                 if speaking:
@@ -1665,7 +2039,12 @@ class ParticipantAudioSession:
                     self._resume_speech_ms = 0
 
             speech_ms = self._interrupt_speech_ms if speaking else self._resume_speech_ms
-            if speech_ms < self._config.vad_min_speech_duration_ms:
+            min_required_ms = (
+                self._config.barge_in_min_speech_duration_ms
+                if speaking
+                else self._config.processing_resume_min_speech_duration_ms
+            )
+            if speech_ms < min_required_ms:
                 continue
 
             if not self._barge_in_pending:
@@ -1778,8 +2157,10 @@ class ParticipantAudioSession:
         duration_ms = int(len(utterance_audio) * 1000 / self._config.sample_rate)
         speech_end_time_ms = int(time.time() * 1000)
 
-        wav_path = self._config.utterance_dir / self._session_id / f"{utterance_id}.wav"
-        self._save_wav(wav_path, utterance_audio)
+        wav_path: Path | None = None
+        if self._config.debug_save_wav:
+            wav_path = self._config.utterance_dir / self._session_id / f"{utterance_id}.wav"
+            self._save_wav(wav_path, utterance_audio)
 
         await self._publish_status("utterance_finalized")
         await self._event_bus.publish_json(
@@ -1798,6 +2179,7 @@ class ParticipantAudioSession:
         asyncio.create_task(
             self._process_utterance(
                 utterance_id=utterance_id,
+                audio_samples=utterance_audio,
                 wav_path=wav_path,
                 duration_ms=duration_ms,
                 vad_confidence=vad_confidence,
@@ -1834,18 +2216,72 @@ class ParticipantAudioSession:
             return self._kb.question_for_field(next_field)
         return self._config.fallback_complex_text
 
+    def _llm_bridge_text(self) -> str:
+        name = self._dialogue_state.name.strip()
+        if name:
+            return f"Так, {name}, секунду."
+        if self._dialogue_state.stage == "qualification":
+            return "Так, секунду, быстро сориентируюсь."
+        return "Смотрите, секунду."
+
+    def _prepare_tts_output(self, text: str, *, intent_value: str) -> tuple[VoiceStyleResult, str, list[str]]:
+        style_result = self._voice_style.adapt(
+            text,
+            intent=intent_value,
+            stage=self._dialogue_state.stage,
+            is_first_message=self._spoken_turn_count == 0,
+        )
+        prepared_text = self._tts_markup.prepare(
+            TtsRequest(
+                text=style_result.styled_text,
+                speaker=self._config.tts_speaker,
+            )
+        )
+        segments = split_into_tts_segments(prepared_text)
+        return style_result, prepared_text, segments
+
+    async def _speak_response(
+        self,
+        *,
+        utterance_id: str,
+        response_text: str,
+        intent_value: str,
+    ) -> tuple[str, str, list[str], int, bool, bool, str]:
+        style_result, prepared_text, segments = self._prepare_tts_output(
+            response_text,
+            intent_value=intent_value,
+        )
+        if not segments:
+            segments = [prepared_text] if prepared_text else [style_result.styled_text]
+        tts_pcm16, tts_sample_rate, tts_latency_ms = await asyncio.to_thread(
+            self._tts_service.synthesize_segments,
+            TtsRequest(text=style_result.styled_text, speaker=self._config.tts_speaker),
+            segments,
+        )
+        playback_completed = await self._audio_publisher.speak_pcm(tts_pcm16, tts_sample_rate)
+        self._spoken_turn_count += 1
+        return (
+            style_result.styled_text,
+            prepared_text,
+            segments,
+            tts_latency_ms,
+            playback_completed,
+            style_result.filler_added,
+            style_result.filler_type,
+        )
+
     def _should_use_adaptive_classifier(self, intent: IntentResult, normalized_text: str) -> bool:
         if not self._llm_service.enabled or not normalized_text.strip():
             return False
-        if self._dialogue_state.awaiting_field:
+        if intent.intent == Intent.COMPLEX_REQUEST.value:
+            return False
+        if self._dialogue_state.awaiting_field and intent.intent in {
+            Intent.CONFIRM.value,
+            Intent.AMOUNT_PROVIDED.value,
+            Intent.UNKNOWN_SHORT.value,
+        }:
             return True
-        return intent.intent in {
-            "ready_to_talk",
-            "confirm",
-            "amount_provided",
-            "unknown_short",
-            "complex_request",
-        }
+        return intent.intent == Intent.UNKNOWN_SHORT.value and len(normalized_text.split()) <= 4
 
     def _should_advance_by_state(self, intent: IntentResult, updated_fields: set[str]) -> bool:
         slot_fields = {
@@ -1856,25 +2292,26 @@ class ParticipantAudioSession:
             "callback_time",
             "сценарий",
         }
-        if intent.action == "ask_next_slot":
+        if intent.action == Action.ASK_NEXT_SLOT.value:
             return True
         if not (updated_fields & slot_fields):
             return False
         if self._dialogue_state.awaiting_field:
             return True
         return intent.intent in {
-            "amount_provided",
-            "confirm_interest",
-            "slot_answer",
-            "unknown_short",
-            "complex_request",
+            Intent.AMOUNT_PROVIDED.value,
+            Intent.CONFIRM_INTEREST.value,
+            Intent.SLOT_ANSWER.value,
+            Intent.UNKNOWN_SHORT.value,
+            Intent.COMPLEX_REQUEST.value,
         }
 
     async def _process_utterance(
         self,
         *,
         utterance_id: str,
-        wav_path: Path,
+        audio_samples: np.ndarray,
+        wav_path: Path | None,
         duration_ms: int,
         vad_confidence: float,
         speech_start_time_ms: int,
@@ -1885,6 +2322,7 @@ class ParticipantAudioSession:
         started_at = time.perf_counter()
         self._is_processing = True
         response_text = self._config.fallback_low_confidence_text
+        raw_response_text = response_text
         normalized_text = ""
         intent = IntentResult("clarify", 0.0, False, "ask_repeat")
         transcript = TranscriptResult("", self._config.stt_language, 0.0, duration_ms, 0)
@@ -1904,6 +2342,10 @@ class ParticipantAudioSession:
         tts_synth_done_time_ms = 0
         tts_publish_start_time_ms = 0
         tts_publish_done_time_ms = 0
+        tts_prepared_text = ""
+        tts_segments: list[str] = []
+        filler_added = False
+        filler_type = ""
         llm_latency_ms = 0
         tts_latency_ms = 0
 
@@ -1911,7 +2353,7 @@ class ParticipantAudioSession:
             if not self._config.stt_enabled:
                 raise RuntimeError("STT is disabled by configuration")
 
-            transcript = await asyncio.to_thread(self._stt_service.transcribe, wav_path, duration_ms)
+            transcript = await asyncio.to_thread(self._stt_service.transcribe, audio_samples, duration_ms)
 
             await self._event_bus.publish_json(
                 {
@@ -2017,14 +2459,39 @@ class ParticipantAudioSession:
                             state_snapshot = self._dialogue_state.snapshot()
                             knowledge = self._kb.retrieve(normalized_text, state_snapshot)
                             examples = self._kb.relevant_examples(normalized_text)
-                            llm_reply, llm_latency_ms = await self._llm_service.generate_response(
-                                normalized_text=normalized_text,
-                                history=self._history,
-                                dialogue_state=state_snapshot,
-                                knowledge=knowledge,
-                                truth_rules=self._kb.truth_rules,
-                                examples=examples,
+                            llm_task = asyncio.create_task(
+                                self._llm_service.generate_response(
+                                    normalized_text=normalized_text,
+                                    history=self._history,
+                                    dialogue_state=state_snapshot,
+                                    knowledge=knowledge,
+                                    truth_rules=self._kb.truth_rules,
+                                    examples=examples,
+                                )
                             )
+                            if self._config.voice_bridge_on_llm and self._config.tts_enabled:
+                                bridge_text = self._llm_bridge_text()
+                                if bridge_text and not self._is_stale_turn(turn_revision):
+                                    self._log(
+                                        f"llm bridge start participant={self._participant.identity} "
+                                        f"utterance_id={utterance_id} text={bridge_text!r}"
+                                    )
+                                    await self._publish_status("speaking")
+                                    self._is_speaking = True
+                                    try:
+                                        _, _, _, _, _, _, _ = await self._speak_response(
+                                            utterance_id=f"{utterance_id}-bridge",
+                                            response_text=bridge_text,
+                                            intent_value=Intent.COMPLEX_REQUEST.value,
+                                        )
+                                    finally:
+                                        self._is_speaking = False
+                                    self._log(
+                                        f"llm bridge done participant={self._participant.identity} "
+                                        f"utterance_id={utterance_id}"
+                                    )
+                                    await self._publish_status("complex_request_detected")
+                            llm_reply, llm_latency_ms = await llm_task
                             response_text = validate_llm_reply(
                                 reply_tts=llm_reply.reply_tts,
                                 fallback_reply=self._state_fallback_reply(),
@@ -2046,6 +2513,7 @@ class ParticipantAudioSession:
                             intent,
                             last_agent_message=self._last_agent_message,
                         )
+                raw_response_text = response_text
                 response_ready_time_ms = int(time.time() * 1000)
 
             if self._is_stale_turn(turn_revision):
@@ -2097,21 +2565,36 @@ class ParticipantAudioSession:
                     f"tts synth start participant={self._participant.identity} "
                     f"utterance_id={utterance_id} text={response_text!r}"
                 )
-                tts_pcm16, tts_sample_rate, tts_latency_ms = await asyncio.to_thread(
-                    self._tts_service.synthesize,
-                    response_text,
+                (
+                    spoken_text,
+                    tts_prepared_text,
+                    tts_segments,
+                    tts_latency_ms,
+                    playback_completed,
+                    filler_added,
+                    filler_type,
+                ) = await self._speak_response(
+                    utterance_id=utterance_id,
+                    response_text=response_text,
+                    intent_value=intent.intent,
+                )
+                response_text = spoken_text
+                self._log(
+                    f"tts style participant={self._participant.identity} "
+                    f"utterance_id={utterance_id} filler_added={str(filler_added).lower()} "
+                    f"filler_type={filler_type or '-'} raw={raw_response_text!r} styled={response_text!r}"
                 )
                 tts_synth_done_time_ms = int(time.time() * 1000)
                 self._log(
                     f"tts synth done participant={self._participant.identity} "
-                    f"utterance_id={utterance_id} samples={len(tts_pcm16)} sample_rate={tts_sample_rate}"
+                    f"utterance_id={utterance_id} segments={len(tts_segments)} "
+                    f"prepared_text={tts_prepared_text!r}"
                 )
                 tts_publish_start_time_ms = int(time.time() * 1000)
                 self._log(
                     f"tts publish start participant={self._participant.identity} "
                     f"utterance_id={utterance_id}"
                 )
-                playback_completed = await self._audio_publisher.speak_pcm(tts_pcm16, tts_sample_rate)
                 tts_publish_done_time_ms = int(time.time() * 1000)
                 self._log(
                     f"tts publish done participant={self._participant.identity} "
@@ -2226,6 +2709,11 @@ class ParticipantAudioSession:
                     "total_latency_ms": total_latency_ms,
                     "error_stage": error_stage,
                     "response_text": response_text,
+                    "raw_response_text": raw_response_text,
+                    "tts_prepared_text": tts_prepared_text,
+                    "tts_segments": tts_segments,
+                    "filler_added": filler_added,
+                    "filler_type": filler_type,
                     "llm_latency_ms": llm_latency_ms,
                     "llm_reply_intent": llm_reply.intent if llm_reply else "",
                     "llm_reply_search_index": llm_reply.search_index if llm_reply else [],
@@ -2252,20 +2740,16 @@ class ParticipantAudioSession:
             await self._publish_status("waiting_for_speech")
             if had_barge_in_pending:
                 if self._resume_buffer.size:
-                    if self._sample_buffer.size == 0:
-                        self._sample_buffer = self._resume_buffer.copy()
-                    else:
-                        self._sample_buffer = np.concatenate((self._resume_buffer, self._sample_buffer))
+                    self._sample_buffer.prepend(self._resume_buffer.to_array())
                 while (
                     not self._is_processing
                     and not self._is_speaking
                     and self._sample_buffer.size >= self._vad.window_size
                 ):
-                    window = self._sample_buffer[: self._vad.window_size]
-                    self._sample_buffer = self._sample_buffer[self._vad.window_size :]
+                    window = self._sample_buffer.pop_front(self._vad.window_size)
                     await self._process_vad_window(window)
-            self._resume_buffer = np.empty(0, dtype=np.int16)
-            self._resume_probe_buffer = np.empty(0, dtype=np.int16)
+            self._resume_buffer.clear()
+            self._resume_probe_buffer.clear()
             self._resume_speech_ms = 0
 
 
