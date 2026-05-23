@@ -165,19 +165,20 @@ AUDIO_FRAME_SIZE_MS=20
 
 VAD_THRESHOLD=0.45
 VAD_MIN_SPEECH_DURATION_MS=200
-VAD_MIN_SILENCE_DURATION_MS=500
-VAD_SPEECH_PAD_MS=120
+VAD_MIN_SILENCE_DURATION_MS=800
+VAD_SPEECH_PAD_MS=180
 VAD_USE_ONNX=false
 TORCH_NUM_THREADS=1
 
 STT_ENABLED=true
-STT_MODEL=Systran/faster-whisper-small
-STT_DEVICE=auto
+STT_MODEL=turbo
+STT_DEVICE=cuda
 STT_COMPUTE_TYPE_CPU=int8
 STT_COMPUTE_TYPE_GPU=float16
 STT_LANGUAGE=ru
 STT_BEAM_SIZE=1
 STT_CONFIDENCE_FLOOR=0.35
+DEBUG_SAVE_WAV=false
 ```
 
 Запуск:
@@ -185,14 +186,14 @@ STT_CONFIDENCE_FLOOR=0.35
 ```bash
 cd /opt/voice-agent
 cp .env.prod.example .env
-docker compose -f docker-compose.prod.yml up --build -d
+docker compose -f docker-compose.prod.yml -f docker-compose.llm.yml up --build -d
 ```
 
 ### 3. GPU override
 
 Файл: [docker-compose.gpu.yml](/Users/dr_emin/Desktop/livekit/docker-compose.gpu.yml)
 
-Используйте его только если:
+Используйте его, если хотите дать `agent` GPU без локального `vLLM`, например только для STT:
 
 - на хосте есть NVIDIA GPU
 - `nvidia-smi` работает
@@ -266,21 +267,23 @@ docker compose -f docker-compose.prod.yml -f docker-compose.gpu.yml up --build -
 
 ## Models And GPU
 
-Базовый STT по умолчанию:
+Рекомендуемый STT для RTX 4090:
 
-- `Systran/faster-whisper-small`
+- `turbo` (`openai/whisper-large-v3-turbo` в faster-whisper)
 
 Почему так:
 
-- это самый быстрый путь к рабочему русскоязычному loop без сложной инфраструктуры
-- модель можно заменить позже на `medium` или другой backend без слома интерфейса
+- `small` на CPU даёт заметно хуже качество и на реальном звонке легко уводит вас в 5+ секунд полной turn latency
+- `turbo` оптимизирован OpenAI именно под быстрый inference
+- faster-whisper официально рекомендует GPU `float16`, а для multilingual сценариев Distil-Whisper не подходит
 
 Текущее поведение по GPU:
 
 - VAD остается легким и может спокойно жить на CPU
-- STT пытается использовать `cuda`, если `STT_DEVICE=auto` и внутри контейнера реально доступна NVIDIA runtime
+- на 4090 сервере `agent` должен идти с `gpus: all` и `STT_DEVICE=cuda`
 - если CUDA недоступна или инициализация падает, agent автоматически откатывается на CPU `int8`
-- для реального проброса GPU в контейнер используйте `docker-compose.gpu.yml`
+- `docker-compose.llm.yml` теперь сразу поднимает `agent` с GPU и `STT_MODEL=turbo`
+- `docker-compose.gpu.yml` нужен только если хотите GPU-STT без локального `vLLM`
 
 Проверка сервера:
 
@@ -297,13 +300,13 @@ docker compose -f docker-compose.prod.yml -f docker-compose.gpu.yml up --build -
 
 ```bash
 pip install -U "huggingface_hub[cli]"
-huggingface-cli download Systran/faster-whisper-small --local-dir /opt/models/faster-whisper-small
+huggingface-cli download openai/whisper-large-v3-turbo --local-dir /opt/models/whisper-large-v3-turbo
 ```
 
 Тогда в `.env` можно указать:
 
 ```env
-STT_MODEL=/models/faster-whisper-small
+STT_MODEL=/models/whisper-large-v3-turbo
 ```
 
 ## Token API

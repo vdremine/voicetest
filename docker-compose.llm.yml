@@ -27,5 +27,11 @@ services:
       - ${MODEL_CACHE_DIR:-/opt/models}/huggingface:/root/.cache/huggingface
 
   agent:
+    gpus: all
     depends_on:
       - llm
+    environment:
+      STT_DEVICE: cuda
+      STT_MODEL: ${STT_MODEL:-turbo}
+      STT_COMPUTE_TYPE_GPU: ${STT_COMPUTE_TYPE_GPU:-float16}
+      DEBUG_SAVE_WAV: ${DEBUG_SAVE_WAV:-false}
