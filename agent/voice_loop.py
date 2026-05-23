@@ -936,6 +936,21 @@ TTS:
         return ""
 
     @staticmethod
+    def _extract_last_assistant_message(messages: list[dict[str, str]]) -> str:
+        for msg in reversed(messages):
+            role = str(msg.get("role", "")).strip().lower()
+            if role != "assistant":
+                continue
+            content = str(msg.get("text", msg.get("content", ""))).strip()
+            if content:
+                return content
+        return ""
+
+    @staticmethod
+    def _assistant_turn_count(messages: list[dict[str, str]]) -> int:
+        return sum(1 for msg in messages if str(msg.get("role", "")).strip().lower() == "assistant")
+
+    @staticmethod
     def _extract_responses_output_text(response: Any) -> str:
         output_text = getattr(response, "output_text", None)
         if output_text:
@@ -949,6 +964,93 @@ TTS:
                     if text_value:
                         return str(text_value).strip()
         return ""
+
+    def _build_yandex_prompt_runtime_input(
+        self,
+        *,
+        normalized_text: str,
+        history: list[dict[str, str]],
+        dialogue_state: dict[str, Any] | None,
+        truth_rules: tuple[str, ...],
+    ) -> str:
+        state = dialogue_state or {}
+        assistant_turn_count = self._assistant_turn_count(history)
+        is_first_turn = assistant_turn_count == 0
+        last_agent_message = self._extract_last_assistant_message(history)
+        history_text = self._build_history_without_last_user(history, limit=8)
+        state_compact = {
+            "stage": state.get("stage", ""),
+            "awaiting_field": state.get("awaiting_field", ""),
+            "next_required_field": state.get("next_required_field", ""),
+            "scenario": state.get("scenario", ""),
+            "known_facts": state.get("known_facts", {}),
+        }
+        rules_text = "; ".join(rule.strip() for rule in truth_rules[:6] if rule.strip())
+        lines = [
+            "Служебный runtime-контекст. Не озвучивай его дословно.",
+            f"is_first_turn={'true' if is_first_turn else 'false'}",
+            f"assistant_turn_count={assistant_turn_count}",
+            f"do_not_repeat_opening={'false' if is_first_turn else 'true'}",
+            f"last_agent_message={last_agent_message or '-'}",
+            "dialogue_state=" + json.dumps(state_compact, ensure_ascii=False),
+        ]
+        if rules_text:
+            lines.append(f"truth_rules={rules_text}")
+        if history_text:
+            lines.append("recent_history=\n" + history_text)
+        lines.append(
+            "Если is_first_turn=false, не начинай ответ с 'Алл+о. Это Влад+имир, МосИнвестФинанс.' "
+            "и не повторяй стартовую реплику звонка."
+        )
+        lines.append(
+            "Ответь коротко и по делу: 1-2 предложения, максимум один вопрос, "
+            "сначала ответ по сути, потом следующий шаг."
+        )
+        lines.append(f"current_user_message={normalized_text}")
+        return "\n\n".join(lines)
+
+    def _stabilize_yandex_prompt_reply(
+        self,
+        reply: LlmReply,
+        *,
+        history: list[dict[str, str]],
+        normalized_text: str,
+    ) -> LlmReply:
+        assistant_turn_count = self._assistant_turn_count(history)
+        if assistant_turn_count == 0:
+            return reply
+
+        text = reply.reply_tts.strip()
+        opening_prefixes = (
+            "алл+о",
+            "алло",
+            "это влад+имир, мосинвестфинанс",
+            "алл+о. это влад+имир, мосинвестфинанс",
+        )
+        lowered = text.lower()
+        if lowered.startswith(opening_prefixes):
+            text = re.sub(
+                r"^(алл\+о\.?\s*)?(это\s+влад\+имир,\s*мосинвестфинанс\.?\s*)",
+                "",
+                text,
+                flags=re.IGNORECASE,
+            ).strip(" .")
+            text = sanitize_voice_response(
+                text,
+                fallback="Да, слушаю вас. Подскажите, пожалуйста, какая сумма вам нужна?",
+            )
+        if normalized_text in {"как дела", "как дела?", "как дела ?"} and assistant_turn_count > 0:
+            text = sanitize_voice_response(
+                text,
+                fallback="Все хорошо, спасибо. Подскажите, пожалуйста, какая сумма вам нужна?",
+            )
+        return LlmReply(
+            reply_tts=text,
+            search_index=reply.search_index,
+            intent=reply.intent,
+            next_step=reply.next_step,
+            raw_text=reply.raw_text,
+        )
 
     def _yandex_auth_headers(self) -> dict[str, str]:
         iam_token = self._config.yandex_iam_token.strip()
@@ -1059,6 +1161,10 @@ TTS:
         if not assistant_id:
             raise RuntimeError("YANDEX_ASSISTANT_ID is not configured")
 
+        self._log(
+            f"using yandex assistant api role={self._role} assistant_id={assistant_id} "
+            f"conversation_key={conversation_key}"
+        )
         started_at = time.perf_counter()
         thread_id = await self._get_or_create_yandex_thread(conversation_key)
         input_text = self._build_yandex_assistant_input(
@@ -1152,15 +1258,23 @@ TTS:
         *,
         normalized_text: str,
         history: list[dict[str, str]],
+        dialogue_state: dict[str, Any] | None,
+        truth_rules: tuple[str, ...],
     ) -> tuple[LlmReply, int]:
         prompt_id = self._config.yandex_prompt_id.strip()
         if not prompt_id:
             raise RuntimeError("YANDEX_PROMPT_ID is not configured")
 
+        self._log(f"using yandex prompt api role={self._role} prompt_id={prompt_id}")
         client = self._ensure_client()
         started_at = time.perf_counter()
         user_message = self._extract_last_user_message(history) or normalized_text
-        history_text = self._build_history_without_last_user(history, limit=10)
+        history_text = self._build_yandex_prompt_runtime_input(
+            normalized_text=normalized_text,
+            history=history,
+            dialogue_state=dialogue_state,
+            truth_rules=truth_rules,
+        )
         response = await client.responses.create(
             prompt={
                 "id": prompt_id,
@@ -1176,13 +1290,18 @@ TTS:
         )
         text = self._extract_responses_output_text(response)
         latency_ms = int((time.perf_counter() - started_at) * 1000)
-        return parse_llm_reply(
+        reply = parse_llm_reply(
             text,
             fallback_reply=self._config.fallback_complex_text,
             fallback_intent="complex_request",
             fallback_next_step="уточнить потребность клиента",
             fallback_search_seed=normalized_text,
             prefer_raw_text=True,
+        )
+        return self._stabilize_yandex_prompt_reply(
+            reply,
+            history=history,
+            normalized_text=normalized_text,
         ), latency_ms
 
     def _ensure_client(self) -> AsyncOpenAI:
@@ -1356,6 +1475,8 @@ TTS:
             return await self._generate_response_via_yandex_prompt(
                 normalized_text=normalized_text,
                 history=history,
+                dialogue_state=dialogue_state,
+                truth_rules=truth_rules,
             )
 
         if self._uses_yandex_assistant_api():
