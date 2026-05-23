@@ -1673,6 +1673,10 @@ class SimpleIntentRouter:
             "зачем вам эта информация",
             "для чего эта информация",
             "почему вам это нужно",
+            "что это за вопрос",
+            "не понял что это за вопрос",
+            "по какому поводу",
+            "по какому вопросу",
         }
         self._latency_markers = {
             "почему так долго",
@@ -1772,7 +1776,7 @@ class SimpleIntentRouter:
         if (
             text in self._identify
             or text.startswith(("это кто", "кто это", "кто вы", "представьтесь", "кто со мной"))
-            or any(marker in text for marker in ("это кто", "кто звонит", "кто вы", "представьтесь"))
+            or any(marker in text for marker in ("это кто", "кто звонит", "кто вы", "представьтесь", "по какому поводу", "по какому вопросу"))
         ):
             return IntentResult(Intent.IDENTIFY_SELF.value, 0.99, False, Action.INTRODUCE_SELF.value)
         if any(marker in text for marker in self._identity_mismatch_markers):
@@ -1801,6 +1805,8 @@ class SimpleIntentRouter:
             return IntentResult(Intent.REPEAT.value, 0.99, False, Action.REPEAT_LAST_AGENT_MESSAGE.value)
         if text in self._wait or text.startswith("подожди"):
             return IntentResult(Intent.WAIT.value, 0.98, False, Action.ACK_WAIT.value)
+        if any(marker in text for marker in ("спасибо за внимание", "всего доброго", "до свидания", "до свиданья")):
+            return IntentResult(Intent.END_SESSION.value, 0.98, False, Action.END_SESSION.value)
         if text in self._end_session or text.startswith("заверши") or text.startswith("стоп"):
             return IntentResult(Intent.END_SESSION.value, 0.98, False, Action.END_SESSION.value)
         if any(token in text for token in self._handoff_tokens):
