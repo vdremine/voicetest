@@ -14,9 +14,7 @@ from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Protocol
-
-import httpx
+from typing import Any, Callable
 import numpy as np
 import torch
 import torchaudio.functional as torchaudio_f
@@ -40,36 +38,6 @@ def env_nonempty(name: str, default: str = "") -> str:
         return default
     value = raw.strip()
     return value if value else default
-
-
-def env_optional_float(name: str) -> float | None:
-    raw = os.getenv(name)
-    if raw is None:
-        return None
-    value = raw.strip()
-    if not value:
-        return None
-    return float(value)
-
-
-def env_optional_int(name: str) -> int | None:
-    raw = os.getenv(name)
-    if raw is None:
-        return None
-    value = raw.strip()
-    if not value:
-        return None
-    return int(value)
-
-
-def env_optional_bool(name: str) -> bool | None:
-    raw = os.getenv(name)
-    if raw is None:
-        return None
-    value = raw.strip()
-    if not value:
-        return None
-    return value.lower() in {"1", "true", "yes", "on"}
 
 
 _AMOUNT_TOKEN_RE = re.compile(
@@ -121,18 +89,6 @@ class VoicePipelineConfig:
     tts_segment_pause_ms: int
     tts_normalize_peak: float
     tts_fade_ms: int
-    tts_timeout_seconds: float
-    elevenlabs_api_key: str
-    elevenlabs_base_url: str
-    elevenlabs_voice_id: str
-    elevenlabs_model_id: str
-    elevenlabs_output_format: str
-    elevenlabs_language_code: str
-    elevenlabs_optimize_streaming_latency: int | None
-    elevenlabs_stability: float | None
-    elevenlabs_similarity_boost: float | None
-    elevenlabs_style: float | None
-    elevenlabs_speaker_boost: bool | None
     half_duplex: bool
     barge_in_enabled: bool
     voice_fillers_enabled: bool
@@ -149,23 +105,26 @@ class VoicePipelineConfig:
 
     @classmethod
     def from_env(cls) -> "VoicePipelineConfig":
-        yandex_api_key = env_nonempty("YANDEX_API_KEY")
-        yandex_project_id = env_nonempty("YANDEX_PROJECT_ID")
-        yandex_base_url = env_nonempty("YANDEX_BASE_URL", "https://ai.api.cloud.yandex.net/v1")
-        elevenlabs_api_key = env_nonempty("ELEVENLABS_API_KEY")
-
-        llm_provider = env_nonempty("LLM_PROVIDER").lower()
-        if not llm_provider:
-            llm_provider = "yandex" if yandex_api_key else "openai"
+        llm_provider = env_nonempty("LLM_PROVIDER", "openai").lower()
 
         tts_provider = env_nonempty("TTS_PROVIDER").lower()
         if not tts_provider:
-            tts_provider = "elevenlabs" if elevenlabs_api_key else "silero"
+            tts_provider = "silero"
 
-        llm_project = env_nonempty("LLM_PROJECT", yandex_project_id or env_nonempty("YANDEX_CLOUD_FOLDER"))
         default_llm_model = "Qwen/Qwen3-8B"
-        if llm_provider == "yandex" and llm_project:
-            default_llm_model = f"gpt://{llm_project}/yandexgpt-lite/latest"
+        default_llm_base_url = "http://127.0.0.1:8001/v1"
+        default_llm_api_key = "local-token"
+        llm_project = env_nonempty("LLM_PROJECT")
+
+        if llm_provider == "yandex":
+            yandex_api_key = env_nonempty("YANDEX_API_KEY")
+            yandex_project_id = env_nonempty("YANDEX_PROJECT_ID")
+            yandex_base_url = env_nonempty("YANDEX_BASE_URL", "https://ai.api.cloud.yandex.net/v1")
+            llm_project = llm_project or yandex_project_id or env_nonempty("YANDEX_CLOUD_FOLDER")
+            if llm_project:
+                default_llm_model = f"gpt://{llm_project}/yandexgpt-lite/latest"
+            default_llm_base_url = yandex_base_url
+            default_llm_api_key = yandex_api_key
 
         return cls(
             sample_rate=int(os.getenv("AUDIO_SAMPLE_RATE", "16000")),
@@ -195,14 +154,8 @@ class VoicePipelineConfig:
             llm_model=env_nonempty("LLM_MODEL", default_llm_model),
             llm_reasoning_effort=os.getenv("LLM_REASONING_EFFORT", "low"),
             llm_timeout_seconds=float(os.getenv("LLM_TIMEOUT_SECONDS", "15")),
-            llm_base_url=env_nonempty(
-                "LLM_BASE_URL",
-                yandex_base_url if llm_provider == "yandex" else "http://127.0.0.1:8001/v1",
-            ),
-            llm_api_key=env_nonempty(
-                "LLM_API_KEY",
-                yandex_api_key if llm_provider == "yandex" else "local-token",
-            ),
+            llm_base_url=env_nonempty("LLM_BASE_URL", default_llm_base_url),
+            llm_api_key=env_nonempty("LLM_API_KEY", default_llm_api_key),
             llm_project=llm_project,
             llm_temperature=float(os.getenv("LLM_TEMPERATURE", "0.2")),
             llm_max_tokens=int(os.getenv("LLM_MAX_TOKENS", "96")),
@@ -220,18 +173,6 @@ class VoicePipelineConfig:
             tts_segment_pause_ms=int(os.getenv("TTS_SEGMENT_PAUSE_MS", "180")),
             tts_normalize_peak=float(os.getenv("TTS_NORMALIZE_PEAK", "0.85")),
             tts_fade_ms=int(os.getenv("TTS_FADE_MS", "10")),
-            tts_timeout_seconds=float(os.getenv("TTS_TIMEOUT_SECONDS", "20")),
-            elevenlabs_api_key=elevenlabs_api_key,
-            elevenlabs_base_url=env_nonempty("ELEVENLABS_BASE_URL", "https://api.elevenlabs.io/v1"),
-            elevenlabs_voice_id=env_nonempty("ELEVENLABS_VOICE_ID"),
-            elevenlabs_model_id=env_nonempty("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5"),
-            elevenlabs_output_format=env_nonempty("ELEVENLABS_OUTPUT_FORMAT", "pcm_24000"),
-            elevenlabs_language_code=env_nonempty("ELEVENLABS_LANGUAGE_CODE", "ru"),
-            elevenlabs_optimize_streaming_latency=env_optional_int("ELEVENLABS_OPTIMIZE_STREAMING_LATENCY"),
-            elevenlabs_stability=env_optional_float("ELEVENLABS_STABILITY"),
-            elevenlabs_similarity_boost=env_optional_float("ELEVENLABS_SIMILARITY_BOOST"),
-            elevenlabs_style=env_optional_float("ELEVENLABS_STYLE"),
-            elevenlabs_speaker_boost=env_optional_bool("ELEVENLABS_SPEAKER_BOOST"),
             half_duplex=env_bool("HALF_DUPLEX", True),
             barge_in_enabled=env_bool("BARGE_IN_ENABLED", False),
             voice_fillers_enabled=env_bool("VOICE_FILLERS_ENABLED", True),
@@ -660,7 +601,7 @@ action используй только из списка:
 Без текста вне JSON.
 
 Правила ответа:
-- reply_tts: одна короткая реплика для клиента, готовая для Yandex SpeechKit;
+- reply_tts: одна короткая реплика для клиента, готовая для озвучки;
 - search_index: массив из 1-5 коротких строк без дублей;
 - intent: короткий смысловой интент клиента;
 - next_step: один короткий следующий шаг менеджера;
@@ -749,7 +690,7 @@ action используй только из списка:
 - не озвучивай внутренние рассуждения, сводки разговора или пересказ в стиле "клиент сказал...".
 
 TTS:
-- reply_tts должен быть сразу пригоден для Yandex SpeechKit;
+- reply_tts должен быть сразу пригоден для озвучки;
 - TTS-разметку используй только если она реально нужна;
 - обязательно помогай с произношением: Влад+имир;
 - если нужно, размечай суммы, проценты, сроки, сложные названия и слово зал+ог."""
@@ -1333,134 +1274,6 @@ class VoiceStyleAdapter:
         return []
 
 
-class BaseTtsService(Protocol):
-    def synthesize_segments(self, request: TtsRequest, segments: list[str]) -> tuple[np.ndarray, int, int]:
-        ...
-
-
-class ElevenLabsTtsService:
-    def __init__(self, config: VoicePipelineConfig, log: Callable[[str], None]) -> None:
-        self._config = config
-        self._log = log
-        self._lock = threading.Lock()
-        self._logged_ready = False
-
-    def _ensure_configured(self) -> None:
-        if not self._config.elevenlabs_api_key:
-            raise RuntimeError("ELEVENLABS_API_KEY is required when TTS_PROVIDER=elevenlabs")
-        if not self._config.elevenlabs_voice_id:
-            raise RuntimeError("ELEVENLABS_VOICE_ID is required when TTS_PROVIDER=elevenlabs")
-        if not self._config.elevenlabs_output_format.startswith("pcm_"):
-            raise RuntimeError("ELEVENLABS_OUTPUT_FORMAT must be a PCM format such as pcm_24000")
-        if not self._logged_ready:
-            self._log(
-                "initialized elevenlabs tts "
-                f"voice_id={self._config.elevenlabs_voice_id} "
-                f"model={self._config.elevenlabs_model_id} "
-                f"output_format={self._config.elevenlabs_output_format}"
-            )
-            self._logged_ready = True
-
-    def _output_sample_rate(self) -> int:
-        parts = self._config.elevenlabs_output_format.split("_")
-        if len(parts) < 2 or not parts[1].isdigit():
-            raise RuntimeError(
-                f"unsupported ELEVENLABS_OUTPUT_FORMAT={self._config.elevenlabs_output_format!r}"
-            )
-        return int(parts[1])
-
-    def _voice_settings_payload(self) -> dict[str, Any] | None:
-        payload: dict[str, Any] = {}
-        if self._config.elevenlabs_stability is not None:
-            payload["stability"] = self._config.elevenlabs_stability
-        if self._config.elevenlabs_similarity_boost is not None:
-            payload["similarity_boost"] = self._config.elevenlabs_similarity_boost
-        if self._config.elevenlabs_style is not None:
-            payload["style"] = self._config.elevenlabs_style
-        if self._config.elevenlabs_speaker_boost is not None:
-            payload["use_speaker_boost"] = self._config.elevenlabs_speaker_boost
-        return payload or None
-
-    def _render_segment(
-        self,
-        segment: str,
-        *,
-        previous_text: str,
-        next_text: str,
-    ) -> np.ndarray:
-        self._ensure_configured()
-        base_url = self._config.elevenlabs_base_url.rstrip("/")
-        url = f"{base_url}/text-to-speech/{self._config.elevenlabs_voice_id}/stream"
-
-        params: dict[str, Any] = {
-            "output_format": self._config.elevenlabs_output_format,
-        }
-        if self._config.elevenlabs_optimize_streaming_latency is not None:
-            params["optimize_streaming_latency"] = self._config.elevenlabs_optimize_streaming_latency
-
-        payload: dict[str, Any] = {
-            "text": segment,
-            "model_id": self._config.elevenlabs_model_id,
-        }
-        if self._config.elevenlabs_language_code:
-            payload["language_code"] = self._config.elevenlabs_language_code
-        if previous_text:
-            payload["previous_text"] = previous_text
-        if next_text:
-            payload["next_text"] = next_text
-        voice_settings = self._voice_settings_payload()
-        if voice_settings:
-            payload["voice_settings"] = voice_settings
-
-        with httpx.Client(timeout=self._config.tts_timeout_seconds) as client:
-            response = client.post(
-                url,
-                params=params,
-                headers={
-                    "xi-api-key": self._config.elevenlabs_api_key,
-                    "Content-Type": "application/json",
-                    "Accept": "application/octet-stream",
-                },
-                json=payload,
-            )
-            response.raise_for_status()
-            audio_bytes = response.content
-
-        pcm16 = np.frombuffer(audio_bytes, dtype="<i2").copy()
-        pcm16 = trim_silence(pcm16)
-        return apply_fade(
-            pcm16,
-            sample_rate=self._output_sample_rate(),
-            fade_ms=self._config.tts_fade_ms,
-        )
-
-    def synthesize_segments(self, request: TtsRequest, segments: list[str]) -> tuple[np.ndarray, int, int]:
-        del request
-        started_at = time.perf_counter()
-        sample_rate = self._output_sample_rate()
-        with self._lock:
-            rendered_segments: list[np.ndarray] = []
-            for index, segment in enumerate(segments):
-                previous_text = segments[index - 1] if index > 0 else ""
-                next_text = segments[index + 1] if index + 1 < len(segments) else ""
-                pcm16 = self._render_segment(
-                    segment,
-                    previous_text=previous_text,
-                    next_text=next_text,
-                )
-                rendered_segments.append(pcm16)
-                if index < len(segments) - 1 and self._config.tts_segment_pause_ms > 0:
-                    rendered_segments.append(silence_ms(self._config.tts_segment_pause_ms, sample_rate))
-
-        if not rendered_segments:
-            pcm16 = np.zeros(0, dtype=np.int16)
-        else:
-            pcm16 = np.concatenate(rendered_segments)
-        pcm16 = normalize_peak(pcm16, target_peak=self._config.tts_normalize_peak)
-        latency_ms = int((time.perf_counter() - started_at) * 1000)
-        return pcm16, sample_rate, latency_ms
-
-
 class SileroTtsService:
     def __init__(self, config: VoicePipelineConfig, log: Callable[[str], None]) -> None:
         self._config = config
@@ -1526,10 +1339,7 @@ class SileroTtsService:
         return pcm16, self._config.tts_sample_rate, latency_ms
 
 
-def build_tts_service(config: VoicePipelineConfig, log: Callable[[str], None]) -> BaseTtsService:
-    provider = config.tts_provider.strip().lower()
-    if provider == "elevenlabs":
-        return ElevenLabsTtsService(config, log)
+def build_tts_service(config: VoicePipelineConfig, log: Callable[[str], None]) -> SileroTtsService:
     return SileroTtsService(config, log)
 
 
@@ -1991,7 +1801,7 @@ class ParticipantAudioSession:
         event_bus: AgentEventBus,
         stt_service: WhisperSttService,
         llm_service: OpenAiLlmService,
-        tts_service: BaseTtsService,
+        tts_service: SileroTtsService,
         audio_publisher: LiveKitAudioPublisher,
         log: Callable[[str], None],
     ) -> None:
@@ -2954,7 +2764,7 @@ class VoiceSessionManager:
         config: VoicePipelineConfig,
         event_bus: AgentEventBus,
         llm_service: OpenAiLlmService,
-        tts_service: BaseTtsService,
+        tts_service: SileroTtsService,
         audio_publisher: LiveKitAudioPublisher,
         log: Callable[[str], None],
     ) -> None:
