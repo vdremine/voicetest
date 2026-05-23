@@ -179,6 +179,7 @@ STT_LANGUAGE=ru
 STT_BEAM_SIZE=3
 STT_CONFIDENCE_FLOOR=0.25
 DEBUG_SAVE_WAV=false
+TTS_DEVICE=auto
 ```
 
 Запуск:
@@ -205,6 +206,27 @@ docker compose -f docker-compose.prod.yml -f docker-compose.llm.yml up --build -
 cd /opt/voice-agent
 cp .env.prod.example .env
 docker compose -f docker-compose.prod.yml -f docker-compose.gpu.yml up --build -d
+```
+
+### Yandex + GPU variant
+
+Файл: [.env.yandex.gpu.example](/Users/dr_emin/Desktop/livekit/.env.yandex.gpu.example)
+
+Этот вариант рассчитан на:
+
+- `LLM_PROVIDER=yandex`
+- `YANDEX_API_KEY`
+- `YANDEX_PROJECT_ID` или `YANDEX_CLOUD_FOLDER`
+- отдельный `AGENT_IDENTITY=agent-yandex-gpu-001`
+- `STT_DEVICE=cuda`
+- `TTS_DEVICE=cuda`
+
+Запуск:
+
+```bash
+cd /opt/voice-agent
+cp .env.yandex.gpu.example .env
+docker compose -f docker-compose.prod.yml up --build -d
 ```
 
 ## Порты

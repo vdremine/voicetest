@@ -96,6 +96,7 @@ class VoicePipelineConfig:
     tts_model_path: Path
     tts_model_url: str
     tts_speaker: str
+    tts_device: str
     tts_sample_rate: int
     tts_publish_sample_rate: int
     tts_frame_ms: int
@@ -206,6 +207,7 @@ class VoicePipelineConfig:
                 "https://models.silero.ai/models/tts/ru/v5_4_ru.pt",
             ),
             tts_speaker=os.getenv("TTS_SPEAKER", "aidar"),
+            tts_device=os.getenv("TTS_DEVICE", "auto"),
             tts_sample_rate=int(os.getenv("TTS_SAMPLE_RATE", "24000")),
             tts_publish_sample_rate=int(os.getenv("TTS_PUBLISH_SAMPLE_RATE", "24000")),
             tts_frame_ms=int(os.getenv("TTS_FRAME_MS", "20")),
@@ -1644,6 +1646,19 @@ class SileroTtsService:
         self._log = log
         self._lock = threading.Lock()
         self._model: Any | None = None
+        self._device: torch.device | None = None
+
+    def _resolve_device(self) -> torch.device:
+        raw = self._config.tts_device.strip().lower()
+        if raw == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError("TTS_DEVICE=cuda but CUDA is not available")
+            return torch.device("cuda")
+        if raw == "cpu":
+            return torch.device("cpu")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        return torch.device("cpu")
 
     def _ensure_model(self) -> Any:
         if self._model is not None:
@@ -1658,10 +1673,13 @@ class SileroTtsService:
             "tts_models",
             "model",
         )
-        model.to(torch.device("cpu"))
+        device = self._resolve_device()
+        model.to(device)
         self._model = model
+        self._device = device
         self._log(
-            f"initialized silero tts model={self._config.tts_model_path} speaker={self._config.tts_speaker}"
+            "initialized silero tts "
+            f"model={self._config.tts_model_path} speaker={self._config.tts_speaker} device={device.type}"
         )
         return self._model
 

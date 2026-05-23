@@ -20,9 +20,9 @@ services:
       - --dtype
       - auto
       - --gpu-memory-utilization
-      - ${LLM_GPU_MEMORY_UTILIZATION:-0.68}
+      - ${LLM_GPU_MEMORY_UTILIZATION:-0.55}
       - --max-model-len
-      - ${LLM_MAX_MODEL_LEN:-4096}
+      - ${LLM_MAX_MODEL_LEN:-3072}
       - --generation-config
       - vllm
     volumes:
