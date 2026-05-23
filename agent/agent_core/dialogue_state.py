@@ -11,6 +11,18 @@ _AMOUNT_RE = re.compile(
     r"(?P<num>\d+(?:[\.,]\d+)?)\s*(?P<unit>млн|миллион|миллиона|миллионов|тыс|тысяч|тысячи)?",
     flags=re.IGNORECASE,
 )
+_CITY_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bмоскв(?:а|е|ы|у|ой)?\b", flags=re.IGNORECASE), "Москва"),
+    (
+        re.compile(r"\bмосковск(?:ая|ой|ую)\s+област(?:ь|и)\b", flags=re.IGNORECASE),
+        "Московская область",
+    ),
+    (
+        re.compile(r"\bсанкт[\s-]?петербург(?:е|а|у|ом)?\b", flags=re.IGNORECASE),
+        "Санкт-Петербург",
+    ),
+    (re.compile(r"\bпитер(?:е|а|у|ом)?\b", flags=re.IGNORECASE), "Санкт-Петербург"),
+)
 
 
 @dataclass(slots=True)
@@ -82,6 +94,14 @@ class DialogueState:
                 updated_fields.add("official_employment")
             self.official_employment = employment
             self.known_facts["official_employment"] = employment
+
+        city = self._detect_city(raw_text)
+        if city:
+            if city != self.city:
+                updated_fields.add("регион")
+            self.city = city
+            self.known_facts["region"] = city
+            self.known_facts["регион"] = city
 
         if "не сегодня" in lowered or "послезавтра" in lowered or "после двенадцати" in lowered:
             if raw_text.strip() != self.callback_time:
@@ -202,6 +222,22 @@ class DialogueState:
             return "официальная работа"
         if "неофициаль" in text or "официально не" in text:
             return "неофициальная работа"
+        return ""
+
+    def _detect_city(self, text: str) -> str:
+        for pattern, city in _CITY_PATTERNS:
+            if pattern.search(text):
+                return city
+        if self.awaiting_field == "region" or self.current_node == "collect_region":
+            match = re.search(
+                r"^\s*(?:в|во|из|по)\s+([A-Za-zА-Яа-яЁё-]+(?:\s+[A-Za-zА-Яа-яЁё-]+){0,2})\s*[.!?]?\s*$",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                city = match.group(1).strip(" .,!?:;")
+                if city:
+                    return city[:1].upper() + city[1:]
         return ""
 
     @staticmethod

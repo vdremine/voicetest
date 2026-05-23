@@ -1,4 +1,7 @@
 services:
+  llm:
+    gpus: all
+
   agent:
     gpus: all
     environment:

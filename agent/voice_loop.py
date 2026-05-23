@@ -1627,7 +1627,16 @@ class SimpleIntentRouter:
             "не понял",
         }
         self._wait = {"подожди", "секунду", "одну секунду"}
-        self._ready_to_talk = {"я слушаю", "слушаю вас", "говорите", "да слушаю", "слушаю", "удобно"}
+        self._ready_to_talk = {
+            "я слушаю",
+            "я вас слушаю",
+            "слушаю вас",
+            "говорите",
+            "да слушаю",
+            "слушаю",
+            "удобно",
+            "да удобно",
+        }
         self._identify = {"это кто", "кто это", "кто вы", "представьтесь"}
         self._identity_mismatch_markers = {
             "с кем то",
@@ -1658,6 +1667,18 @@ class SimpleIntentRouter:
             "плохо пообщалась",
             "нехорошая",
             "девушка",
+        }
+        self._abuse_markers = {
+            "тупец",
+            "тупая",
+            "тупой",
+            "идиот",
+            "дебил",
+            "придурок",
+            "отстань",
+            "отвали",
+            "пошел",
+            "пошла",
         }
         self._payment_help_markers = {
             "куда переводить",
@@ -1700,7 +1721,11 @@ class SimpleIntentRouter:
 
         if text in self._greeting or text.startswith(("привет", "здравствуйте", "добрый ", "алло", "ало")):
             return IntentResult(Intent.GREETING.value, 0.99, False, Action.ACK_GREETING.value)
-        if text in self._ready_to_talk or text.startswith(("я слушаю", "слушаю вас", "говорите", "да слушаю")):
+        if (
+            text in self._ready_to_talk
+            or text.startswith(("я слушаю", "я вас слушаю", "слушаю вас", "говорите", "да слушаю"))
+            or ("слушаю" in text and any(token in text for token in ("да", "удобно", "говорите")))
+        ):
             return IntentResult(Intent.READY_TO_TALK.value, 0.99, False, Action.CONTINUE_OPENING.value)
         if text in self._identify or text.startswith(("это кто", "кто это", "кто вы", "представьтесь", "кто со мной")):
             return IntentResult(Intent.IDENTIFY_SELF.value, 0.99, False, Action.INTRODUCE_SELF.value)
@@ -1714,6 +1739,8 @@ class SimpleIntentRouter:
             return IntentResult(Intent.LATENCY_QUESTION.value, 0.94, False, Action.EXPLAIN_DELAY_AND_CONTINUE.value)
         if any(marker in text for marker in self._service_complaint_markers):
             return IntentResult(Intent.SERVICE_COMPLAINT.value, 0.92, False, Action.ACK_COMPLAINT_AND_REFOCUS.value)
+        if any(marker in text for marker in self._abuse_markers):
+            return IntentResult(Intent.REJECT.value, 0.97, False, Action.ACK_REJECT.value)
         if any(marker in text for marker in self._payment_help_markers):
             return IntentResult(Intent.PAYMENT_HELP.value, 0.92, False, Action.HANDOFF_PAYMENT_SUPPORT.value)
         if text in self._confirm or self._is_affirmation_phrase(text):
@@ -2394,6 +2421,7 @@ class ParticipantAudioSession:
             "нужная_сумма",
             "цель",
             "вид_объекта",
+            "регион",
             "обременение",
             "callback_time",
             "сценарий",
