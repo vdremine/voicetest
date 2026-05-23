@@ -36,22 +36,22 @@ services:
       HF_TOKEN: ${HF_TOKEN:-}
       HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
     command:
-      - --model
-      - ${LLM_MODEL:-Qwen/Qwen3-8B}
+      - ${LLM_MODEL:-Qwen/Qwen2.5-7B-Instruct}
       - --host
       - 127.0.0.1
       - --port
       - ${LLM_PORT:-8001}
       - --api-key
       - ${LLM_API_KEY:-local-token}
+      - --trust-remote-code
       - --dtype
       - auto
       - --gpu-memory-utilization
-      - ${LLM_GPU_MEMORY_UTILIZATION:-0.55}
+      - ${LLM_GPU_MEMORY_UTILIZATION:-0.82}
       - --max-model-len
-      - ${LLM_MAX_MODEL_LEN:-3072}
+      - ${LLM_MAX_MODEL_LEN:-1536}
       - --max-num-seqs
-      - ${LLM_MAX_NUM_SEQS:-2}
+      - ${LLM_MAX_NUM_SEQS:-1}
       - --enforce-eager
     volumes:
       - ${MODEL_CACHE_DIR:-/opt/models}/huggingface:/root/.cache/huggingface
