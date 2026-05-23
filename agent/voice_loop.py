@@ -80,6 +80,7 @@ class VoicePipelineConfig:
     llm_max_tokens: int
     adaptive_classifier_enabled: bool
     llm_orchestrates_all: bool
+    llm_debug_direct_mode: bool
     tts_enabled: bool
     tts_model_path: Path
     tts_model_url: str
@@ -160,9 +161,10 @@ class VoicePipelineConfig:
             llm_api_key=env_nonempty("LLM_API_KEY", default_llm_api_key),
             llm_project=llm_project,
             llm_temperature=float(os.getenv("LLM_TEMPERATURE", "0.2")),
-            llm_max_tokens=int(os.getenv("LLM_MAX_TOKENS", "96")),
+            llm_max_tokens=int(os.getenv("LLM_MAX_TOKENS", "4096")),
             adaptive_classifier_enabled=env_bool("ADAPTIVE_CLASSIFIER_ENABLED", False),
             llm_orchestrates_all=env_bool("LLM_ORCHESTRATES_ALL", True),
+            llm_debug_direct_mode=env_bool("LLM_DEBUG_DIRECT_MODE", False),
             tts_enabled=env_bool("TTS_ENABLED", True),
             tts_model_path=Path(os.getenv("TTS_MODEL_PATH", "/models/silero-tts/ru/v5_4_ru.pt")),
             tts_model_url=os.getenv(
@@ -703,6 +705,26 @@ TTS:
 - TTS-разметку используй только если она реально нужна;
 - обязательно помогай с произношением: Влад+имир;
 - если нужно, размечай суммы, проценты, сроки, сложные названия и слово зал+ог."""
+    _LOCAL_MANAGER_DEBUG_PROMPT = """Ты — Влад+имир, дежурный менеджер компании МосИнвестФинанс.
+Если спрашивают, живой ли ты, отвечай: да.
+
+Отвечай только plain text, сразу пригодным для озвучки.
+Без JSON.
+Без markdown.
+Без комментариев.
+Без служебных префиксов.
+
+Правила:
+- одна реплика, обычно 1-2 коротких предложения;
+- держи ответ коротким, обычно до 220 символов;
+- сначала ответь по сути, потом при необходимости задай один следующий вопрос;
+- не повторяй уже известное;
+- не пересказывай историю звонка и не озвучивай служебные поля;
+- если это первый заход, начни с "Алл+о";
+- не выдумывай продукты и условия;
+- не предлагай ПТС, если у клиента нет автомобиля;
+- вопросы оплаты, отсрочки и реквизитов переводи на персонального менеджера;
+- если клиент грубит или просит прекратить разговор, спокойно заверши разговор."""
 
     def __init__(self, config: VoicePipelineConfig, log: Callable[[str], None]) -> None:
         self._config = config
@@ -886,17 +908,27 @@ TTS:
 
         client = self._ensure_client()
         started_at = time.perf_counter()
+        debug_direct_mode = self._config.llm_debug_direct_mode
         messages: list[dict[str, str]] = [
             {
                 "role": "system",
-                "content": self._LOCAL_MANAGER_PROMPT,
+                "content": (
+                    self._LOCAL_MANAGER_DEBUG_PROMPT
+                    if debug_direct_mode
+                    else self._LOCAL_MANAGER_PROMPT
+                ),
             },
             {
                 "role": "system",
                 "content": (
-                    "Строго соблюдай JSON-схему ответа. "
-                    'Формат: {"reply_tts":"строка","search_index":["строка"],"intent":"строка","next_step":"строка"}. '
-                    "Никакого текста вне JSON."
+                    "Верни только plain-text реплику для TTS. "
+                    "Никакого JSON, markdown и служебного текста."
+                    if debug_direct_mode
+                    else (
+                        "Строго соблюдай JSON-схему ответа. "
+                        'Формат: {"reply_tts":"строка","search_index":["строка"],"intent":"строка","next_step":"строка"}. '
+                        "Никакого текста вне JSON."
+                    )
                 ),
             },
             *build_context_messages(
@@ -914,9 +946,10 @@ TTS:
             "model": self._config.llm_model,
             "temperature": self._config.llm_temperature,
             "max_tokens": self._config.llm_max_tokens,
-            "response_format": self._response_format(self._LLM_JSON_SCHEMA),
             "messages": messages,
         }
+        if not debug_direct_mode:
+            request_kwargs["response_format"] = self._response_format(self._LLM_JSON_SCHEMA)
         extra_body = self._chat_extra_body()
         if extra_body is not None:
             request_kwargs["extra_body"] = extra_body
@@ -937,6 +970,7 @@ TTS:
             fallback_intent="complex_request",
             fallback_next_step="уточнить потребность клиента",
             fallback_search_seed=normalized_text,
+            prefer_raw_text=debug_direct_mode,
         ), latency_ms
 
 
@@ -1040,6 +1074,87 @@ def dedupe_compact_strings(items: list[str], *, limit: int) -> list[str]:
     return result
 
 
+def _decode_loose_json_string(value: str) -> str:
+    candidate = value.strip()
+    if not candidate:
+        return ""
+    try:
+        return json.loads(f'"{candidate}"')
+    except Exception:
+        return (
+            candidate.replace('\\"', '"')
+            .replace("\\n", " ")
+            .replace("\\r", " ")
+            .replace("\\t", " ")
+            .replace("\\/", "/")
+            .strip()
+        )
+
+
+def _extract_json_string_field(text: str, field_name: str) -> str:
+    match = re.search(rf'"{re.escape(field_name)}"\s*:\s*"', text)
+    if not match:
+        return ""
+
+    chars: list[str] = []
+    escape = False
+    index = match.end()
+    while index < len(text):
+        char = text[index]
+        index += 1
+        if escape:
+            chars.append(char)
+            escape = False
+            continue
+        if char == "\\":
+            escape = True
+            continue
+        if char == '"':
+            break
+        chars.append(char)
+
+    return _decode_loose_json_string("".join(chars))
+
+
+def _extract_json_array_strings_field(text: str, field_name: str) -> list[str]:
+    match = re.search(rf'"{re.escape(field_name)}"\s*:\s*\[', text)
+    if not match:
+        return []
+
+    values: list[str] = []
+    index = match.end()
+    while index < len(text):
+        while index < len(text) and text[index] in " \t\r\n,":
+            index += 1
+        if index >= len(text) or text[index] == "]":
+            break
+        if text[index] != '"':
+            break
+
+        index += 1
+        chars: list[str] = []
+        escape = False
+        while index < len(text):
+            char = text[index]
+            index += 1
+            if escape:
+                chars.append(char)
+                escape = False
+                continue
+            if char == "\\":
+                escape = True
+                continue
+            if char == '"':
+                break
+            chars.append(char)
+
+        value = _decode_loose_json_string("".join(chars))
+        if value:
+            values.append(value)
+
+    return dedupe_compact_strings(values, limit=5)
+
+
 def parse_llm_reply(
     raw_text: str,
     *,
@@ -1047,6 +1162,7 @@ def parse_llm_reply(
     fallback_intent: str,
     fallback_next_step: str,
     fallback_search_seed: str,
+    prefer_raw_text: bool = False,
 ) -> LlmReply:
     payload_text = extract_first_json_object(raw_text)
     parsed: dict[str, Any] = {}
@@ -1058,16 +1174,23 @@ def parse_llm_reply(
     except Exception:
         parsed = {}
 
+    extracted_reply = _extract_json_string_field(raw_text, "reply_tts")
+    extracted_intent = _extract_json_string_field(raw_text, "intent")
+    extracted_next_step = _extract_json_string_field(raw_text, "next_step")
+    extracted_search_index = _extract_json_array_strings_field(raw_text, "search_index")
+
     raw_reply_value = parsed.get("reply_tts", "")
     reply_source = str(raw_reply_value).strip() if raw_reply_value is not None else ""
     if not reply_source:
-        reply_source = fallback_reply if json_like_response else raw_text
+        reply_source = extracted_reply
+    if not reply_source:
+        reply_source = raw_text if prefer_raw_text or not json_like_response else fallback_reply
     if reply_source.lstrip().startswith("{") or '"reply_tts"' in reply_source:
-        reply_source = fallback_reply
+        reply_source = extracted_reply or (fallback_reply if json_like_response else raw_text)
 
     reply_tts = sanitize_voice_response(reply_source, fallback=fallback_reply)
-    intent = str(parsed.get("intent", "")).strip() or fallback_intent
-    next_step = str(parsed.get("next_step", "")).strip() or fallback_next_step
+    intent = str(parsed.get("intent", "")).strip() or extracted_intent or fallback_intent
+    next_step = str(parsed.get("next_step", "")).strip() or extracted_next_step or fallback_next_step
 
     raw_search_index = parsed.get("search_index", [])
     search_values: list[str] = []
@@ -1075,6 +1198,8 @@ def parse_llm_reply(
         search_values = [str(item) for item in raw_search_index]
     elif isinstance(raw_search_index, str):
         search_values = [raw_search_index]
+    elif extracted_search_index:
+        search_values = extracted_search_index
 
     if fallback_search_seed:
         search_values.append(fallback_search_seed)
