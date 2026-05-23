@@ -289,6 +289,128 @@ class OpenAiLlmService:
         "required": ["reply_tts", "search_index", "intent", "next_step"],
         "additionalProperties": False,
     }
+    _CLASSIFIER_JSON_SCHEMA: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "intent": {
+                "type": "string",
+                "description": "Короткий тип реплики клиента.",
+            },
+            "action": {
+                "type": "string",
+                "description": "Что должен сделать агент на этом ходе.",
+            },
+            "use_llm": {
+                "type": "boolean",
+                "description": "Нужен ли полный ответ основного менеджерского LLM-ответчика.",
+            },
+            "confidence": {
+                "type": "number",
+                "description": "Уверенность от 0 до 1.",
+            },
+        },
+        "required": ["intent", "action", "use_llm", "confidence"],
+        "additionalProperties": False,
+    }
+    _CLASSIFIER_ALLOWED_INTENTS = {
+        "greeting",
+        "ready_to_talk",
+        "confirm_interest",
+        "slot_answer",
+        "identify_self",
+        "identity_mismatch",
+        "line_issue",
+        "why_need_info",
+        "latency_question",
+        "service_complaint",
+        "payment_help",
+        "repeat",
+        "wait",
+        "human_handoff",
+        "cancel",
+        "reject",
+        "end_session",
+        "unknown_short",
+        "complex_request",
+    }
+    _CLASSIFIER_ALLOWED_ACTIONS = {
+        "continue_opening",
+        "ask_next_slot",
+        "introduce_self",
+        "clarify_identity",
+        "repeat_last_agent_message",
+        "explain_question",
+        "explain_delay_and_continue",
+        "ack_complaint_and_refocus",
+        "handoff_payment_support",
+        "handoff_to_human",
+        "cancel_action",
+        "ack_reject",
+        "end_session",
+        "ack_wait",
+        "ask_repeat",
+        "call_llm",
+    }
+    _CLASSIFIER_PROMPT = """Ты sidecar-классификатор реплик клиента в голосовом кредитном звонке.
+Ты НЕ отвечаешь клиенту. Ты только решаешь, что означает текущая реплика и какой следующий режим обработки нужен.
+
+Верни только один JSON-объект строго по схеме.
+Без markdown.
+Без комментариев.
+Без текста вне JSON.
+
+intent используй только из списка:
+- greeting
+- ready_to_talk
+- confirm_interest
+- slot_answer
+- identify_self
+- identity_mismatch
+- line_issue
+- why_need_info
+- latency_question
+- service_complaint
+- payment_help
+- repeat
+- wait
+- human_handoff
+- cancel
+- reject
+- end_session
+- unknown_short
+- complex_request
+
+action используй только из списка:
+- continue_opening
+- ask_next_slot
+- introduce_self
+- clarify_identity
+- repeat_last_agent_message
+- explain_question
+- explain_delay_and_continue
+- ack_complaint_and_refocus
+- handoff_payment_support
+- handoff_to_human
+- cancel_action
+- ack_reject
+- end_session
+- ack_wait
+- ask_repeat
+- call_llm
+
+Правила:
+- если клиент просто подтверждает актуальность, согласие на разговор или отвечает на предыдущий квалификационный вопрос, это не complex_request;
+- если в реплике уже есть сумма, цель, объект, регион, обременение или другая квалификационная деталь, обычно выбирай intent=slot_answer и action=ask_next_slot;
+- если в реплике есть и сумма, и цель одновременно, всё равно выбирай intent=slot_answer и action=ask_next_slot;
+- если клиент повторяет цель, которую агент уже должен был понять, не возвращай тот же вопрос снова;
+- identify_self выбирай для "кто это", "кто вы", "с кем говорю";
+- why_need_info выбирай для "зачем вам это", "для чего эта информация";
+- line_issue выбирай для плохой связи и "вас не слышно";
+- service_complaint выбирай для жалоб на прошлого менеджера и грубость;
+- payment_help выбирай, если человек спрашивает про оплату, отсрочку, реквизиты, перевод или последний платеж;
+- repeat, wait, cancel, human_handoff, reject, end_session используй для прямых управляющих команд;
+- unknown_short ставь только если реплика реально шумовая, пустая или неинформативная;
+- если реплика требует содержательного ответа по продукту, возражению или нестандартному кейсу, выбирай complex_request и action=call_llm."""
 
     _LOCAL_MANAGER_PROMPT = """Ты — Влад+имир, дежурный менеджер компании МосИнвестФинанс.
 Если спрашивают, живой ли ты, отвечай: да.
@@ -436,6 +558,116 @@ TTS:
             messages.append({"role": role, "content": content})
         return messages
 
+    def _response_format(self, schema: dict[str, Any]) -> dict[str, Any]:
+        if self._is_yandex_provider():
+            return {"type": "json_schema", "json_schema": schema}
+        return {"type": "json_object"}
+
+    @classmethod
+    def _parse_classifier_reply(
+        cls,
+        raw_text: str,
+        *,
+        fallback_intent: str,
+        fallback_action: str,
+        fallback_use_llm: bool,
+        fallback_confidence: float,
+    ) -> IntentResult:
+        payload_text = extract_first_json_object(raw_text)
+        parsed: dict[str, Any] = {}
+        try:
+            maybe_parsed = json.loads(payload_text)
+            if isinstance(maybe_parsed, dict):
+                parsed = maybe_parsed
+        except Exception:
+            parsed = {}
+
+        intent = str(parsed.get("intent", "")).strip() or fallback_intent
+        if intent not in cls._CLASSIFIER_ALLOWED_INTENTS:
+            intent = fallback_intent
+
+        action = str(parsed.get("action", "")).strip() or fallback_action
+        if action not in cls._CLASSIFIER_ALLOWED_ACTIONS:
+            action = fallback_action
+
+        use_llm_value = parsed.get("use_llm", fallback_use_llm)
+        if isinstance(use_llm_value, bool):
+            use_llm = use_llm_value
+        elif isinstance(use_llm_value, str):
+            use_llm = use_llm_value.strip().lower() in {"1", "true", "yes", "да"}
+        else:
+            use_llm = fallback_use_llm
+
+        confidence_value = parsed.get("confidence", fallback_confidence)
+        try:
+            confidence = float(confidence_value)
+        except Exception:
+            confidence = fallback_confidence
+        confidence = max(0.0, min(1.0, confidence))
+
+        return IntentResult(intent=intent, confidence=confidence, use_llm=use_llm, action=action)
+
+    async def classify_intent(
+        self,
+        *,
+        normalized_text: str,
+        history: list[dict[str, str]],
+        dialogue_state: dict[str, Any],
+        initial_intent: IntentResult,
+    ) -> tuple[IntentResult, int]:
+        if not self.enabled:
+            raise RuntimeError("LLM is disabled by configuration")
+
+        client = self._ensure_client()
+        started_at = time.perf_counter()
+        state_json = json.dumps(dialogue_state, ensure_ascii=False)
+        messages: list[dict[str, str]] = [
+            {
+                "role": "system",
+                "content": self._CLASSIFIER_PROMPT,
+            },
+            {
+                "role": "system",
+                "content": f"Текущее состояние звонка: {state_json}",
+            },
+            {
+                "role": "system",
+                "content": (
+                    "Подсказка эвристического роутера: "
+                    f"intent={initial_intent.intent}, action={initial_intent.action}, "
+                    f"use_llm={str(initial_intent.use_llm).lower()}, confidence={initial_intent.confidence:.2f}."
+                ),
+            },
+            *self._history_to_messages(history[-6:]),
+        ]
+        if not messages or messages[-1]["role"] != "user":
+            messages.append({"role": "user", "content": normalized_text})
+
+        completion = await client.chat.completions.create(
+            model=self._config.llm_model,
+            temperature=0.0,
+            max_tokens=min(160, self._config.llm_max_tokens),
+            response_format=self._response_format(self._CLASSIFIER_JSON_SCHEMA),
+            messages=messages,
+        )
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        content = completion.choices[0].message.content or ""
+        if isinstance(content, list):
+            text = "".join(
+                part.get("text", "") if isinstance(part, dict) else getattr(part, "text", "")
+                for part in content
+            )
+        else:
+            text = str(content)
+
+        return self._parse_classifier_reply(
+            text,
+            fallback_intent=initial_intent.intent,
+            fallback_action=initial_intent.action,
+            fallback_use_llm=initial_intent.use_llm,
+            fallback_confidence=initial_intent.confidence,
+        ), latency_ms
+
     async def generate_response(
         self,
         *,
@@ -475,15 +707,11 @@ TTS:
         if not messages or messages[-1]["role"] != "user":
             messages.append({"role": "user", "content": normalized_text})
 
-        response_format: dict[str, Any] = {"type": "json_object"}
-        if self._is_yandex_provider():
-            response_format = {"type": "json_schema", "json_schema": self._LLM_JSON_SCHEMA}
-
         completion = await client.chat.completions.create(
             model=self._config.llm_model,
             temperature=self._config.llm_temperature,
             max_tokens=self._config.llm_max_tokens,
-            response_format=response_format,
+            response_format=self._response_format(self._LLM_JSON_SCHEMA),
             messages=messages,
         )
         latency_ms = int((time.perf_counter() - started_at) * 1000)
@@ -1606,6 +1834,42 @@ class ParticipantAudioSession:
             return self._kb.question_for_field(next_field)
         return self._config.fallback_complex_text
 
+    def _should_use_adaptive_classifier(self, intent: IntentResult, normalized_text: str) -> bool:
+        if not self._llm_service.enabled or not normalized_text.strip():
+            return False
+        if self._dialogue_state.awaiting_field:
+            return True
+        return intent.intent in {
+            "ready_to_talk",
+            "confirm",
+            "amount_provided",
+            "unknown_short",
+            "complex_request",
+        }
+
+    def _should_advance_by_state(self, intent: IntentResult, updated_fields: set[str]) -> bool:
+        slot_fields = {
+            "нужная_сумма",
+            "цель",
+            "вид_объекта",
+            "обременение",
+            "callback_time",
+            "сценарий",
+        }
+        if intent.action == "ask_next_slot":
+            return True
+        if not (updated_fields & slot_fields):
+            return False
+        if self._dialogue_state.awaiting_field:
+            return True
+        return intent.intent in {
+            "amount_provided",
+            "confirm_interest",
+            "slot_answer",
+            "unknown_short",
+            "complex_request",
+        }
+
     async def _process_utterance(
         self,
         *,
@@ -1629,6 +1893,17 @@ class ParticipantAudioSession:
         response_published = False
         suppress_response = False
         rescue_only = False
+        updated_fields: set[str] = set()
+        classifier_latency_ms = 0
+        router_latency_ms = 0
+        decision_started_at = 0.0
+        stt_done_time_ms = 0
+        intent_ready_time_ms = 0
+        response_ready_time_ms = 0
+        tts_synth_start_time_ms = 0
+        tts_synth_done_time_ms = 0
+        tts_publish_start_time_ms = 0
+        tts_publish_done_time_ms = 0
         llm_latency_ms = 0
         tts_latency_ms = 0
 
@@ -1654,6 +1929,7 @@ class ParticipantAudioSession:
             )
 
             normalized_text = self._normalizer.normalize(transcript.text)
+            stt_done_time_ms = int(time.time() * 1000)
             if is_low_information_transcript(transcript.text, normalized_text):
                 if self._needs_rescue_prompt:
                     response_text = self._responses.rescue_prompt()
@@ -1680,11 +1956,39 @@ class ParticipantAudioSession:
             if not rescue_only:
                 faq_answer = self._kb.match_faq(normalized_text)
                 if transcript.text:
-                    self._dialogue_state.update_from_user(transcript.text, normalized_text, kb=self._kb)
+                    updated_fields = self._dialogue_state.update_from_user(
+                        transcript.text,
+                        normalized_text,
+                        kb=self._kb,
+                    )
                     self._history.append({"role": "user", "text": normalized_text or transcript.text})
                     self._history = self._history[-12:]
+                state_snapshot = self._dialogue_state.snapshot()
                 await self._publish_status("routing_intent")
+                decision_started_at = time.perf_counter()
                 intent = self._router.route(normalized_text)
+                if (
+                    transcript.text
+                    and transcript.confidence >= self._config.stt_confidence_floor
+                    and not faq_answer
+                    and self._should_use_adaptive_classifier(intent, normalized_text)
+                ):
+                    try:
+                        intent, classifier_latency_ms = await self._llm_service.classify_intent(
+                            normalized_text=normalized_text,
+                            history=self._history,
+                            dialogue_state=state_snapshot,
+                            initial_intent=intent,
+                        )
+                    except Exception as exc:
+                        self._log(
+                            f"adaptive classifier fallback for {self._participant.identity}: {exc}"
+                        )
+                if decision_started_at > 0:
+                    decision_latency_ms = int((time.perf_counter() - decision_started_at) * 1000)
+                    router_latency_ms = max(0, decision_latency_ms - classifier_latency_ms)
+                intent_ready_time_ms = int(time.time() * 1000)
+
                 await self._event_bus.publish_json(
                     {
                         "type": "intent",
@@ -1701,41 +2005,48 @@ class ParticipantAudioSession:
                 if not transcript.text or transcript.confidence < self._config.stt_confidence_floor:
                     response_text = self._config.fallback_low_confidence_text
                 elif faq_answer:
+                    await self._publish_status("simple_intent_detected")
                     response_text = faq_answer
-                else:
-                    if intent.use_llm:
-                        await self._publish_status("complex_request_detected")
-                        if self._llm_service.enabled:
-                            try:
-                                state_snapshot = self._dialogue_state.snapshot()
-                                knowledge = self._kb.retrieve(normalized_text, state_snapshot)
-                                examples = self._kb.relevant_examples(normalized_text)
-                                llm_reply, llm_latency_ms = await self._llm_service.generate_response(
-                                    normalized_text=normalized_text,
-                                    history=self._history,
-                                    dialogue_state=state_snapshot,
-                                    knowledge=knowledge,
-                                    truth_rules=self._kb.truth_rules,
-                                    examples=examples,
-                                )
-                                response_text = validate_llm_reply(
-                                    reply_tts=llm_reply.reply_tts,
-                                    fallback_reply=self._state_fallback_reply(),
-                                    state=state_snapshot,
-                                    knowledge=knowledge,
-                                    truth_rules=self._kb.truth_rules,
-                                )
-                            except Exception as exc:
-                                self._log(f"llm fallback failed for {self._participant.identity}: {exc}")
-                                response_text = self._state_fallback_reply()
-                        else:
+                elif self._should_advance_by_state(intent, updated_fields):
+                    await self._publish_status("simple_intent_detected")
+                    response_text = self._state_fallback_reply()
+                elif intent.use_llm:
+                    await self._publish_status("complex_request_detected")
+                    if self._llm_service.enabled:
+                        try:
+                            state_snapshot = self._dialogue_state.snapshot()
+                            knowledge = self._kb.retrieve(normalized_text, state_snapshot)
+                            examples = self._kb.relevant_examples(normalized_text)
+                            llm_reply, llm_latency_ms = await self._llm_service.generate_response(
+                                normalized_text=normalized_text,
+                                history=self._history,
+                                dialogue_state=state_snapshot,
+                                knowledge=knowledge,
+                                truth_rules=self._kb.truth_rules,
+                                examples=examples,
+                            )
+                            response_text = validate_llm_reply(
+                                reply_tts=llm_reply.reply_tts,
+                                fallback_reply=self._state_fallback_reply(),
+                                state=state_snapshot,
+                                knowledge=knowledge,
+                                truth_rules=self._kb.truth_rules,
+                            )
+                        except Exception as exc:
+                            self._log(f"llm fallback failed for {self._participant.identity}: {exc}")
                             response_text = self._state_fallback_reply()
+                    else:
+                        response_text = self._state_fallback_reply()
+                else:
+                    if intent.action == "ask_next_slot":
+                        response_text = self._state_fallback_reply()
                     else:
                         await self._publish_status("simple_intent_detected")
                         response_text = self._responses.choose(
                             intent,
                             last_agent_message=self._last_agent_message,
                         )
+                response_ready_time_ms = int(time.time() * 1000)
 
             if self._is_stale_turn(turn_revision):
                 suppress_response = True
@@ -1781,6 +2092,7 @@ class ParticipantAudioSession:
                     return
                 await self._publish_status("speaking")
                 self._is_speaking = True
+                tts_synth_start_time_ms = int(time.time() * 1000)
                 self._log(
                     f"tts synth start participant={self._participant.identity} "
                     f"utterance_id={utterance_id} text={response_text!r}"
@@ -1789,15 +2101,18 @@ class ParticipantAudioSession:
                     self._tts_service.synthesize,
                     response_text,
                 )
+                tts_synth_done_time_ms = int(time.time() * 1000)
                 self._log(
                     f"tts synth done participant={self._participant.identity} "
                     f"utterance_id={utterance_id} samples={len(tts_pcm16)} sample_rate={tts_sample_rate}"
                 )
+                tts_publish_start_time_ms = int(time.time() * 1000)
                 self._log(
                     f"tts publish start participant={self._participant.identity} "
                     f"utterance_id={utterance_id}"
                 )
                 playback_completed = await self._audio_publisher.speak_pcm(tts_pcm16, tts_sample_rate)
+                tts_publish_done_time_ms = int(time.time() * 1000)
                 self._log(
                     f"tts publish done participant={self._participant.identity} "
                     f"utterance_id={utterance_id}"
@@ -1834,6 +2149,17 @@ class ParticipantAudioSession:
             response_published = True
         finally:
             total_latency_ms = int((time.perf_counter() - started_at) * 1000)
+            finalized_to_intent_ms = max(0, intent_ready_time_ms - speech_end_time_ms) if intent_ready_time_ms else 0
+            finalized_to_response_ms = max(0, response_ready_time_ms - speech_end_time_ms) if response_ready_time_ms else 0
+            finalized_to_tts_start_ms = (
+                max(0, tts_synth_start_time_ms - speech_end_time_ms) if tts_synth_start_time_ms else 0
+            )
+            finalized_to_tts_publish_ms = (
+                max(0, tts_publish_start_time_ms - speech_end_time_ms) if tts_publish_start_time_ms else 0
+            )
+            finalized_to_tts_done_ms = (
+                max(0, tts_publish_done_time_ms - speech_end_time_ms) if tts_publish_done_time_ms else 0
+            )
             if not response_published and not suppress_response:
                 await self._event_bus.publish_json(
                     {
@@ -1846,8 +2172,38 @@ class ParticipantAudioSession:
                         "search_index": llm_reply.search_index if llm_reply else [],
                         "next_step": llm_reply.next_step if llm_reply else "",
                     },
-                    destination_identities=[self._participant.identity],
+                        destination_identities=[self._participant.identity],
                 )
+            self._log(
+                "turn timing "
+                f"participant={self._participant.identity} "
+                f"utterance_id={utterance_id} "
+                f"stt_ms={transcript.stt_latency_ms} "
+                f"router_ms={router_latency_ms} "
+                f"classifier_ms={classifier_latency_ms} "
+                f"llm_ms={llm_latency_ms} "
+                f"tts_ms={tts_latency_ms} "
+                f"finalized_to_intent_ms={finalized_to_intent_ms} "
+                f"finalized_to_response_ms={finalized_to_response_ms} "
+                f"finalized_to_tts_start_ms={finalized_to_tts_start_ms} "
+                f"finalized_to_tts_publish_ms={finalized_to_tts_publish_ms} "
+                f"finalized_to_tts_done_ms={finalized_to_tts_done_ms} "
+                f"total_ms={total_latency_ms}"
+            )
+            self._log(
+                "turn timestamps "
+                f"participant={self._participant.identity} "
+                f"utterance_id={utterance_id} "
+                f"speech_start_ms={speech_start_time_ms} "
+                f"speech_end_ms={speech_end_time_ms} "
+                f"stt_done_ms={stt_done_time_ms} "
+                f"intent_ready_ms={intent_ready_time_ms} "
+                f"response_ready_ms={response_ready_time_ms} "
+                f"tts_synth_start_ms={tts_synth_start_time_ms} "
+                f"tts_synth_done_ms={tts_synth_done_time_ms} "
+                f"tts_publish_start_ms={tts_publish_start_time_ms} "
+                f"tts_publish_done_ms={tts_publish_done_time_ms}"
+            )
             self._session_logger.write(
                 {
                     "session_id": self._session_id,
@@ -1865,7 +2221,8 @@ class ParticipantAudioSession:
                     "intent_confidence": intent.confidence,
                     "use_llm": intent.use_llm,
                     "stt_latency_ms": transcript.stt_latency_ms,
-                    "router_latency_ms": 0,
+                    "router_latency_ms": router_latency_ms,
+                    "classifier_latency_ms": classifier_latency_ms,
                     "total_latency_ms": total_latency_ms,
                     "error_stage": error_stage,
                     "response_text": response_text,
@@ -1874,6 +2231,18 @@ class ParticipantAudioSession:
                     "llm_reply_search_index": llm_reply.search_index if llm_reply else [],
                     "llm_reply_next_step": llm_reply.next_step if llm_reply else "",
                     "tts_latency_ms": tts_latency_ms,
+                    "stt_done_time_ms": stt_done_time_ms,
+                    "intent_ready_time_ms": intent_ready_time_ms,
+                    "response_ready_time_ms": response_ready_time_ms,
+                    "tts_synth_start_time_ms": tts_synth_start_time_ms,
+                    "tts_synth_done_time_ms": tts_synth_done_time_ms,
+                    "tts_publish_start_time_ms": tts_publish_start_time_ms,
+                    "tts_publish_done_time_ms": tts_publish_done_time_ms,
+                    "finalized_to_intent_ms": finalized_to_intent_ms,
+                    "finalized_to_response_ms": finalized_to_response_ms,
+                    "finalized_to_tts_start_ms": finalized_to_tts_start_ms,
+                    "finalized_to_tts_publish_ms": finalized_to_tts_publish_ms,
+                    "finalized_to_tts_done_ms": finalized_to_tts_done_ms,
                 }
             )
             self._is_speaking = False

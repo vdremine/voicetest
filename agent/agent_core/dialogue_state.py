@@ -32,30 +32,44 @@ class DialogueState:
     next_required_field: str = ""
     known_facts: dict[str, str] = field(default_factory=dict)
 
-    def update_from_user(self, raw_text: str, normalized_text: str, *, kb: KnowledgeBase | None = None) -> None:
+    def update_from_user(
+        self,
+        raw_text: str,
+        normalized_text: str,
+        *,
+        kb: KnowledgeBase | None = None,
+    ) -> set[str]:
         text = normalized_text.strip()
         if not text:
-            return
+            return set()
 
         self.last_user_text = raw_text.strip()
         lowered = text.lower()
+        updated_fields: set[str] = set()
 
         amount = self._extract_amount(text)
         if amount:
+            if amount != self.amount_text:
+                updated_fields.add("нужная_сумма")
             self.amount_text = amount
             self.known_facts["amount"] = amount
             self.known_facts["нужная_сумма"] = amount
 
         goal = self._detect_goal(lowered)
         if goal:
+            if goal != self.goal:
+                updated_fields.add("цель")
             self.goal = goal
             self.known_facts["goal"] = goal
             self.known_facts["цель"] = goal
 
         collateral = self._detect_collateral(lowered)
         if collateral:
+            if collateral != self.collateral:
+                updated_fields.add("обременение")
             self.collateral = collateral
             self.known_facts["collateral"] = collateral
+            self.known_facts["обременение"] = collateral
             if collateral == "недвижимость":
                 self.known_facts["вид_объекта"] = self.object_type or "недвижимость"
             elif collateral == "автомобиль/птс":
@@ -63,10 +77,14 @@ class DialogueState:
 
         employment = self._detect_employment(lowered)
         if employment:
+            if employment != self.official_employment:
+                updated_fields.add("official_employment")
             self.official_employment = employment
             self.known_facts["official_employment"] = employment
 
         if "не сегодня" in lowered or "послезавтра" in lowered or "после двенадцати" in lowered:
+            if raw_text.strip() != self.callback_time:
+                updated_fields.add("callback_time")
             self.callback_time = raw_text.strip()
             self.known_facts["callback_time"] = raw_text.strip()
 
@@ -76,14 +94,17 @@ class DialogueState:
         if kb is not None:
             self.object_type = self._detect_object_type(lowered)
             if self.object_type:
+                updated_fields.add("вид_объекта")
                 self.known_facts["вид_объекта"] = self.object_type
             self.scenario = self._detect_scenario(lowered, kb)
             if self.scenario:
+                updated_fields.add("сценарий")
                 self.known_facts["сценарий"] = self.scenario
 
         self._advance_stage()
         if kb is not None:
             self.next_required_field = kb.next_required_field(self.snapshot())
+        return updated_fields
 
     def update_from_agent(self, reply_tts: str, next_step: str, *, kb: KnowledgeBase | None = None) -> None:
         self.last_agent_text = reply_tts.strip()
@@ -158,9 +179,9 @@ class DialogueState:
     def _detect_collateral(text: str) -> str:
         if any(marker in text for marker in ("нет недвижимости", "без недвижимости", "ничего нет", "машины нет")):
             return "нет залога"
-        if "недвижим" in text or "квартир" in text or "дом" in text:
+        if "залог" in text and any(marker in text for marker in ("недвижим", "квартир", "дом", "участ", "земл", "коммерчес")):
             return "недвижимость"
-        if "автомоб" in text or "машин" in text or "птс" in text:
+        if "птс" in text or ("залог" in text and any(marker in text for marker in ("автомоб", "машин"))):
             return "автомобиль/птс"
         return ""
 
