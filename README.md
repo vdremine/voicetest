@@ -215,8 +215,10 @@ docker compose -f docker-compose.prod.yml -f docker-compose.gpu.yml up --build -
 Этот вариант рассчитан на:
 
 - `LLM_PROVIDER=yandex`
+- `YANDEX_IAM_TOKEN` или `YANDEX_API_KEY`
 - `YANDEX_API_KEY`
 - `YANDEX_PROJECT_ID`
+- `YANDEX_PROMPT_ID` или `YANDEX_ASSISTANT_ID`
 - `YANDEX_ASSISTANT_ID`
 - отдельный `AGENT_IDENTITY=agent-yandex-gpu-001`
 - `STT_DEVICE=cuda`
@@ -229,6 +231,11 @@ cd /opt/voice-agent
 cp .env.yandex.gpu.example .env
 docker compose -f docker-compose.prod.yml up --build -d
 ```
+
+Если `assistants/v1/threads` отвечает `401 Unauthorized`, сначала задайте `YANDEX_IAM_TOKEN`.
+
+Если у вас уже есть рабочий Yandex prompt в OpenAI-compatible API, задайте `YANDEX_PROMPT_ID`.
+Тогда агент пойдет через `responses.create(prompt={id,...})` вместо Assistants API.
 
 ## Порты
 

@@ -77,6 +77,8 @@ class VoicePipelineConfig:
     llm_base_url: str
     llm_api_key: str
     llm_project: str
+    yandex_iam_token: str
+    yandex_prompt_id: str
     yandex_assistant_id: str
     yandex_assistant_base_url: str
     yandex_assistant_poll_interval_ms: int
@@ -181,6 +183,8 @@ class VoicePipelineConfig:
             llm_base_url=env_nonempty("LLM_BASE_URL", default_llm_base_url),
             llm_api_key=env_nonempty("LLM_API_KEY", default_llm_api_key),
             llm_project=llm_project,
+            yandex_iam_token=env_nonempty("YANDEX_IAM_TOKEN"),
+            yandex_prompt_id=env_nonempty("YANDEX_PROMPT_ID"),
             yandex_assistant_id=env_nonempty("YANDEX_ASSISTANT_ID"),
             yandex_assistant_base_url=yandex_assistant_base_url,
             yandex_assistant_poll_interval_ms=int(os.getenv("YANDEX_ASSISTANT_POLL_INTERVAL_MS", "350")),
@@ -879,10 +883,80 @@ TTS:
         return (
             self._role == "talker"
             and self._provider_name() == "yandex"
+            and not bool(self._config.yandex_prompt_id.strip())
             and bool(self._config.yandex_assistant_id.strip())
         )
 
+    def _uses_yandex_prompt_api(self) -> bool:
+        return (
+            self._role == "talker"
+            and self._provider_name() == "yandex"
+            and bool(self._config.yandex_prompt_id.strip())
+        )
+
+    @staticmethod
+    def _build_history(messages: list[dict[str, str]], limit: int = 10) -> str:
+        parts: list[str] = []
+        for msg in messages:
+            role = str(msg.get("role", "")).strip().lower()
+            content = str(msg.get("text", msg.get("content", ""))).strip()
+            if not content or role == "system":
+                continue
+            if role == "user":
+                parts.append(f"User: {content}")
+            elif role == "assistant":
+                parts.append(f"Assistant: {content}")
+        return "\n".join(parts[-limit:])
+
+    @staticmethod
+    def _build_history_without_last_user(messages: list[dict[str, str]], limit: int = 10) -> str:
+        last_user_skipped = False
+        filtered: list[dict[str, str]] = []
+        for msg in reversed(messages):
+            role = str(msg.get("role", "")).strip().lower()
+            content = str(msg.get("text", msg.get("content", ""))).strip()
+            if not content:
+                continue
+            if role == "user" and not last_user_skipped:
+                last_user_skipped = True
+                continue
+            filtered.append({"role": role, "text": content})
+        filtered.reverse()
+        return OpenAiLlmService._build_history(filtered, limit=limit)
+
+    @staticmethod
+    def _extract_last_user_message(messages: list[dict[str, str]]) -> str:
+        for msg in reversed(messages):
+            role = str(msg.get("role", "")).strip().lower()
+            if role != "user":
+                continue
+            content = str(msg.get("text", msg.get("content", ""))).strip()
+            if content:
+                return content
+        return ""
+
+    @staticmethod
+    def _extract_responses_output_text(response: Any) -> str:
+        output_text = getattr(response, "output_text", None)
+        if output_text:
+            return str(output_text).strip()
+        output = getattr(response, "output", None)
+        if output:
+            for item in output:
+                content_list = getattr(item, "content", None) or []
+                for chunk in content_list:
+                    text_value = getattr(chunk, "text", None)
+                    if text_value:
+                        return str(text_value).strip()
+        return ""
+
     def _yandex_auth_headers(self) -> dict[str, str]:
+        iam_token = self._config.yandex_iam_token.strip()
+        if iam_token:
+            return {
+                "Authorization": f"Bearer {iam_token}",
+                "Content-Type": "application/json",
+            }
         api_key = self._api_key().strip()
         if not api_key:
             raise RuntimeError("Yandex assistant API key is not configured")
@@ -1073,6 +1147,44 @@ TTS:
 
                 await asyncio.sleep(poll_interval)
 
+    async def _generate_response_via_yandex_prompt(
+        self,
+        *,
+        normalized_text: str,
+        history: list[dict[str, str]],
+    ) -> tuple[LlmReply, int]:
+        prompt_id = self._config.yandex_prompt_id.strip()
+        if not prompt_id:
+            raise RuntimeError("YANDEX_PROMPT_ID is not configured")
+
+        client = self._ensure_client()
+        started_at = time.perf_counter()
+        user_message = self._extract_last_user_message(history) or normalized_text
+        history_text = self._build_history_without_last_user(history, limit=10)
+        response = await client.responses.create(
+            prompt={
+                "id": prompt_id,
+                "variables": {
+                    "input": history_text,
+                },
+            },
+            input=user_message,
+            max_output_tokens=self._max_tokens(),
+            extra_headers={
+                "OpenAI-Project": self._project(),
+            } if self._project().strip() else None,
+        )
+        text = self._extract_responses_output_text(response)
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        return parse_llm_reply(
+            text,
+            fallback_reply=self._config.fallback_complex_text,
+            fallback_intent="complex_request",
+            fallback_next_step="уточнить потребность клиента",
+            fallback_search_seed=normalized_text,
+            prefer_raw_text=True,
+        ), latency_ms
+
     def _ensure_client(self) -> AsyncOpenAI:
         if self._client is None:
             kwargs: dict[str, Any] = {"timeout": self._timeout_seconds()}
@@ -1239,6 +1351,12 @@ TTS:
     ) -> tuple[LlmReply, int]:
         if not self.enabled:
             raise RuntimeError("LLM is disabled by configuration")
+
+        if self._uses_yandex_prompt_api():
+            return await self._generate_response_via_yandex_prompt(
+                normalized_text=normalized_text,
+                history=history,
+            )
 
         if self._uses_yandex_assistant_api():
             return await self._generate_response_via_yandex_assistant(
@@ -1873,7 +1991,8 @@ class SileroTtsService:
         raw = self._config.tts_device.strip().lower()
         if raw == "cuda":
             if not torch.cuda.is_available():
-                raise RuntimeError("TTS_DEVICE=cuda but CUDA is not available")
+                self._log("TTS_DEVICE=cuda requested, but CUDA is not available; falling back to cpu")
+                return torch.device("cpu")
             return torch.device("cuda")
         if raw == "cpu":
             return torch.device("cpu")
