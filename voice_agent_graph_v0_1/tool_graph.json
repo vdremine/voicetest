@@ -1,0 +1,883 @@
+{
+  "graph_name": "credit_collateral_sales_graph",
+  "version": "0.1",
+  "start_node": "opening",
+  "global_policy": {
+    "max_reply_sentences": 2,
+    "max_questions_per_turn": 1,
+    "max_reply_chars": 260,
+    "speak_style": "коротко, живо, уважительно, без длинных презентаций",
+    "forbidden": [
+      "не обещать одобрение",
+      "не говорить 'мы готовы одобрить' как факт",
+      "не повторять opening больше одного раза",
+      "не спрашивать уже заполненный слот",
+      "не выдумывать ставку, срок, сумму или банк",
+      "не продолжать старый монолог после перебивания",
+      "не давить, если клиент явно просит перезвонить"
+    ]
+  },
+  "nodes": {
+    "opening": {
+      "type": "cached_answer",
+      "goal": "начать звонок и объяснить повод",
+      "ready_answers": [
+        "Алло.",
+        "Да, добрый день. Вы интересовались кредитом под залог недвижимости. Удобно сейчас коротко обсудить?"
+      ],
+      "transitions": [
+        {
+          "condition": "client_greeting_or_ready",
+          "next": "check_convenience"
+        },
+        {
+          "condition": "client_small_talk",
+          "next": "small_talk"
+        },
+        {
+          "condition": "client_asks_who",
+          "next": "who_are_you"
+        },
+        {
+          "condition": "client_asks_company",
+          "next": "identity_company_faq"
+        },
+        {
+          "condition": "client_asks_source_of_number",
+          "next": "source_of_number_faq"
+        },
+        {
+          "condition": "client_asks_robot",
+          "next": "robot_check"
+        },
+        {
+          "condition": "client_does_not_remember",
+          "next": "memory_denial_faq"
+        },
+        {
+          "condition": "client_busy",
+          "next": "soft_micro_qualification_or_callback"
+        },
+        {
+          "condition": "client_not_interested",
+          "next": "handle_not_interested"
+        }
+      ]
+    },
+    "small_talk": {
+      "type": "cached_answer",
+      "goal": "коротко ответить на бытовую реплику и вернуть разговор к цели звонка",
+      "ready_answers": [
+        "Спасибо, всё хорошо. Подскажите, пожалуйста, вопрос по кредиту для вас сейчас ещё актуален?"
+      ],
+      "transitions": [
+        {
+          "condition": "client_returns_to_topic",
+          "next": "detect_scenario"
+        },
+        {
+          "condition": "client_asks_identity",
+          "next": "who_are_you"
+        },
+        {
+          "condition": "client_rejects",
+          "next": "handle_not_interested"
+        }
+      ]
+    },
+    "callback_reentry": {
+      "type": "cached_answer",
+      "goal": "мягко вернуться в разговор после ранее согласованного перезвона",
+      "ready_answers": [
+        "Добрый день. Мы созванивались ранее, я обещал перезвонить. Сейчас удобно коротко продолжить?"
+      ],
+      "transitions": [
+        {
+          "condition": "client_ready",
+          "next": "detect_scenario"
+        },
+        {
+          "condition": "client_small_talk",
+          "next": "small_talk"
+        },
+        {
+          "condition": "client_asks_context",
+          "next": "who_are_you"
+        },
+        {
+          "condition": "client_does_not_remember",
+          "next": "memory_denial_faq"
+        },
+        {
+          "condition": "client_busy",
+          "next": "schedule_callback"
+        }
+      ]
+    },
+    "who_are_you": {
+      "type": "cached_answer",
+      "goal": "объяснить кто звонит и зачем",
+      "reply_template": "Это [AGENT_NAME], МосИнвестФинанс. Вы оставляли интерес к кредиту под залог недвижимости, я хочу коротко уточнить пару деталей и передать эксперту.",
+      "transitions": [
+        {
+          "condition": "client_allows_continue",
+          "next": "check_convenience"
+        },
+        {
+          "condition": "client_asks_company",
+          "next": "identity_company_faq"
+        },
+        {
+          "condition": "client_asks_source_of_number",
+          "next": "source_of_number_faq"
+        },
+        {
+          "condition": "client_busy",
+          "next": "soft_micro_qualification_or_callback"
+        },
+        {
+          "condition": "client_rejects",
+          "next": "handle_not_interested"
+        }
+      ]
+    },
+    "identity_company_faq": {
+      "type": "cached_answer",
+      "goal": "кратко объяснить, кто звонит и что за компания",
+      "ready_answers": [
+        "Это МосИнвестФинанс. Мы занимаемся кредитами и рефинансированием под залог недвижимости, а я звоню, чтобы уточнить вашу текущую ситуацию и при необходимости передать эксперту."
+      ],
+      "transitions": [
+        {
+          "condition": "client_allows_continue",
+          "next": "check_convenience"
+        },
+        {
+          "condition": "client_asks_source_of_number",
+          "next": "source_of_number_faq"
+        },
+        {
+          "condition": "client_rejects",
+          "next": "handle_not_interested"
+        }
+      ]
+    },
+    "source_of_number_faq": {
+      "type": "cached_answer",
+      "goal": "коротко объяснить, откуда номер и почему идет звонок",
+      "ready_answers": [
+        "Номер попал к нам из вашей заявки или предыдущего обращения по вопросу кредита. Если тема уже неактуальна, скажите, и я не буду отвлекать."
+      ],
+      "transitions": [
+        {
+          "condition": "client_allows_continue",
+          "next": "check_convenience"
+        },
+        {
+          "condition": "client_does_not_remember",
+          "next": "memory_denial_faq"
+        },
+        {
+          "condition": "client_rejects",
+          "next": "finish_not_interested"
+        }
+      ]
+    },
+    "robot_check": {
+      "type": "cached_answer",
+      "goal": "снять вопрос про робота и сохранить разговор",
+      "ready_answers": [
+        "Я живой сотрудник. Если хотите, коротко отвечу по сути: это звонок по вопросу кредита под залог недвижимости."
+      ],
+      "transitions": [
+        {
+          "condition": "client_allows_continue",
+          "next": "check_convenience"
+        },
+        {
+          "condition": "client_asks_company",
+          "next": "identity_company_faq"
+        },
+        {
+          "condition": "client_rejects",
+          "next": "handle_not_interested"
+        }
+      ]
+    },
+    "memory_denial_faq": {
+      "type": "llm_action",
+      "goal": "мягко отработать фразу клиента, что он не помнит такого обращения или кредита",
+      "rules": [
+        "не спорить с клиентом и не настаивать, что он точно оставлял заявку",
+        "допустить, что обращение могло быть давно или через партнера",
+        "сформулировать коротко, без давления",
+        "если клиент не хочет продолжать — завершить"
+      ],
+      "good_example": "Понял, такое бывает. Возможно, обращение было давно или через партнёрскую форму. Если тема уже неактуальна, не буду отвлекать. Если актуальна, могу за минуту уточнить ситуацию и передать эксперту.",
+      "transitions": [
+        {
+          "condition": "client_allows_continue",
+          "next": "check_convenience"
+        },
+        {
+          "condition": "client_rejects",
+          "next": "finish_not_interested"
+        }
+      ]
+    },
+    "returning_customer_opening": {
+      "type": "cached_answer",
+      "goal": "начать разговор с бывшим клиентом и проверить, закрыт ли прошлый кредит",
+      "ready_answers": [
+        "Добрый день. Вы раньше оформляли у нас кредит, и у вас хорошая кредитная история. Подскажите, прошлый кредит уже закрыт или еще нет?"
+      ],
+      "transitions": [
+        {
+          "condition": "prior_credit_closed_no",
+          "next": "refinance_collect_current_credit"
+        },
+        {
+          "condition": "prior_credit_closed_yes",
+          "next": "collect_amount"
+        },
+        {
+          "condition": "client_busy",
+          "next": "schedule_callback"
+        },
+        {
+          "condition": "client_disputes_prior_credit_record",
+          "next": "repair_crm_memory_conflict"
+        },
+        {
+          "condition": "client_asks_context",
+          "next": "who_are_you"
+        }
+      ]
+    },
+    "repair_crm_memory_conflict": {
+      "type": "llm_action",
+      "goal": "не спорить с клиентом, если CRM-память о прошлом кредите не совпадает с его словами",
+      "rules": [
+        "сразу допустить ошибку в данных",
+        "не настаивать на сумме, дате или старом кредите",
+        "быстро перейти к актуальной ситуации клиента",
+        "если есть текущий залоговый кредит — увести в refinance flow"
+      ],
+      "good_example": "Понял, значит информация у нас могла быть неточной. Давайте тогда отталкиваться от вашей текущей ситуации: объект сейчас уже в залоге или свободен?",
+      "transitions": [
+        {
+          "condition": "current_credit_active",
+          "next": "refinance_collect_current_credit"
+        },
+        {
+          "condition": "new_loan_interest",
+          "next": "collect_amount"
+        }
+      ]
+    },
+    "check_convenience": {
+      "type": "classifier",
+      "goal": "понять, можно ли говорить сейчас",
+      "output": [
+        "convenient",
+        "not_convenient",
+        "callback_requested",
+        "messenger_requested",
+        "reject"
+      ],
+      "transitions": [
+        {
+          "condition": "convenient",
+          "next": "detect_scenario"
+        },
+        {
+          "condition": "not_convenient",
+          "next": "soft_micro_qualification_or_callback"
+        },
+        {
+          "condition": "callback_requested",
+          "next": "schedule_callback"
+        },
+        {
+          "condition": "messenger_requested",
+          "next": "messenger_contact"
+        },
+        {
+          "condition": "reject",
+          "next": "handle_not_interested"
+        }
+      ]
+    },
+    "detect_scenario": {
+      "type": "controller",
+      "goal": "выбрать сценарий: новый кредит или рефинансирование",
+      "tool": "save_slot",
+      "transitions": [
+        {
+          "condition": "caller_is_proxy_or_friend",
+          "next": "proxy_collect_minimum"
+        },
+        {
+          "condition": "old_credit_active_or_other_bank_credit",
+          "next": "refinance_collect_current_credit"
+        },
+        {
+          "condition": "new_loan_interest",
+          "next": "collect_amount"
+        },
+        {
+          "condition": "unknown",
+          "next": "ask_credit_status_or_goal"
+        }
+      ]
+    },
+    "proxy_collect_minimum": {
+      "type": "slot_group",
+      "scenario": "proxy_for_friend",
+      "goal": "собрать минимум фактов, если звонит не сам клиент, а посредник",
+      "slots": [
+        "proxy_relation",
+        "object_type",
+        "region",
+        "encumbrance",
+        "property_value_estimate",
+        "owners",
+        "loan_goal"
+      ],
+      "ask_order": [
+        "object_type",
+        "region",
+        "encumbrance",
+        "property_value_estimate",
+        "owners",
+        "loan_goal"
+      ],
+      "rules": [
+        "не упираться в имя клиента в начале",
+        "если посредник знает объект и регион — собирать предметные данные дальше",
+        "если посредник не знает деталей — предлагать передать контакт менеджеру",
+        "не требовать лишние персональные данные раньше времени"
+      ],
+      "transitions": [
+        {
+          "condition": "enough_proxy_facts_collected",
+          "next": "proxy_pitch_short"
+        },
+        {
+          "condition": "proxy_requests_manager",
+          "next": "handoff_to_expert"
+        },
+        {
+          "condition": "proxy_lacks_details",
+          "next": "messenger_contact"
+        }
+      ]
+    },
+    "proxy_pitch_short": {
+      "type": "llm_action",
+      "goal": "коротко подтвердить, что кейс можно предварительно рассмотреть, и перевести к эксперту",
+      "facts_tool": "retrieve_product_facts",
+      "rules": [
+        "не читать длинную презентацию",
+        "не обещать одобрение",
+        "опираться только на уже собранные факты",
+        "после короткого подтверждения вести к передаче эксперту"
+      ],
+      "good_example": "Понял, квартира в регионе, без залога, ориентир по стоимости есть. Такой кейс можно предварительно рассмотреть, а точные условия уже посчитает эксперт.",
+      "transitions": [
+        {
+          "condition": "proxy_has_question",
+          "next": "handle_questions"
+        },
+        {
+          "condition": "proxy_agrees",
+          "next": "handoff_to_expert"
+        }
+      ]
+    },
+    "ask_credit_status_or_goal": {
+      "type": "llm_action",
+      "goal": "мягко уточнить: нужен новый кредит или рефинансирование",
+      "prompt_hint": "Спросить одним вопросом: это новый кредит, рефинансирование или вы узнаете условия для другого человека?",
+      "transitions": [
+        {
+          "condition": "refinance",
+          "next": "refinance_collect_current_credit"
+        },
+        {
+          "condition": "new_loan",
+          "next": "collect_amount"
+        },
+        {
+          "condition": "proxy_for_friend",
+          "next": "proxy_collect_minimum"
+        }
+      ]
+    },
+    "soft_micro_qualification_or_callback": {
+      "type": "llm_action",
+      "goal": "если клиенту неудобно, собрать максимум 1-2 ключевых поля или согласовать перезвон",
+      "rules": [
+        "признать, что клиенту неудобно",
+        "не давить",
+        "можно задать максимум один короткий вопрос",
+        "если клиент всё равно занят — перейти к callback"
+      ],
+      "good_example": "Понял, не буду задерживать. Тогда коротко: объект под залог — квартира, дом или коммерческая недвижимость?",
+      "transitions": [
+        {
+          "condition": "client_answers_object",
+          "next": "collect_region"
+        },
+        {
+          "condition": "client_requests_callback",
+          "next": "schedule_callback"
+        },
+        {
+          "condition": "client_requests_messenger",
+          "next": "messenger_contact"
+        },
+        {
+          "condition": "client_rejects",
+          "next": "finish_not_interested"
+        }
+      ]
+    },
+    "collect_amount": {
+      "type": "slot_fill",
+      "slot": "amount",
+      "question": "Какую сумму рассматриваете?",
+      "tool": "save_slot",
+      "transitions": [
+        {
+          "condition": "slot_filled",
+          "next": "collect_object_type"
+        },
+        {
+          "condition": "client_does_not_know",
+          "next": "collect_object_type"
+        }
+      ]
+    },
+    "collect_object_type": {
+      "type": "slot_fill",
+      "slot": "object_type",
+      "question": "Какая недвижимость есть в собственности — квартира, дом или коммерческое помещение?",
+      "tool": "save_slot",
+      "transitions": [
+        {
+          "condition": "object_is_room_or_dorm_room",
+          "next": "collect_room_subtype"
+        },
+        {
+          "condition": "slot_filled",
+          "next": "collect_region"
+        }
+      ]
+    },
+    "collect_room_subtype": {
+      "type": "slot_fill",
+      "slot": "property_subtype",
+      "question": "Это отдельная комната, малосемейка или доля?",
+      "tool": "save_slot",
+      "transitions": [
+        {
+          "condition": "slot_filled",
+          "next": "collect_region"
+        }
+      ]
+    },
+    "collect_region": {
+      "type": "slot_fill",
+      "slot": "region",
+      "question": "В каком регионе находится объект?",
+      "tool": "save_slot",
+      "transitions": [
+        {
+          "condition": "slot_filled",
+          "next": "collect_encumbrance"
+        }
+      ]
+    },
+    "collect_encumbrance": {
+      "type": "slot_fill",
+      "slot": "encumbrance",
+      "question": "Объект сейчас свободен от залога или уже в обременении?",
+      "tool": "save_slot",
+      "transitions": [
+        {
+          "condition": "object_belongs_to_other_person_for_purchase",
+          "next": "collect_purchase_target_status"
+        },
+        {
+          "condition": "no_encumbrance",
+          "next": "collect_owner"
+        },
+        {
+          "condition": "has_encumbrance",
+          "next": "refinance_collect_current_credit"
+        }
+      ]
+    },
+    "collect_purchase_target_status": {
+      "type": "slot_group",
+      "goal": "понять, можно ли работать с объектом, который клиент только планирует выкупить",
+      "slots": [
+        "ownership_status",
+        "purchase_target_ready",
+        "object_type",
+        "region"
+      ],
+      "rules": [
+        "уточнить, на ком сейчас объект",
+        "уточнить, готов ли текущий собственник идти в сделку",
+        "если текущий собственник готов — допустим handoff менеджеру",
+        "если это только абстрактные планы без готовности собственника — lead quality ниже"
+      ],
+      "transitions": [
+        {
+          "condition": "seller_ready_for_deal",
+          "next": "pitch_short"
+        },
+        {
+          "condition": "seller_not_ready",
+          "next": "handle_questions"
+        },
+        {
+          "condition": "client_requests_manager",
+          "next": "handoff_to_expert"
+        }
+      ]
+    },
+    "refinance_collect_current_credit": {
+      "type": "slot_group",
+      "scenario": "refinance",
+      "goal": "собрать параметры текущего кредита для рефинансирования",
+      "slots": [
+        "remaining_debt",
+        "current_rate",
+        "monthly_payment",
+        "overdue_payments",
+        "current_lender",
+        "object_type",
+        "region"
+      ],
+      "ask_order": [
+        "remaining_debt",
+        "current_lender",
+        "current_rate",
+        "monthly_payment",
+        "overdue_payments"
+      ],
+      "rules": [
+        "не задавать все вопросы сразу",
+        "если клиент отвечает длинно — сохранить факты и задать следующий недостающий вопрос",
+        "если клиент говорит, что юрист занимается вопросом — перейти к legal_representative"
+      ],
+      "transitions": [
+        {
+          "condition": "client_transfers_to_lawyer",
+          "next": "legal_representative"
+        },
+        {
+          "condition": "enough_facts_collected",
+          "next": "collect_owner"
+        },
+        {
+          "condition": "client_requests_manager",
+          "next": "handoff_to_expert"
+        }
+      ]
+    },
+    "legal_representative": {
+      "type": "llm_action",
+      "goal": "перейти на разговор с юристом или представителем клиента",
+      "rules": [
+        "коротко представиться заново, но не повторять полный opening",
+        "подтвердить контекст: обсуждаем рефинансирование",
+        "собрать остаток, срок, объект в залоге и банк"
+      ],
+      "transitions": [
+        {
+          "condition": "representative_ready",
+          "next": "refinance_collect_current_credit"
+        },
+        {
+          "condition": "representative_requests_handoff",
+          "next": "handoff_to_expert"
+        }
+      ]
+    },
+    "collect_owner": {
+      "type": "slot_fill",
+      "slot": "owner",
+      "question": "Собственник объекта вы?",
+      "tool": "save_slot",
+      "transitions": [
+        {
+          "condition": "slot_filled",
+          "next": "pitch_short"
+        }
+      ]
+    },
+    "pitch_short": {
+      "type": "llm_action",
+      "goal": "коротко подтвердить рабочий кейс и назвать максимум 1-2 условия",
+      "facts_tool": "retrieve_product_facts",
+      "rules": [
+        "не читать все условия подряд",
+        "не обещать одобрение",
+        "формулировать как предварительное рассмотрение",
+        "если объект нестандартный, вроде комнаты или малосемейки, не отсеивать его автоматически",
+        "после короткого питча вести к эксперту"
+      ],
+      "good_example": "Понял, квартира в регионе, без обременения, собственник — вы. Это похоже на рабочий вариант: можно предварительно рассмотреть сумму до части стоимости объекта, а точные условия посчитает эксперт.",
+      "transitions": [
+        {
+          "condition": "client_has_question",
+          "next": "handle_questions"
+        },
+        {
+          "condition": "client_agrees",
+          "next": "handoff_to_expert"
+        }
+      ]
+    },
+    "handle_questions": {
+      "type": "llm_action",
+      "goal": "ответить на вопрос клиента и вернуть к передаче эксперту",
+      "allowed_topics": [
+        "rate",
+        "commission",
+        "bank_or_broker",
+        "documents",
+        "safety",
+        "monthly_payment",
+        "timeline",
+        "messenger"
+      ],
+      "rules": [
+        "отвечать только по заданному вопросу",
+        "не уходить в новую презентацию",
+        "после ответа спросить согласие на передачу эксперту"
+      ],
+      "transitions": [
+        {
+          "condition": "client_agrees",
+          "next": "handoff_to_expert"
+        },
+        {
+          "condition": "client_requests_messenger",
+          "next": "messenger_contact"
+        },
+        {
+          "condition": "client_requests_callback",
+          "next": "schedule_callback"
+        },
+        {
+          "condition": "more_questions",
+          "next": "handle_questions"
+        }
+      ]
+    },
+    "repair_misheard_owner_answer": {
+      "type": "llm_action",
+      "goal": "мягко исправить ошибку распознавания и переподтвердить собственника",
+      "rules": [
+        "сначала признать, что вы могли неправильно услышать",
+        "не спорить с клиентом",
+        "одним коротким вопросом переподтвердить слот owner",
+        "после подтверждения вернуться в основной сценарий"
+      ],
+      "good_example": "Понял, значит я вас неправильно услышал, извините. Подскажите, пожалуйста, кто собственник по документам?",
+      "transitions": [
+        {
+          "condition": "owner_confirmed",
+          "next": "pitch_short"
+        }
+      ]
+    },
+    "repair_unexpected_numeric_noise": {
+      "type": "llm_action",
+      "goal": "если клиент продиктовал несвязный набор цифр вне контекста, не интерпретировать это как паспорт или телефон без подтверждения",
+      "rules": [
+        "не домысливать паспортные данные",
+        "не просить чувствительные данные на раннем этапе",
+        "вернуть разговор к текущему недостающему слоту",
+        "кратко уточнить, что именно клиент имел в виду"
+      ],
+      "good_example": "Я мог неправильно понять цифры. Пока для расчета мне важнее параметры кредита и объекта. Подскажите, пожалуйста, это был остаток долга, платеж или что-то другое?",
+      "transitions": [
+        {
+          "condition": "numeric_value_clarified",
+          "next": "refinance_collect_current_credit"
+        },
+        {
+          "condition": "client_still_confused",
+          "next": "handoff_to_expert"
+        }
+      ]
+    },
+    "messenger_contact": {
+      "type": "tool_call",
+      "tool": "save_preferred_contact_channel",
+      "goal": "зафиксировать WhatsApp/Telegram как канал связи",
+      "rules": [
+        "если номер уже известен из звонка, не просить диктовать его снова",
+        "если нужен ник Telegram — спросить один раз",
+        "после фиксации канала переходить к handoff"
+      ],
+      "transitions": [
+        {
+          "condition": "channel_saved",
+          "next": "handoff_to_expert"
+        }
+      ]
+    },
+    "schedule_callback": {
+      "type": "tool_call",
+      "tool": "schedule_callback",
+      "goal": "назначить перезвон",
+      "required_slots": [
+        "callback_time"
+      ],
+      "reply_template": "Понял, тогда зафиксирую перезвон. Когда вам удобнее — сегодня позже или завтра?",
+      "transitions": [
+        {
+          "condition": "callback_time_saved",
+          "next": "finish_callback"
+        }
+      ]
+    },
+    "schedule_specific_daytime_callback": {
+      "type": "tool_call",
+      "tool": "schedule_callback",
+      "goal": "зафиксировать конкретный день и окно времени для звонка менеджера",
+      "required_slots": [
+        "callback_time"
+      ],
+      "reply_template": "Понял, зафиксирую. Подскажите, пожалуйста, в какой день и после какого времени будет удобно принять звонок менеджера?",
+      "transitions": [
+        {
+          "condition": "callback_time_saved",
+          "next": "finish_callback"
+        }
+      ]
+    },
+    "same_day_handoff": {
+      "type": "tool_call",
+      "tool": "create_lead_transfer",
+      "goal": "передать клиента эксперту с акцентом на звонок сегодня",
+      "required_slots_any": [
+        [
+          "amount",
+          "object_type",
+          "region"
+        ],
+        [
+          "object_type",
+          "region",
+          "urgency"
+        ]
+      ],
+      "rules": [
+        "использовать, если клиент явно просит звонок сегодня или приоритет — скорость",
+        "в required_manager_action зафиксировать same-day contact"
+      ],
+      "reply_template": "Понял, тогда передам заявку с пометкой на связь сегодня. Менеджер свяжется с вами и уже детально всё обсудит.",
+      "transitions": [
+        {
+          "condition": "lead_created",
+          "next": "finish_success"
+        }
+      ]
+    },
+    "handoff_to_expert": {
+      "type": "tool_call",
+      "tool": "create_lead_transfer",
+      "goal": "передать клиента эксперту",
+      "required_slots_any": [
+        [
+          "object_type",
+          "region",
+          "owner"
+        ],
+        [
+          "amount",
+          "object_type",
+          "region"
+        ],
+        [
+          "remaining_debt",
+          "object_type",
+          "region"
+        ],
+        [
+          "preferred_contact_channel"
+        ],
+        [
+          "object_type",
+          "region",
+          "encumbrance",
+          "property_value_estimate"
+        ]
+      ],
+      "lead_quality_rules": {
+        "8_10": "есть объект, регион, собственник или явное согласие на контакт",
+        "5_7": "интерес есть, но данных мало",
+        "1_4": "нет интереса или неподходящий клиент"
+      },
+      "reply_template": "Отлично, передам информацию эксперту. Он свяжется с вами и уже подробно рассчитает условия.",
+      "transitions": [
+        {
+          "condition": "lead_created",
+          "next": "finish_success"
+        }
+      ]
+    },
+    "handle_not_interested": {
+      "type": "llm_action",
+      "goal": "мягко обработать отказ один раз",
+      "rules": [
+        "не спорить",
+        "не давить",
+        "одна короткая попытка уточнить причину",
+        "если отказ повторяется — завершить"
+      ],
+      "transitions": [
+        {
+          "condition": "client_reconsiders",
+          "next": "detect_scenario"
+        },
+        {
+          "condition": "reject_confirmed",
+          "next": "finish_not_interested"
+        }
+      ]
+    },
+    "finish_success": {
+      "type": "cached_answer",
+      "tool": "finish_call",
+      "ready_answers": [
+        "Спасибо, передам информацию эксперту. Он свяжется с вами и всё подробно рассчитает. Всего доброго."
+      ],
+      "terminal": true
+    },
+    "finish_callback": {
+      "type": "cached_answer",
+      "tool": "finish_call",
+      "ready_answers": [
+        "Хорошо, зафиксировал перезвон. Спасибо, до связи."
+      ],
+      "terminal": true
+    },
+    "finish_not_interested": {
+      "type": "cached_answer",
+      "tool": "finish_call",
+      "ready_answers": [
+        "Понял вас. Тогда не буду отвлекать. Всего доброго."
+      ],
+      "terminal": true
+    }
+  }
+}

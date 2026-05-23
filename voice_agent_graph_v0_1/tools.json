@@ -1,0 +1,265 @@
+{
+  "version": "0.1",
+  "domain": "credit_collateral_voice_agent",
+  "tools": [
+    {
+      "name": "save_slot",
+      "type": "state",
+      "description": "Сохраняет факт из речи клиента в состояние диалога.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "slot",
+          "value"
+        ],
+        "properties": {
+          "slot": {
+            "type": "string",
+            "enum": [
+              "client_name",
+              "proxy_name",
+              "proxy_relation",
+              "returning_customer_status",
+              "crm_memory_conflict",
+              "amount",
+              "loan_goal",
+              "object_type",
+              "property_subtype",
+              "region",
+              "district",
+              "encumbrance",
+              "remaining_debt",
+              "current_rate",
+              "monthly_payment",
+              "overdue_payments",
+              "current_lender",
+              "owner",
+              "owners",
+              "property_value_estimate",
+              "not_only_home",
+              "arrears_other",
+              "income_style",
+              "urgency",
+              "ownership_status",
+              "purchase_target_ready",
+              "commission_question",
+              "prior_credit_closed",
+              "crm_claim_disputed",
+              "preferred_contact_channel",
+              "callback_time",
+              "objection",
+              "question"
+            ]
+          },
+          "value": {
+            "type": "string"
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "evidence": {
+            "type": "string"
+          }
+        }
+      },
+      "side_effect": "updates_dialogue_state"
+    },
+    {
+      "name": "get_next_required_slot",
+      "type": "controller",
+      "description": "Определяет следующий недостающий слот по текущему сценарию и состоянию.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "scenario",
+          "state"
+        ],
+        "properties": {
+          "scenario": {
+            "type": "string",
+            "enum": [
+              "new_loan",
+              "refinance",
+              "proxy_for_friend",
+              "callback",
+              "unknown"
+            ]
+          },
+          "state": {
+            "type": "object"
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "next_slot": {
+            "type": "string"
+          },
+          "next_node": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "retrieve_product_facts",
+      "type": "knowledge",
+      "description": "Возвращает разрешённые факты продукта для короткого ответа клиенту.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "scenario": {
+            "type": "string"
+          },
+          "object_type": {
+            "type": "string"
+          },
+          "encumbrance": {
+            "type": "string"
+          },
+          "question": {
+            "type": "string"
+          }
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "facts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "forbidden_claims": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "schedule_callback",
+      "type": "crm_action",
+      "description": "Фиксирует просьбу клиента перезвонить позднее.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "callback_time"
+        ],
+        "properties": {
+          "callback_time": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "collected_facts": {
+            "type": "object"
+          }
+        }
+      },
+      "side_effect": "creates_callback_task"
+    },
+    {
+      "name": "save_preferred_contact_channel",
+      "type": "crm_action",
+      "description": "Фиксирует предпочтительный канал связи: телефон, WhatsApp, Telegram.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "channel"
+        ],
+        "properties": {
+          "channel": {
+            "type": "string",
+            "enum": [
+              "phone",
+              "whatsapp",
+              "telegram",
+              "other"
+            ]
+          },
+          "contact_value": {
+            "type": "string"
+          },
+          "comment": {
+            "type": "string"
+          }
+        }
+      },
+      "side_effect": "updates_lead_contact_preferences"
+    },
+    {
+      "name": "create_lead_transfer",
+      "type": "crm_action",
+      "description": "Создаёт лид для передачи эксперту по кредитованию.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "lead_quality",
+          "client_facts",
+          "next_action"
+        ],
+        "properties": {
+          "lead_quality": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10
+          },
+          "client_facts": {
+            "type": "string"
+          },
+          "agreements": {
+            "type": "string"
+          },
+          "next_action": {
+            "type": "string"
+          },
+          "preferred_contact_channel": {
+            "type": "string"
+          },
+          "required_manager_action": {
+            "type": "string"
+          },
+          "proxy_context": {
+            "type": "string"
+          }
+        }
+      },
+      "side_effect": "creates_or_updates_lead"
+    },
+    {
+      "name": "finish_call",
+      "type": "call_action",
+      "description": "Закрывает разговор корректной финальной репликой.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "reason": {
+            "type": "string",
+            "enum": [
+              "success_transfer",
+              "callback_scheduled",
+              "not_interested",
+              "no_fit",
+              "client_busy"
+            ]
+          },
+          "final_phrase": {
+            "type": "string"
+          }
+        }
+      },
+      "side_effect": "ends_dialogue"
+    }
+  ]
+}
