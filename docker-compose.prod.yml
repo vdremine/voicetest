@@ -100,6 +100,7 @@ services:
       LLM_PROJECT: ${LLM_PROJECT:-}
       LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.2}
       LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-96}
+      ADAPTIVE_CLASSIFIER_ENABLED: ${ADAPTIVE_CLASSIFIER_ENABLED:-false}
       TTS_ENABLED: ${TTS_ENABLED:-true}
       TTS_MODEL_PATH: ${TTS_MODEL_PATH:-/models/silero-tts/ru/v5_4_ru.pt}
       TTS_MODEL_URL: ${TTS_MODEL_URL:-https://models.silero.ai/models/tts/ru/v5_4_ru.pt}

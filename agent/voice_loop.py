@@ -78,6 +78,7 @@ class VoicePipelineConfig:
     llm_project: str
     llm_temperature: float
     llm_max_tokens: int
+    adaptive_classifier_enabled: bool
     tts_enabled: bool
     tts_model_path: Path
     tts_model_url: str
@@ -159,6 +160,7 @@ class VoicePipelineConfig:
             llm_project=llm_project,
             llm_temperature=float(os.getenv("LLM_TEMPERATURE", "0.2")),
             llm_max_tokens=int(os.getenv("LLM_MAX_TOKENS", "96")),
+            adaptive_classifier_enabled=env_bool("ADAPTIVE_CLASSIFIER_ENABLED", False),
             tts_enabled=env_bool("TTS_ENABLED", True),
             tts_model_path=Path(os.getenv("TTS_MODEL_PATH", "/models/silero-tts/ru/v5_4_ru.pt")),
             tts_model_url=os.getenv(
@@ -1584,7 +1586,17 @@ class SimpleIntentRouter:
         self._confirm = {"да", "угу", "ага", "подтверждаю", "конечно", "хорошо", "супер", "отлично"}
         self._reject = {"нет", "неа", "не надо"}
         self._cancel = {"отмена", "отменить", "отбой"}
-        self._repeat = {"повтори", "повтори пожалуйста", "еще раз", "ещё раз", "не понял"}
+        self._repeat = {
+            "повтори",
+            "повтори пожалуйста",
+            "повторите",
+            "повторите пожалуйста",
+            "повторяю",
+            "повторяю пожалуйста",
+            "еще раз",
+            "ещё раз",
+            "не понял",
+        }
         self._wait = {"подожди", "секунду", "одну секунду"}
         self._ready_to_talk = {"я слушаю", "слушаю вас", "говорите", "да слушаю", "слушаю", "удобно"}
         self._identify = {"это кто", "кто это", "кто вы", "представьтесь"}
@@ -1681,7 +1693,7 @@ class SimpleIntentRouter:
             return IntentResult(Intent.REJECT.value, 0.99, False, Action.ACK_REJECT.value)
         if text in self._cancel or "отмена" in text:
             return IntentResult(Intent.CANCEL.value, 0.99, False, Action.CANCEL_ACTION.value)
-        if text in self._repeat or text.startswith("повтори") or text.startswith("повтори"):
+        if text in self._repeat or text.startswith("повтор") or "повтор" in text:
             return IntentResult(Intent.REPEAT.value, 0.99, False, Action.REPEAT_LAST_AGENT_MESSAGE.value)
         if text in self._wait or text.startswith("подожди"):
             return IntentResult(Intent.WAIT.value, 0.98, False, Action.ACK_WAIT.value)
@@ -2296,7 +2308,11 @@ class ParticipantAudioSession:
         )
 
     def _should_use_adaptive_classifier(self, intent: IntentResult, normalized_text: str) -> bool:
-        if not self._llm_service.enabled or not normalized_text.strip():
+        if (
+            not self._config.adaptive_classifier_enabled
+            or not self._llm_service.enabled
+            or not normalized_text.strip()
+        ):
             return False
         if intent.intent == Intent.COMPLEX_REQUEST.value:
             return False
@@ -2306,7 +2322,21 @@ class ParticipantAudioSession:
             Intent.UNKNOWN_SHORT.value,
         }:
             return True
-        return intent.intent == Intent.UNKNOWN_SHORT.value and len(normalized_text.split()) <= 4
+        return False
+
+    @staticmethod
+    def _skip_confidence_gate_for(intent: IntentResult) -> bool:
+        return intent.intent in {
+            Intent.GREETING.value,
+            Intent.READY_TO_TALK.value,
+            Intent.IDENTIFY_SELF.value,
+            Intent.REPEAT.value,
+            Intent.LINE_ISSUE.value,
+            Intent.WAIT.value,
+            Intent.HUMAN_HANDOFF.value,
+            Intent.CANCEL.value,
+            Intent.END_SESSION.value,
+        }
 
     def _should_advance_by_state(self, intent: IntentResult, updated_fields: set[str]) -> bool:
         slot_fields = {
@@ -2436,6 +2466,14 @@ class ParticipantAudioSession:
                     self._history.append({"role": "user", "text": normalized_text or transcript.text})
                     self._history = self._history[-12:]
                 state_snapshot = self._dialogue_state.snapshot()
+                self._log(
+                    f"turn state participant={self._participant.identity} "
+                    f"utterance_id={utterance_id} updated_fields={sorted(updated_fields)!r} "
+                    f"scenario={state_snapshot.get('scenario', '')!r} "
+                    f"awaiting_field={state_snapshot.get('awaiting_field', '')!r} "
+                    f"next_required_field={state_snapshot.get('next_required_field', '')!r} "
+                    f"known_facts={state_snapshot.get('known_facts', {})!r}"
+                )
                 await self._publish_status("routing_intent")
                 decision_started_at = time.perf_counter()
                 intent = self._router.route(normalized_text)
@@ -2474,7 +2512,12 @@ class ParticipantAudioSession:
                     destination_identities=[self._participant.identity],
                 )
 
-                if not transcript.text or transcript.confidence < self._config.stt_confidence_floor:
+                if not transcript.text:
+                    response_text = self._config.fallback_low_confidence_text
+                elif (
+                    transcript.confidence < self._config.stt_confidence_floor
+                    and not self._skip_confidence_gate_for(intent)
+                ):
                     response_text = self._config.fallback_low_confidence_text
                 elif faq_answer:
                     await self._publish_status("simple_intent_detected")
@@ -2673,6 +2716,7 @@ class ParticipantAudioSession:
             finalized_to_tts_start_ms = (
                 max(0, tts_synth_start_time_ms - speech_end_time_ms) if tts_synth_start_time_ms else 0
             )
+            perceived_latency_ms = finalized_to_tts_start_ms or finalized_to_response_ms
             finalized_to_tts_publish_ms = (
                 max(0, tts_publish_start_time_ms - speech_end_time_ms) if tts_publish_start_time_ms else 0
             )
@@ -2702,6 +2746,7 @@ class ParticipantAudioSession:
                 f"classifier_ms={classifier_latency_ms} "
                 f"llm_ms={llm_latency_ms} "
                 f"tts_ms={tts_latency_ms} "
+                f"perceived_latency_ms={perceived_latency_ms} "
                 f"finalized_to_intent_ms={finalized_to_intent_ms} "
                 f"finalized_to_response_ms={finalized_to_response_ms} "
                 f"finalized_to_tts_start_ms={finalized_to_tts_start_ms} "

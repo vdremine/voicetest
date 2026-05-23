@@ -22,6 +22,14 @@ class TrainingExample:
 
 
 class KnowledgeBase:
+    _GENERIC_SEQUENCE: tuple[str, ...] = (
+        "нужная_сумма",
+        "цель",
+        "вид_объекта",
+        "регион",
+        "обременение",
+    )
+
     def __init__(
         self,
         *,
@@ -311,7 +319,20 @@ class KnowledgeBase:
     def match_faq(self, text: str) -> str:
         lowered = _normalize_text(text)
         for entry in self._faq_entries:
-            if any(_normalize_text(pattern) in lowered for pattern in entry.patterns):
+            normalized_patterns = tuple(_normalize_text(pattern) for pattern in entry.patterns)
+            if any(pattern and pattern in lowered for pattern in normalized_patterns):
+                return entry.answer
+            if entry.code == "статус_компании" and any(
+                marker in lowered
+                for marker in (
+                    "о компании",
+                    "что за компания",
+                    "расскажи о компании",
+                    "расскажите о компании",
+                    "чем занимаетесь",
+                    "кто вы такие",
+                )
+            ):
                 return entry.answer
         return ""
 
@@ -321,6 +342,8 @@ class KnowledgeBase:
         if not isinstance(known_facts, dict):
             known_facts = {}
         sequence = self._qualification_sequences.get(scenario, [])
+        if not sequence:
+            sequence = list(self._GENERIC_SEQUENCE)
         for field in sequence:
             value = str(known_facts.get(field, "")).strip()
             if not value:
