@@ -81,6 +81,17 @@ class VoicePipelineConfig:
     adaptive_classifier_enabled: bool
     llm_orchestrates_all: bool
     llm_debug_direct_mode: bool
+    supervisor_enabled: bool
+    supervisor_provider: str
+    supervisor_model: str
+    supervisor_reasoning_effort: str
+    supervisor_timeout_seconds: float
+    supervisor_base_url: str
+    supervisor_api_key: str
+    supervisor_project: str
+    supervisor_temperature: float
+    supervisor_max_tokens: int
+    supervisor_soft_timeout_ms: int
     tts_enabled: bool
     tts_model_path: Path
     tts_model_url: str
@@ -114,10 +125,11 @@ class VoicePipelineConfig:
         if not tts_provider:
             tts_provider = "silero"
 
-        default_llm_model = "Qwen/Qwen3-8B"
-        default_llm_base_url = "http://127.0.0.1:8001/v1"
+        default_llm_model = "Qwen/Qwen2.5-7B-Instruct"
+        default_llm_base_url = "http://127.0.0.1:8000/v1"
         default_llm_api_key = "local-token"
         llm_project = env_nonempty("LLM_PROJECT")
+        supervisor_project = env_nonempty("SUPERVISOR_PROJECT")
 
         if llm_provider == "yandex":
             yandex_api_key = env_nonempty("YANDEX_API_KEY")
@@ -165,6 +177,28 @@ class VoicePipelineConfig:
             adaptive_classifier_enabled=env_bool("ADAPTIVE_CLASSIFIER_ENABLED", False),
             llm_orchestrates_all=env_bool("LLM_ORCHESTRATES_ALL", True),
             llm_debug_direct_mode=env_bool("LLM_DEBUG_DIRECT_MODE", False),
+            supervisor_enabled=env_bool("SUPERVISOR_ENABLED", False),
+            supervisor_provider=env_nonempty("SUPERVISOR_PROVIDER", llm_provider).lower(),
+            supervisor_model=env_nonempty("SUPERVISOR_MODEL", "Qwen/Qwen2.5-3B-Instruct"),
+            supervisor_reasoning_effort=os.getenv(
+                "SUPERVISOR_REASONING_EFFORT",
+                os.getenv("LLM_REASONING_EFFORT", "low"),
+            ),
+            supervisor_timeout_seconds=float(
+                os.getenv("SUPERVISOR_TIMEOUT_SECONDS", os.getenv("LLM_TIMEOUT_SECONDS", "15"))
+            ),
+            supervisor_base_url=env_nonempty(
+                "SUPERVISOR_BASE_URL",
+                env_nonempty("LLM_BASE_URL", default_llm_base_url),
+            ),
+            supervisor_api_key=env_nonempty(
+                "SUPERVISOR_API_KEY",
+                env_nonempty("LLM_API_KEY", default_llm_api_key),
+            ),
+            supervisor_project=supervisor_project or llm_project,
+            supervisor_temperature=float(os.getenv("SUPERVISOR_TEMPERATURE", "0.1")),
+            supervisor_max_tokens=int(os.getenv("SUPERVISOR_MAX_TOKENS", "256")),
+            supervisor_soft_timeout_ms=int(os.getenv("SUPERVISOR_SOFT_TIMEOUT_MS", "450")),
             tts_enabled=env_bool("TTS_ENABLED", True),
             tts_model_path=Path(os.getenv("TTS_MODEL_PATH", "/models/silero-tts/ru/v5_4_ru.pt")),
             tts_model_url=os.getenv(
@@ -227,6 +261,19 @@ class LlmReply:
     search_index: list[str]
     intent: str
     next_step: str
+    raw_text: str = ""
+
+
+@dataclass(slots=True)
+class SupervisorDecision:
+    approved: bool
+    stage: str
+    missing_slots: list[str]
+    repeat_detected: bool
+    risk_flags: list[str]
+    replace_speech_text: str
+    next_allowed_slots: list[str]
+    notes: str
     raw_text: str = ""
 
 
@@ -496,6 +543,30 @@ class OpenAiLlmService:
         "required": ["intent", "action", "use_llm", "confidence"],
         "additionalProperties": False,
     }
+    _SUPERVISOR_JSON_SCHEMA: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "approved": {"type": "boolean"},
+            "stage": {"type": "string"},
+            "missing_slots": {"type": "array", "items": {"type": "string"}},
+            "repeat_detected": {"type": "boolean"},
+            "risk_flags": {"type": "array", "items": {"type": "string"}},
+            "replace_speech_text": {"type": "string"},
+            "next_allowed_slots": {"type": "array", "items": {"type": "string"}},
+            "notes": {"type": "string"},
+        },
+        "required": [
+            "approved",
+            "stage",
+            "missing_slots",
+            "repeat_detected",
+            "risk_flags",
+            "replace_speech_text",
+            "next_allowed_slots",
+            "notes",
+        ],
+        "additionalProperties": False,
+    }
     _CLASSIFIER_ALLOWED_INTENTS = {
         Intent.GREETING.value,
         Intent.READY_TO_TALK.value,
@@ -725,29 +796,78 @@ TTS:
 - не предлагай ПТС, если у клиента нет автомобиля;
 - вопросы оплаты, отсрочки и реквизитов переводи на персонального менеджера;
 - если клиент грубит или просит прекратить разговор, спокойно заверши разговор."""
+    _SUPERVISOR_PROMPT = """Ты скрытый супервайзер voice-agent. Пользователь тебя не слышит.
+Ты не ведешь диалог сам. Ты проверяешь предложенный ответ перед озвучкой.
 
-    def __init__(self, config: VoicePipelineConfig, log: Callable[[str], None]) -> None:
+Верни только один JSON-объект строго по схеме.
+Без markdown.
+Без комментариев.
+Без текста вне JSON.
+
+Проверь:
+- не повторяет ли агент уже заполненный слот;
+- не перескочил ли обязательный следующий слот;
+- нет ли опасных или неподтвержденных обещаний;
+- нужен ли handoff вместо следующего вопроса;
+- подходит ли ответ для телефонной озвучки.
+
+Если ответ нормальный, approved=true и replace_speech_text оставь пустым.
+Если ответ лучше заменить, approved=false и дай короткий исправленный replace_speech_text.
+Исправленный текст должен быть до 180 символов, максимум 2 коротких предложения и не больше одного вопроса."""
+
+    def __init__(self, config: VoicePipelineConfig, log: Callable[[str], None], *, role: str = "talker") -> None:
         self._config = config
         self._log = log
+        self._role = role
         self._client: AsyncOpenAI | None = None
 
     @property
     def enabled(self) -> bool:
-        return self._config.llm_enabled and bool(self._config.llm_model)
+        if self._role == "supervisor":
+            return self._config.supervisor_enabled and bool(self._model_name())
+        return self._config.llm_enabled and bool(self._model_name())
 
     def _is_yandex_provider(self) -> bool:
-        if self._config.llm_provider == "yandex":
+        if self._provider_name() == "yandex":
             return True
-        return "yandex.cloud" in self._config.llm_base_url or "ai.api.cloud.yandex.net" in self._config.llm_base_url
+        base_url = self._base_url()
+        return "yandex.cloud" in base_url or "ai.api.cloud.yandex.net" in base_url
+
+    def _provider_name(self) -> str:
+        return self._config.supervisor_provider if self._role == "supervisor" else self._config.llm_provider
+
+    def _model_name(self) -> str:
+        return self._config.supervisor_model if self._role == "supervisor" else self._config.llm_model
+
+    def _reasoning_effort(self) -> str:
+        return self._config.supervisor_reasoning_effort if self._role == "supervisor" else self._config.llm_reasoning_effort
+
+    def _timeout_seconds(self) -> float:
+        return self._config.supervisor_timeout_seconds if self._role == "supervisor" else self._config.llm_timeout_seconds
+
+    def _base_url(self) -> str:
+        return self._config.supervisor_base_url if self._role == "supervisor" else self._config.llm_base_url
+
+    def _api_key(self) -> str:
+        return self._config.supervisor_api_key if self._role == "supervisor" else self._config.llm_api_key
+
+    def _project(self) -> str:
+        return self._config.supervisor_project if self._role == "supervisor" else self._config.llm_project
+
+    def _temperature(self) -> float:
+        return self._config.supervisor_temperature if self._role == "supervisor" else self._config.llm_temperature
+
+    def _max_tokens(self) -> int:
+        return self._config.supervisor_max_tokens if self._role == "supervisor" else self._config.llm_max_tokens
 
     def _ensure_client(self) -> AsyncOpenAI:
         if self._client is None:
-            kwargs: dict[str, Any] = {"timeout": self._config.llm_timeout_seconds}
-            if self._config.llm_base_url:
-                kwargs["base_url"] = self._config.llm_base_url
-                kwargs["api_key"] = self._config.llm_api_key or "local-token"
-                if self._config.llm_project:
-                    kwargs["default_headers"] = {"OpenAI-Project": self._config.llm_project}
+            kwargs: dict[str, Any] = {"timeout": self._timeout_seconds()}
+            if self._base_url():
+                kwargs["base_url"] = self._base_url()
+                kwargs["api_key"] = self._api_key() or "local-token"
+                if self._project():
+                    kwargs["default_headers"] = {"OpenAI-Project": self._project()}
             else:
                 api_key = os.getenv("OPENAI_API_KEY", "").strip()
                 if not api_key:
@@ -775,11 +895,11 @@ TTS:
         return {"type": "json_object"}
 
     def _chat_extra_body(self) -> dict[str, Any] | None:
-        model_name = self._config.llm_model.strip().lower()
+        model_name = self._model_name().strip().lower()
         if "qwen3" not in model_name:
             return None
 
-        effort = self._config.llm_reasoning_effort.strip().lower()
+        effort = self._reasoning_effort().strip().lower()
         enable_thinking = effort in {"on", "enabled", "thinking", "reasoning"}
         return {"chat_template_kwargs": {"enable_thinking": enable_thinking}}
 
@@ -864,9 +984,9 @@ TTS:
             messages.append({"role": "user", "content": normalized_text})
 
         request_kwargs: dict[str, Any] = {
-            "model": self._config.llm_model,
+            "model": self._model_name(),
             "temperature": 0.0,
-            "max_tokens": min(160, self._config.llm_max_tokens),
+            "max_tokens": min(160, self._max_tokens()),
             "response_format": self._response_format(self._CLASSIFIER_JSON_SCHEMA),
             "messages": messages,
         }
@@ -943,9 +1063,9 @@ TTS:
             messages.append({"role": "user", "content": normalized_text})
 
         request_kwargs: dict[str, Any] = {
-            "model": self._config.llm_model,
-            "temperature": self._config.llm_temperature,
-            "max_tokens": self._config.llm_max_tokens,
+            "model": self._model_name(),
+            "temperature": self._temperature(),
+            "max_tokens": self._max_tokens(),
             "messages": messages,
         }
         if not debug_direct_mode:
@@ -971,6 +1091,87 @@ TTS:
             fallback_next_step="уточнить потребность клиента",
             fallback_search_seed=normalized_text,
             prefer_raw_text=debug_direct_mode,
+        ), latency_ms
+
+    async def review_response(
+        self,
+        *,
+        normalized_text: str,
+        history: list[dict[str, str]],
+        dialogue_state: dict[str, Any],
+        candidate_reply: str,
+        fallback_reply: str,
+    ) -> tuple[SupervisorDecision, int]:
+        if not self.enabled:
+            raise RuntimeError("Supervisor is disabled by configuration")
+
+        client = self._ensure_client()
+        started_at = time.perf_counter()
+        state_json = json.dumps(dialogue_state, ensure_ascii=False)
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": self._SUPERVISOR_PROMPT},
+            {"role": "system", "content": f"Текущее состояние звонка: {state_json}"},
+            {"role": "system", "content": f"Текущая реплика клиента: {normalized_text}"},
+            {"role": "system", "content": f"Кандидат на озвучку: {candidate_reply}"},
+            *self._history_to_messages(history[-8:]),
+        ]
+        request_kwargs: dict[str, Any] = {
+            "model": self._model_name(),
+            "temperature": self._temperature(),
+            "max_tokens": self._max_tokens(),
+            "response_format": self._response_format(self._SUPERVISOR_JSON_SCHEMA),
+            "messages": messages,
+        }
+        extra_body = self._chat_extra_body()
+        if extra_body is not None:
+            request_kwargs["extra_body"] = extra_body
+
+        completion = await client.chat.completions.create(**request_kwargs)
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        content = completion.choices[0].message.content or ""
+        if isinstance(content, list):
+            text = "".join(
+                part.get("text", "") if isinstance(part, dict) else getattr(part, "text", "")
+                for part in content
+            )
+        else:
+            text = str(content)
+
+        payload_text = extract_first_json_object(text)
+        parsed: dict[str, Any] = {}
+        try:
+            maybe_parsed = json.loads(payload_text)
+            if isinstance(maybe_parsed, dict):
+                parsed = maybe_parsed
+        except Exception:
+            parsed = {}
+
+        replace_speech_text = sanitize_voice_response(
+            str(parsed.get("replace_speech_text", "")).strip(),
+            fallback="",
+        )
+        if replace_speech_text == fallback_reply:
+            replace_speech_text = ""
+
+        return SupervisorDecision(
+            approved=bool(parsed.get("approved", True)),
+            stage=str(parsed.get("stage", "")).strip(),
+            missing_slots=dedupe_compact_strings(
+                [str(item) for item in parsed.get("missing_slots", []) if str(item).strip()],
+                limit=8,
+            ),
+            repeat_detected=bool(parsed.get("repeat_detected", False)),
+            risk_flags=dedupe_compact_strings(
+                [str(item) for item in parsed.get("risk_flags", []) if str(item).strip()],
+                limit=8,
+            ),
+            replace_speech_text=replace_speech_text,
+            next_allowed_slots=dedupe_compact_strings(
+                [str(item) for item in parsed.get("next_allowed_slots", []) if str(item).strip()],
+                limit=8,
+            ),
+            notes=str(parsed.get("notes", "")).strip()[:240],
+            raw_text=text,
         ), latency_ms
 
 
@@ -1984,6 +2185,7 @@ class ParticipantAudioSession:
         event_bus: AgentEventBus,
         stt_service: WhisperSttService,
         llm_service: OpenAiLlmService,
+        supervisor_service: OpenAiLlmService | None,
         tts_service: SileroTtsService,
         audio_publisher: LiveKitAudioPublisher,
         log: Callable[[str], None],
@@ -1994,6 +2196,7 @@ class ParticipantAudioSession:
         self._event_bus = event_bus
         self._stt_service = stt_service
         self._llm_service = llm_service
+        self._supervisor_service = supervisor_service
         self._tts_service = tts_service
         self._audio_publisher = audio_publisher
         self._log = log
@@ -2478,7 +2681,7 @@ class ParticipantAudioSession:
     def _should_use_adaptive_classifier(self, intent: IntentResult, normalized_text: str) -> bool:
         if (
             not self._config.adaptive_classifier_enabled
-            or not self._llm_service.enabled
+            or not ((self._supervisor_service and self._supervisor_service.enabled) or self._llm_service.enabled)
             or not normalized_text.strip()
         ):
             return False
@@ -2556,6 +2759,54 @@ class ParticipantAudioSession:
             Intent.COMPLEX_REQUEST.value,
         }
 
+    async def _maybe_apply_supervisor_review(
+        self,
+        *,
+        normalized_text: str,
+        state_snapshot: dict[str, Any],
+        response_text: str,
+    ) -> tuple[str, int, str]:
+        if self._supervisor_service is None or not self._supervisor_service.enabled:
+            return response_text, 0, ""
+        if not normalized_text.strip() or not response_text.strip():
+            return response_text, 0, ""
+
+        fallback_reply = self._state_fallback_reply()
+        try:
+            decision, latency_ms = await asyncio.wait_for(
+                self._supervisor_service.review_response(
+                    normalized_text=normalized_text,
+                    history=self._history,
+                    dialogue_state=state_snapshot,
+                    candidate_reply=response_text,
+                    fallback_reply=fallback_reply,
+                ),
+                timeout=max(0.05, self._config.supervisor_soft_timeout_ms / 1000.0),
+            )
+        except asyncio.TimeoutError:
+            return response_text, self._config.supervisor_soft_timeout_ms, "timeout"
+        except Exception as exc:
+            self._log(f"supervisor review failed participant={self._participant.identity}: {exc}")
+            return response_text, 0, "error"
+
+        final_text = response_text
+        reason = "approved"
+        if decision.replace_speech_text:
+            final_text = decision.replace_speech_text
+            reason = "replaced"
+        elif not decision.approved or decision.repeat_detected or decision.risk_flags:
+            final_text = fallback_reply
+            reason = "fallback"
+
+        self._log(
+            f"supervisor review participant={self._participant.identity} "
+            f"approved={str(decision.approved).lower()} "
+            f"repeat_detected={str(decision.repeat_detected).lower()} "
+            f"risk_flags={decision.risk_flags!r} replace={decision.replace_speech_text!r} "
+            f"notes={decision.notes!r}"
+        )
+        return final_text, latency_ms, reason
+
     async def _process_utterance(
         self,
         *,
@@ -2599,6 +2850,8 @@ class ParticipantAudioSession:
         llm_latency_ms = 0
         tts_latency_ms = 0
         llm_validation_reason = ""
+        supervisor_latency_ms = 0
+        supervisor_decision_reason = ""
 
         try:
             if not self._config.stt_enabled:
@@ -2673,6 +2926,11 @@ class ParticipantAudioSession:
                 )
                 await self._publish_status("routing_intent")
                 decision_started_at = time.perf_counter()
+                classifier_service = (
+                    self._supervisor_service
+                    if self._supervisor_service is not None and self._supervisor_service.enabled
+                    else self._llm_service
+                )
                 use_llm_orchestrator = self._should_use_llm_orchestrator(
                     transcript=transcript,
                     normalized_text=normalized_text,
@@ -2690,7 +2948,7 @@ class ParticipantAudioSession:
                         and self._should_use_adaptive_classifier(intent, normalized_text)
                     ):
                         try:
-                            intent, classifier_latency_ms = await self._llm_service.classify_intent(
+                            intent, classifier_latency_ms = await classifier_service.classify_intent(
                                 normalized_text=normalized_text,
                                 history=self._history,
                                 dialogue_state=state_snapshot,
@@ -2864,6 +3122,13 @@ class ParticipantAudioSession:
                             last_agent_message=self._last_agent_message,
                         )
                 self._processing_can_be_interrupted = False
+                if not rescue_only:
+                    supervisor_state_snapshot = self._dialogue_state.snapshot()
+                    response_text, supervisor_latency_ms, supervisor_decision_reason = await self._maybe_apply_supervisor_review(
+                        normalized_text=normalized_text,
+                        state_snapshot=supervisor_state_snapshot,
+                        response_text=response_text,
+                    )
                 raw_response_text = response_text
                 response_ready_time_ms = int(time.time() * 1000)
                 self._log(
@@ -3025,6 +3290,7 @@ class ParticipantAudioSession:
                     "router_latency_ms": router_latency_ms,
                     "classifier_latency_ms": classifier_latency_ms,
                     "llm_latency_ms": llm_latency_ms,
+                    "supervisor_latency_ms": supervisor_latency_ms,
                     "tts_latency_ms": tts_latency_ms,
                     "perceived_latency_ms": perceived_latency_ms,
                     "finalized_to_intent_ms": finalized_to_intent_ms,
@@ -3045,6 +3311,7 @@ class ParticipantAudioSession:
                 f"router_ms={router_latency_ms} "
                 f"classifier_ms={classifier_latency_ms} "
                 f"llm_ms={llm_latency_ms} "
+                f"supervisor_ms={supervisor_latency_ms} "
                 f"tts_ms={tts_latency_ms} "
                 f"perceived_latency_ms={perceived_latency_ms} "
                 f"finalized_to_intent_ms={finalized_to_intent_ms} "
@@ -3096,6 +3363,8 @@ class ParticipantAudioSession:
                     "filler_added": filler_added,
                     "filler_type": filler_type,
                     "llm_latency_ms": llm_latency_ms,
+                    "supervisor_latency_ms": supervisor_latency_ms,
+                    "supervisor_decision_reason": supervisor_decision_reason,
                     "llm_reply_intent": llm_reply.intent if llm_reply else "",
                     "llm_reply_search_index": llm_reply.search_index if llm_reply else [],
                     "llm_reply_next_step": llm_reply.next_step if llm_reply else "",
@@ -3145,6 +3414,7 @@ class VoiceSessionManager:
         config: VoicePipelineConfig,
         event_bus: AgentEventBus,
         llm_service: OpenAiLlmService,
+        supervisor_service: OpenAiLlmService | None,
         tts_service: SileroTtsService,
         audio_publisher: LiveKitAudioPublisher,
         log: Callable[[str], None],
@@ -3153,6 +3423,7 @@ class VoiceSessionManager:
         self._config = config
         self._event_bus = event_bus
         self._llm_service = llm_service
+        self._supervisor_service = supervisor_service
         self._tts_service = tts_service
         self._audio_publisher = audio_publisher
         self._log = log
@@ -3175,6 +3446,7 @@ class VoiceSessionManager:
                 event_bus=self._event_bus,
                 stt_service=self._stt,
                 llm_service=self._llm_service,
+                supervisor_service=self._supervisor_service,
                 tts_service=self._tts_service,
                 audio_publisher=self._audio_publisher,
                 log=self._log,

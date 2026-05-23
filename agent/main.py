@@ -116,7 +116,8 @@ async def run() -> None:
     room = rtc.Room()
     pipeline_config = VoicePipelineConfig.from_env()
     event_bus = AgentEventBus(room, topic=pipeline_config.events_topic, log=log)
-    llm_service = OpenAiLlmService(pipeline_config, log)
+    llm_service = OpenAiLlmService(pipeline_config, log, role="talker")
+    supervisor_service = OpenAiLlmService(pipeline_config, log, role="supervisor")
     tts_service = build_tts_service(pipeline_config, log)
     audio_publisher = LiveKitAudioPublisher(room, pipeline_config, log)
     voice_sessions = VoiceSessionManager(
@@ -124,6 +125,7 @@ async def run() -> None:
         config=pipeline_config,
         event_bus=event_bus,
         llm_service=llm_service,
+        supervisor_service=supervisor_service,
         tts_service=tts_service,
         audio_publisher=audio_publisher,
         log=log,
