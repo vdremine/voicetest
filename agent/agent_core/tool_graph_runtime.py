@@ -57,11 +57,6 @@ class ToolGraphRuntime:
             node_name = "robot_check"
         elif self._matches_any(lowered, ("не помню такого", "не оставлял заявку", "не помню обращения")):
             node_name = "memory_denial_faq"
-        elif current_node == "opening" and self._looks_ready(lowered):
-            node_name = "opening"
-        elif current_node in self._OPENING_FAMILY and self._looks_ready(lowered):
-            node_name = "callback_reentry"
-
         if not node_name:
             return None
 

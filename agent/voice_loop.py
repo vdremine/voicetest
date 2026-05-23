@@ -1743,6 +1743,8 @@ class SimpleIntentRouter:
             return IntentResult(Intent.REJECT.value, 0.97, False, Action.ACK_REJECT.value)
         if any(marker in text for marker in self._payment_help_markers):
             return IntentResult(Intent.PAYMENT_HELP.value, 0.92, False, Action.HANDOFF_PAYMENT_SUPPORT.value)
+        if text.startswith(("да да", "угу да", "ага да")) or "я понял" in text or "понял вас" in text:
+            return IntentResult(Intent.CONFIRM.value, 0.96, False, Action.ACK_CONFIRM.value)
         if text in self._confirm or self._is_affirmation_phrase(text):
             return IntentResult(Intent.CONFIRM.value, 0.99, False, Action.ACK_CONFIRM.value)
         if text in self._reject or self._is_rejection_phrase(text):
@@ -2554,6 +2556,17 @@ class ParticipantAudioSession:
                     self._history.append({"role": "user", "text": normalized_text or transcript.text})
                     self._history = self._history[-12:]
                 state_snapshot = self._dialogue_state.snapshot()
+                opening_nodes = {
+                    "opening",
+                    "check_convenience",
+                    "small_talk",
+                    "who_are_you",
+                    "identity_company_faq",
+                    "source_of_number_faq",
+                    "robot_check",
+                    "memory_denial_faq",
+                    "callback_reentry",
+                }
                 self._log(
                     f"turn state participant={self._participant.identity} "
                     f"utterance_id={utterance_id} updated_fields={sorted(updated_fields)!r} "
@@ -2607,6 +2620,13 @@ class ParticipantAudioSession:
                     and not self._skip_confidence_gate_for(intent)
                 ):
                     response_text = self._config.fallback_low_confidence_text
+                elif (
+                    intent.intent in {Intent.READY_TO_TALK.value, Intent.CONFIRM.value}
+                    and str(state_snapshot.get("current_node", "")).strip() in opening_nodes
+                ):
+                    await self._publish_status("simple_intent_detected")
+                    response_text = self._state_fallback_reply()
+                    next_graph_node = self._dialogue_state.current_node
                 elif faq_answer:
                     await self._publish_status("simple_intent_detected")
                     response_text = faq_answer
