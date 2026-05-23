@@ -18,7 +18,7 @@ from typing import Any, Callable
 import numpy as np
 import torch
 import torchaudio.functional as torchaudio_f
-from agent_core import DialogueState, KnowledgeBase, build_context_messages, validate_llm_reply
+from agent_core import DialogueState, KnowledgeBase, build_context_messages, inspect_llm_reply
 from faster_whisper import WhisperModel
 from livekit import rtc
 from openai import AsyncOpenAI
@@ -136,7 +136,7 @@ class VoicePipelineConfig:
             vad_min_silence_duration_ms=int(os.getenv("VAD_MIN_SILENCE_DURATION_MS", "900")),
             vad_speech_pad_ms=int(os.getenv("VAD_SPEECH_PAD_MS", "200")),
             processing_resume_min_speech_duration_ms=int(
-                os.getenv("PROCESSING_RESUME_MIN_SPEECH_DURATION_MS", "450")
+                os.getenv("PROCESSING_RESUME_MIN_SPEECH_DURATION_MS", "1200")
             ),
             barge_in_min_speech_duration_ms=int(os.getenv("BARGE_IN_MIN_SPEECH_DURATION_MS", "500")),
             vad_use_onnx=env_bool("VAD_USE_ONNX", False),
@@ -223,6 +223,7 @@ class LlmReply:
     search_index: list[str]
     intent: str
     next_step: str
+    raw_text: str = ""
 
 
 @dataclass(slots=True)
@@ -745,6 +746,15 @@ TTS:
             return {"type": "json_schema", "json_schema": schema}
         return {"type": "json_object"}
 
+    def _chat_extra_body(self) -> dict[str, Any] | None:
+        model_name = self._config.llm_model.strip().lower()
+        if "qwen3" not in model_name:
+            return None
+
+        effort = self._config.llm_reasoning_effort.strip().lower()
+        enable_thinking = effort in {"on", "enabled", "thinking", "reasoning"}
+        return {"chat_template_kwargs": {"enable_thinking": enable_thinking}}
+
     @classmethod
     def _parse_classifier_reply(
         cls,
@@ -825,13 +835,18 @@ TTS:
         if not messages or messages[-1]["role"] != "user":
             messages.append({"role": "user", "content": normalized_text})
 
-        completion = await client.chat.completions.create(
-            model=self._config.llm_model,
-            temperature=0.0,
-            max_tokens=min(160, self._config.llm_max_tokens),
-            response_format=self._response_format(self._CLASSIFIER_JSON_SCHEMA),
-            messages=messages,
-        )
+        request_kwargs: dict[str, Any] = {
+            "model": self._config.llm_model,
+            "temperature": 0.0,
+            "max_tokens": min(160, self._config.llm_max_tokens),
+            "response_format": self._response_format(self._CLASSIFIER_JSON_SCHEMA),
+            "messages": messages,
+        }
+        extra_body = self._chat_extra_body()
+        if extra_body is not None:
+            request_kwargs["extra_body"] = extra_body
+
+        completion = await client.chat.completions.create(**request_kwargs)
         latency_ms = int((time.perf_counter() - started_at) * 1000)
         content = completion.choices[0].message.content or ""
         if isinstance(content, list):
@@ -889,13 +904,18 @@ TTS:
         if not messages or messages[-1]["role"] != "user":
             messages.append({"role": "user", "content": normalized_text})
 
-        completion = await client.chat.completions.create(
-            model=self._config.llm_model,
-            temperature=self._config.llm_temperature,
-            max_tokens=self._config.llm_max_tokens,
-            response_format=self._response_format(self._LLM_JSON_SCHEMA),
-            messages=messages,
-        )
+        request_kwargs: dict[str, Any] = {
+            "model": self._config.llm_model,
+            "temperature": self._config.llm_temperature,
+            "max_tokens": self._config.llm_max_tokens,
+            "response_format": self._response_format(self._LLM_JSON_SCHEMA),
+            "messages": messages,
+        }
+        extra_body = self._chat_extra_body()
+        if extra_body is not None:
+            request_kwargs["extra_body"] = extra_body
+
+        completion = await client.chat.completions.create(**request_kwargs)
         latency_ms = int((time.perf_counter() - started_at) * 1000)
         content = completion.choices[0].message.content or ""
         if isinstance(content, list):
@@ -1062,6 +1082,7 @@ def parse_llm_reply(
         search_index=search_index,
         intent=intent[:120],
         next_step=next_step[:160],
+        raw_text=raw_text,
     )
 
 
@@ -1568,7 +1589,17 @@ class TranscriptNormalizer:
 
 
 class SimpleIntentRouter:
-    _affirmation_tokens = {"да", "ага", "угу", "конечно", "хорошо", "ладно", "поехали", "договорились"}
+    _affirmation_tokens = {
+        "да",
+        "ага",
+        "угу",
+        "конечно",
+        "хорошо",
+        "ладно",
+        "поехали",
+        "договорились",
+        "безусловно",
+    }
     _rejection_tokens = {"нет", "не", "неа", "не буду", "не надо", "не нужно"}
 
     def __init__(self) -> None:
@@ -1583,7 +1614,7 @@ class SimpleIntentRouter:
             "доброе утро",
             "доброй ночи",
         }
-        self._confirm = {"да", "угу", "ага", "подтверждаю", "конечно", "хорошо", "супер", "отлично"}
+        self._confirm = {"да", "угу", "ага", "подтверждаю", "конечно", "хорошо", "супер", "отлично", "безусловно"}
         self._reject = {"нет", "неа", "не надо"}
         self._cancel = {"отмена", "отменить", "отбой"}
         self._repeat = {
@@ -1883,6 +1914,7 @@ class ParticipantAudioSession:
         self._needs_rescue_prompt = False
         self._spoken_turn_count = 0
         self._greeting_was_spoken = False
+        self._processing_can_be_interrupted = False
 
         self._chunk_ms = int(self._vad.window_size * 1000 / self._config.sample_rate)
         self._pad_chunks = max(1, math.ceil(self._config.vad_speech_pad_ms / self._chunk_ms))
@@ -2067,10 +2099,15 @@ class ParticipantAudioSession:
             min_required_ms = (
                 self._config.barge_in_min_speech_duration_ms
                 if speaking
-                else self._config.processing_resume_min_speech_duration_ms
+                else max(1200, self._config.processing_resume_min_speech_duration_ms)
             )
             if speech_ms < min_required_ms:
                 continue
+
+            if not speaking and not self._processing_can_be_interrupted:
+                self._resume_speech_ms = 0
+                self._resume_probe_buffer.clear()
+                return
 
             if not self._barge_in_pending:
                 self._turn_revision += 1
@@ -2405,10 +2442,13 @@ class ParticipantAudioSession:
         filler_type = ""
         llm_latency_ms = 0
         tts_latency_ms = 0
+        llm_validation_reason = ""
 
         try:
             if not self._config.stt_enabled:
                 raise RuntimeError("STT is disabled by configuration")
+
+            self._processing_can_be_interrupted = True
 
             transcript = await asyncio.to_thread(self._stt_service.transcribe, audio_samples, duration_ms)
 
@@ -2567,12 +2607,23 @@ class ParticipantAudioSession:
                                     )
                                     await self._publish_status("complex_request_detected")
                             llm_reply, llm_latency_ms = await llm_task
-                            response_text = validate_llm_reply(
+                            self._log(
+                                f"llm raw reply participant={self._participant.identity} "
+                                f"utterance_id={utterance_id} raw_text={llm_reply.raw_text!r} "
+                                f"reply_tts={llm_reply.reply_tts!r} intent={llm_reply.intent!r} "
+                                f"next_step={llm_reply.next_step!r}"
+                            )
+                            response_text, llm_validation_reason = inspect_llm_reply(
                                 reply_tts=llm_reply.reply_tts,
                                 fallback_reply=self._state_fallback_reply(),
                                 state=state_snapshot,
                                 knowledge=knowledge,
                                 truth_rules=self._kb.truth_rules,
+                            )
+                            self._log(
+                                f"llm validated reply participant={self._participant.identity} "
+                                f"utterance_id={utterance_id} reason={llm_validation_reason} "
+                                f"result={response_text!r}"
                             )
                         except Exception as exc:
                             self._log(f"llm fallback failed for {self._participant.identity}: {exc}")
@@ -2588,6 +2639,7 @@ class ParticipantAudioSession:
                             intent,
                             last_agent_message=self._last_agent_message,
                         )
+                self._processing_can_be_interrupted = False
                 raw_response_text = response_text
                 response_ready_time_ms = int(time.time() * 1000)
                 self._log(
@@ -2597,6 +2649,7 @@ class ParticipantAudioSession:
                     f"final_response_text={response_text!r}"
                 )
 
+            self._processing_can_be_interrupted = False
             if self._is_stale_turn(turn_revision):
                 suppress_response = True
                 error_stage = "superseded_turn"
@@ -2801,6 +2854,8 @@ class ParticipantAudioSession:
                     "llm_reply_intent": llm_reply.intent if llm_reply else "",
                     "llm_reply_search_index": llm_reply.search_index if llm_reply else [],
                     "llm_reply_next_step": llm_reply.next_step if llm_reply else "",
+                    "llm_raw_text": llm_reply.raw_text if llm_reply else "",
+                    "llm_validation_reason": llm_validation_reason,
                     "tts_latency_ms": tts_latency_ms,
                     "stt_done_time_ms": stt_done_time_ms,
                     "intent_ready_time_ms": intent_ready_time_ms,
@@ -2834,6 +2889,7 @@ class ParticipantAudioSession:
             self._resume_buffer.clear()
             self._resume_probe_buffer.clear()
             self._resume_speech_ms = 0
+            self._processing_can_be_interrupted = False
 
 
 class VoiceSessionManager:
