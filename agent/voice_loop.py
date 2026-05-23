@@ -131,9 +131,9 @@ class VoicePipelineConfig:
             num_channels=int(os.getenv("AUDIO_NUM_CHANNELS", "1")),
             frame_size_ms=int(os.getenv("AUDIO_FRAME_SIZE_MS", "20")),
             vad_threshold=float(os.getenv("VAD_THRESHOLD", "0.45")),
-            vad_min_speech_duration_ms=int(os.getenv("VAD_MIN_SPEECH_DURATION_MS", "200")),
-            vad_min_silence_duration_ms=int(os.getenv("VAD_MIN_SILENCE_DURATION_MS", "800")),
-            vad_speech_pad_ms=int(os.getenv("VAD_SPEECH_PAD_MS", "180")),
+            vad_min_speech_duration_ms=int(os.getenv("VAD_MIN_SPEECH_DURATION_MS", "250")),
+            vad_min_silence_duration_ms=int(os.getenv("VAD_MIN_SILENCE_DURATION_MS", "900")),
+            vad_speech_pad_ms=int(os.getenv("VAD_SPEECH_PAD_MS", "200")),
             processing_resume_min_speech_duration_ms=int(
                 os.getenv("PROCESSING_RESUME_MIN_SPEECH_DURATION_MS", "450")
             ),
@@ -141,13 +141,13 @@ class VoicePipelineConfig:
             vad_use_onnx=env_bool("VAD_USE_ONNX", False),
             torch_num_threads=int(os.getenv("TORCH_NUM_THREADS", "1")),
             stt_enabled=env_bool("STT_ENABLED", True),
-            stt_model=os.getenv("STT_MODEL", "Systran/faster-whisper-small"),
+            stt_model=os.getenv("STT_MODEL", "Systran/faster-whisper-medium"),
             stt_device=os.getenv("STT_DEVICE", "auto"),
             stt_compute_type_cpu=os.getenv("STT_COMPUTE_TYPE_CPU", "int8"),
             stt_compute_type_gpu=os.getenv("STT_COMPUTE_TYPE_GPU", "float16"),
             stt_language=os.getenv("STT_LANGUAGE", "ru"),
-            stt_beam_size=int(os.getenv("STT_BEAM_SIZE", "1")),
-            stt_confidence_floor=float(os.getenv("STT_CONFIDENCE_FLOOR", "0.35")),
+            stt_beam_size=int(os.getenv("STT_BEAM_SIZE", "3")),
+            stt_confidence_floor=float(os.getenv("STT_CONFIDENCE_FLOOR", "0.25")),
             debug_save_wav=env_bool("DEBUG_SAVE_WAV", True),
             llm_enabled=env_bool("LLM_ENABLED", True),
             llm_provider=llm_provider,
@@ -165,20 +165,20 @@ class VoicePipelineConfig:
                 "TTS_MODEL_URL",
                 "https://models.silero.ai/models/tts/ru/v5_4_ru.pt",
             ),
-            tts_speaker=os.getenv("TTS_SPEAKER", "xenia"),
+            tts_speaker=os.getenv("TTS_SPEAKER", "aidar"),
             tts_sample_rate=int(os.getenv("TTS_SAMPLE_RATE", "24000")),
             tts_publish_sample_rate=int(os.getenv("TTS_PUBLISH_SAMPLE_RATE", "24000")),
             tts_frame_ms=int(os.getenv("TTS_FRAME_MS", "20")),
             tts_provider=tts_provider,
-            tts_segment_pause_ms=int(os.getenv("TTS_SEGMENT_PAUSE_MS", "180")),
-            tts_normalize_peak=float(os.getenv("TTS_NORMALIZE_PEAK", "0.85")),
-            tts_fade_ms=int(os.getenv("TTS_FADE_MS", "10")),
+            tts_segment_pause_ms=int(os.getenv("TTS_SEGMENT_PAUSE_MS", "120")),
+            tts_normalize_peak=float(os.getenv("TTS_NORMALIZE_PEAK", "0.8")),
+            tts_fade_ms=int(os.getenv("TTS_FADE_MS", "8")),
             half_duplex=env_bool("HALF_DUPLEX", True),
             barge_in_enabled=env_bool("BARGE_IN_ENABLED", False),
-            voice_fillers_enabled=env_bool("VOICE_FILLERS_ENABLED", True),
+            voice_fillers_enabled=env_bool("VOICE_FILLERS_ENABLED", False),
             voice_fillers_level=os.getenv("VOICE_FILLERS_LEVEL", "light").strip().lower() or "light",
             voice_fillers_probability=float(os.getenv("VOICE_FILLERS_PROBABILITY", "0.35")),
-            voice_bridge_on_llm=env_bool("VOICE_BRIDGE_ON_LLM", True),
+            voice_bridge_on_llm=env_bool("VOICE_BRIDGE_ON_LLM", False),
             data_dir=Path(os.getenv("AGENT_DATA_DIR", "/app/data")),
             utterance_dir=Path(os.getenv("UTTERANCE_DIR", "/tmp/voice-agent/utterances")),
             session_log_dir=Path(os.getenv("SESSION_LOG_DIR", "/tmp/voice-agent/session-logs")),
@@ -1195,6 +1195,10 @@ class VoiceStyleAdapter:
         "payment_help",
         "cancel",
         "end_session",
+        "repeat",
+        "unknown_short",
+        "clarify",
+        "low_confidence",
     }
 
     def __init__(self, config: VoicePipelineConfig) -> None:
@@ -1208,13 +1212,18 @@ class VoiceStyleAdapter:
         *,
         intent: str,
         stage: str,
-        is_first_message: bool,
+        can_use_greeting_prefix: bool,
     ) -> VoiceStyleResult:
         original = text.strip()
         if not original:
             return VoiceStyleResult("", False, "", original)
 
-        if is_first_message:
+        lowered_original = original.lower()
+        if "не расслышал" in lowered_original:
+            self._previous_had_filler = False
+            return VoiceStyleResult(original, False, "", original)
+
+        if can_use_greeting_prefix:
             styled = original if original.lower().startswith(("алло", "алл")) else f"Алл+о. {original}"
             self._previous_had_filler = True
             return VoiceStyleResult(styled, True, "greeting", original)
@@ -1861,6 +1870,7 @@ class ParticipantAudioSession:
         self._resume_buffer_limit = self._config.sample_rate * 6
         self._needs_rescue_prompt = False
         self._spoken_turn_count = 0
+        self._greeting_was_spoken = False
 
         self._chunk_ms = int(self._vad.window_size * 1000 / self._config.sample_rate)
         self._pad_chunks = max(1, math.ceil(self._config.vad_speech_pad_ms / self._chunk_ms))
@@ -2227,12 +2237,22 @@ class ParticipantAudioSession:
             return "Так, секунду, быстро сориентируюсь."
         return "Смотрите, секунду."
 
+    @staticmethod
+    def _is_opening_intent(intent_value: str) -> bool:
+        return intent_value in {
+            Intent.GREETING.value,
+            Intent.READY_TO_TALK.value,
+            Intent.IDENTIFY_SELF.value,
+        }
+
     def _prepare_tts_output(self, text: str, *, intent_value: str) -> tuple[VoiceStyleResult, str, list[str]]:
         style_result = self._voice_style.adapt(
             text,
             intent=intent_value,
             stage=self._dialogue_state.stage,
-            is_first_message=self._spoken_turn_count == 0,
+            can_use_greeting_prefix=(
+                self._is_opening_intent(intent_value) and not self._greeting_was_spoken
+            ),
         )
         prepared_text = self._tts_markup.prepare(
             TtsRequest(
@@ -2263,6 +2283,8 @@ class ParticipantAudioSession:
         )
         playback_completed = await self._audio_publisher.speak_pcm(tts_pcm16, tts_sample_rate)
         self._spoken_turn_count += 1
+        if not self._greeting_was_spoken and style_result.styled_text.lower().startswith(("алло", "алл")):
+            self._greeting_was_spoken = True
         return (
             style_result.styled_text,
             prepared_text,
@@ -2375,6 +2397,11 @@ class ParticipantAudioSession:
 
             normalized_text = self._normalizer.normalize(transcript.text)
             stt_done_time_ms = int(time.time() * 1000)
+            self._log(
+                f"turn transcript participant={self._participant.identity} "
+                f"utterance_id={utterance_id} raw_stt_text={transcript.text!r} "
+                f"normalized_text={normalized_text!r} confidence={transcript.confidence:.3f}"
+            )
             if is_low_information_transcript(transcript.text, normalized_text):
                 if self._needs_rescue_prompt:
                     response_text = self._responses.rescue_prompt()
@@ -2518,6 +2545,12 @@ class ParticipantAudioSession:
                         )
                 raw_response_text = response_text
                 response_ready_time_ms = int(time.time() * 1000)
+                self._log(
+                    f"turn decision participant={self._participant.identity} "
+                    f"utterance_id={utterance_id} router_intent={intent.intent} "
+                    f"action={intent.action} use_llm={str(intent.use_llm).lower()} "
+                    f"final_response_text={response_text!r}"
+                )
 
             if self._is_stale_turn(turn_revision):
                 suppress_response = True

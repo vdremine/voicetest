@@ -164,20 +164,20 @@ AUDIO_NUM_CHANNELS=1
 AUDIO_FRAME_SIZE_MS=20
 
 VAD_THRESHOLD=0.45
-VAD_MIN_SPEECH_DURATION_MS=200
-VAD_MIN_SILENCE_DURATION_MS=800
-VAD_SPEECH_PAD_MS=180
+VAD_MIN_SPEECH_DURATION_MS=250
+VAD_MIN_SILENCE_DURATION_MS=900
+VAD_SPEECH_PAD_MS=200
 VAD_USE_ONNX=false
 TORCH_NUM_THREADS=1
 
 STT_ENABLED=true
-STT_MODEL=turbo
+STT_MODEL=Systran/faster-whisper-medium
 STT_DEVICE=cuda
 STT_COMPUTE_TYPE_CPU=int8
 STT_COMPUTE_TYPE_GPU=float16
 STT_LANGUAGE=ru
-STT_BEAM_SIZE=1
-STT_CONFIDENCE_FLOOR=0.35
+STT_BEAM_SIZE=3
+STT_CONFIDENCE_FLOOR=0.25
 DEBUG_SAVE_WAV=false
 ```
 
@@ -267,22 +267,23 @@ docker compose -f docker-compose.prod.yml -f docker-compose.gpu.yml up --build -
 
 ## Models And GPU
 
-Рекомендуемый STT для RTX 4090:
+Рекомендуемый STT для RTX 4090 в текущем debug-quality профиле:
 
-- `turbo` (`openai/whisper-large-v3-turbo` в faster-whisper)
+- `Systran/faster-whisper-medium`
+- если нужна ещё выше точность и VRAM позволяет: `large-v3`
 
 Почему так:
 
 - `small` на CPU даёт заметно хуже качество и на реальном звонке легко уводит вас в 5+ секунд полной turn latency
-- `turbo` оптимизирован OpenAI именно под быстрый inference
-- faster-whisper официально рекомендует GPU `float16`, а для multilingual сценариев Distil-Whisper не подходит
+- `medium` на CUDA даёт заметно более адекватный русский transcript без экстремальной цены по latency
+- модель можно потом поднять до `large-v3`, если 4090 и ваша задержка это позволяют
 
 Текущее поведение по GPU:
 
 - VAD остается легким и может спокойно жить на CPU
 - на 4090 сервере `agent` должен идти с `gpus: all` и `STT_DEVICE=cuda`
 - если CUDA недоступна или инициализация падает, agent автоматически откатывается на CPU `int8`
-- `docker-compose.llm.yml` теперь сразу поднимает `agent` с GPU и `STT_MODEL=turbo`
+- `docker-compose.llm.yml` теперь сразу поднимает `agent` с GPU и `STT_MODEL=Systran/faster-whisper-medium`
 - `docker-compose.gpu.yml` нужен только если хотите GPU-STT без локального `vLLM`
 
 Проверка сервера:
@@ -300,13 +301,13 @@ docker compose -f docker-compose.prod.yml -f docker-compose.gpu.yml up --build -
 
 ```bash
 pip install -U "huggingface_hub[cli]"
-huggingface-cli download openai/whisper-large-v3-turbo --local-dir /opt/models/whisper-large-v3-turbo
+huggingface-cli download Systran/faster-whisper-medium --local-dir /opt/models/faster-whisper-medium
 ```
 
 Тогда в `.env` можно указать:
 
 ```env
-STT_MODEL=/models/whisper-large-v3-turbo
+STT_MODEL=/models/faster-whisper-medium
 ```
 
 ## Token API
