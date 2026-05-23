@@ -2792,6 +2792,27 @@ class ParticipantAudioSession:
                     },
                         destination_identities=[self._participant.identity],
                 )
+            await self._event_bus.publish_json(
+                {
+                    "type": "turn_timing",
+                    "utterance_id": utterance_id,
+                    "participant_identity": self._participant.identity,
+                    "stt_latency_ms": transcript.stt_latency_ms,
+                    "router_latency_ms": router_latency_ms,
+                    "classifier_latency_ms": classifier_latency_ms,
+                    "llm_latency_ms": llm_latency_ms,
+                    "tts_latency_ms": tts_latency_ms,
+                    "perceived_latency_ms": perceived_latency_ms,
+                    "finalized_to_intent_ms": finalized_to_intent_ms,
+                    "finalized_to_response_ms": finalized_to_response_ms,
+                    "finalized_to_tts_start_ms": finalized_to_tts_start_ms,
+                    "finalized_to_tts_publish_ms": finalized_to_tts_publish_ms,
+                    "finalized_to_tts_done_ms": finalized_to_tts_done_ms,
+                    "total_latency_ms": total_latency_ms,
+                    "error_stage": error_stage,
+                },
+                destination_identities=[self._participant.identity],
+            )
             self._log(
                 "turn timing "
                 f"participant={self._participant.identity} "

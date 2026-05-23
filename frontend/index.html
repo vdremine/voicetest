@@ -452,6 +452,13 @@
         }
       }
 
+      function formatSeconds(valueMs) {
+        if (!Number.isFinite(valueMs) || valueMs <= 0) {
+          return "0.00s";
+        }
+        return `${(valueMs / 1000).toFixed(2)}s`;
+      }
+
       function attachRoomHandlers(room) {
         room
           .on(RoomEvent.Connected, () => {
@@ -506,17 +513,23 @@
               }
 
               if (event?.type === "utterance_finalized") {
-                log(`utterance finalized: ${event.utterance_id} (${event.duration_ms} ms)`);
+                log(
+                  `utterance finalized: ${event.utterance_id} (${formatSeconds(event.duration_ms)} / ${event.duration_ms} ms)`,
+                );
                 return;
               }
 
               if (event?.type === "transcript") {
-                log(`transcript final=${event.final}: ${event.text || "<empty>"}`);
+                log(
+                  `transcript final=${event.final} stt=${formatSeconds(event.stt_latency_ms)} conf=${Number(event.confidence || 0).toFixed(2)}: ${event.text || "<empty>"}`,
+                );
                 return;
               }
 
               if (event?.type === "intent") {
-                log(`intent: ${event.intent} use_llm=${event.use_llm} action=${event.action}`);
+                log(
+                  `intent: ${event.intent} use_llm=${event.use_llm} action=${event.action} conf=${Number(event.confidence || 0).toFixed(2)}`,
+                );
                 return;
               }
 
@@ -531,6 +544,13 @@
                 if (event.next_step) {
                   log(`next step: ${event.next_step}`);
                 }
+                return;
+              }
+
+              if (event?.type === "turn_timing") {
+                log(
+                  `timing ${event.utterance_id}: response=${formatSeconds(event.finalized_to_response_ms)} perceived=${formatSeconds(event.perceived_latency_ms)} total=${formatSeconds(event.total_latency_ms)} stt=${formatSeconds(event.stt_latency_ms)} router=${formatSeconds(event.router_latency_ms)} classifier=${formatSeconds(event.classifier_latency_ms)} llm=${formatSeconds(event.llm_latency_ms)} tts=${formatSeconds(event.tts_latency_ms)} err=${event.error_stage || "-"}`,
+                );
                 return;
               }
 
