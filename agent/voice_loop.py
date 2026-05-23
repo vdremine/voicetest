@@ -16,6 +16,7 @@ from typing import Any, Callable
 
 import numpy as np
 import torch
+from agent_core import DialogueState, StaticRagIndex, build_context_messages, validate_llm_reply
 from faster_whisper import WhisperModel
 from livekit import rtc
 from openai import AsyncOpenAI
@@ -35,6 +36,12 @@ def env_nonempty(name: str, default: str = "") -> str:
         return default
     value = raw.strip()
     return value if value else default
+
+
+_AMOUNT_TOKEN_RE = re.compile(
+    r"\b\d+(?:[\.,]\d+)?\s*(?:млн|миллион|миллиона|миллионов|тыс|тысяч|тысячи)?\b",
+    flags=re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -432,6 +439,8 @@ TTS:
         *,
         normalized_text: str,
         history: list[dict[str, str]],
+        dialogue_state: dict[str, Any] | None = None,
+        knowledge: list[KnowledgeSnippet] | None = None,
     ) -> tuple[LlmReply, int]:
         if not self.enabled:
             raise RuntimeError("LLM is disabled by configuration")
@@ -451,6 +460,10 @@ TTS:
                     "Никакого текста вне JSON."
                 ),
             },
+            *build_context_messages(
+                state=dialogue_state or {},
+                knowledge=knowledge or [],
+            ),
             *self._history_to_messages(history),
         ]
         if not messages or messages[-1]["role"] != "user":
@@ -922,6 +935,9 @@ class TranscriptNormalizer:
 
 
 class SimpleIntentRouter:
+    _affirmation_tokens = {"да", "ага", "угу", "конечно", "хорошо", "ладно", "поехали", "договорились"}
+    _rejection_tokens = {"нет", "не", "неа", "не буду", "не надо", "не нужно"}
+
     def __init__(self) -> None:
         self._greeting = {
             "алло",
@@ -984,6 +1000,28 @@ class SimpleIntentRouter:
         self._end_session = {"стоп", "завершить", "закончить"}
         self._handoff_tokens = {"оператор", "человек"}
 
+    @staticmethod
+    def _tokens(text: str) -> list[str]:
+        return [token for token in text.split() if token]
+
+    @classmethod
+    def _is_affirmation_phrase(cls, text: str) -> bool:
+        tokens = cls._tokens(text)
+        if not tokens:
+            return False
+        return all(token in cls._affirmation_tokens or token == "а" for token in tokens)
+
+    @classmethod
+    def _is_rejection_phrase(cls, text: str) -> bool:
+        tokens = cls._tokens(text)
+        if not tokens:
+            return False
+        return all(token in cls._rejection_tokens or token == "буду" for token in tokens)
+
+    @staticmethod
+    def _looks_like_amount(text: str) -> bool:
+        return bool(_AMOUNT_TOKEN_RE.search(text))
+
     def route(self, text: str) -> IntentResult:
         if not text:
             return IntentResult("clarify", 0.0, False, "ask_repeat")
@@ -992,7 +1030,7 @@ class SimpleIntentRouter:
             return IntentResult("greeting", 0.99, False, "ack_greeting")
         if text in self._ready_to_talk or text.startswith(("я слушаю", "слушаю вас", "говорите", "да слушаю")):
             return IntentResult("ready_to_talk", 0.99, False, "continue_opening")
-        if text in self._identify or text.startswith(("это кто", "кто это", "кто вы", "представьтесь")):
+        if text in self._identify or text.startswith(("это кто", "кто это", "кто вы", "представьтесь", "кто со мной")):
             return IntentResult("identify_self", 0.99, False, "introduce_self")
         if any(marker in text for marker in self._identity_mismatch_markers):
             return IntentResult("identity_mismatch", 0.95, False, "clarify_identity")
@@ -1006,9 +1044,9 @@ class SimpleIntentRouter:
             return IntentResult("service_complaint", 0.92, False, "ack_complaint_and_refocus")
         if any(marker in text for marker in self._payment_help_markers):
             return IntentResult("payment_help", 0.92, False, "handoff_payment_support")
-        if text in self._confirm:
+        if text in self._confirm or self._is_affirmation_phrase(text):
             return IntentResult("confirm", 0.99, False, "ack_confirm")
-        if text in self._reject:
+        if text in self._reject or self._is_rejection_phrase(text):
             return IntentResult("reject", 0.99, False, "ack_reject")
         if text in self._cancel or "отмена" in text:
             return IntentResult("cancel", 0.99, False, "cancel_action")
@@ -1020,6 +1058,8 @@ class SimpleIntentRouter:
             return IntentResult("end_session", 0.98, False, "end_session")
         if any(token in text for token in self._handoff_tokens):
             return IntentResult("human_handoff", 0.99, False, "handoff_to_human")
+        if self._looks_like_amount(text):
+            return IntentResult("amount_provided", 0.94, False, "ack_amount_and_continue")
         if len(text.split()) <= 2:
             return IntentResult("unknown_short", 0.45, False, "ask_repeat")
 
@@ -1081,6 +1121,8 @@ class CannedResponseEngine:
                 "Понял вас. Реквизиты и точную сумму должен подтвердить персональный менеджер. "
                 "Подскажите, пожалуйста, вам удобнее, чтобы он связался сегодня или в другое время?"
             )
+        if intent.intent == "amount_provided":
+            return "Понял. Подскажите, пожалуйста, на какую цель планируете использовать эту сумму?"
         if intent.intent == "confirm":
             return "Хорошо."
         if intent.intent == "reject":
@@ -1098,6 +1140,10 @@ class CannedResponseEngine:
         if intent.intent in {"clarify", "unknown_short"}:
             return self._config.fallback_low_confidence_text
         return self._config.fallback_complex_text
+
+    @staticmethod
+    def rescue_prompt() -> str:
+        return "Алл+о. Я вас слушаю. Повторите, пожалуйста, коротко."
 
 
 class SileroVadEngine:
@@ -1151,6 +1197,8 @@ class ParticipantAudioSession:
         self._router = SimpleIntentRouter()
         self._responses = CannedResponseEngine(config)
         self._vad = SileroVadEngine(config)
+        self._dialogue_state = DialogueState()
+        self._rag = StaticRagIndex.default()
 
         self._session_id = f"{participant.identity}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
         self._session_logger = SessionLogger(config.session_log_dir / f"{self._session_id}.jsonl")
@@ -1182,6 +1230,7 @@ class ParticipantAudioSession:
         self._resume_buffer = np.empty(0, dtype=np.int16)
         self._resume_probe_buffer = np.empty(0, dtype=np.int16)
         self._resume_buffer_limit = self._config.sample_rate * 6
+        self._needs_rescue_prompt = False
 
         self._chunk_ms = int(self._vad.window_size * 1000 / self._config.sample_rate)
         self._pad_chunks = max(1, math.ceil(self._config.vad_speech_pad_ms / self._chunk_ms))
@@ -1383,6 +1432,7 @@ class ParticipantAudioSession:
             if not self._barge_in_pending:
                 self._turn_revision += 1
             self._barge_in_pending = True
+            self._needs_rescue_prompt = True
             self._interrupt_speech_ms = 0
             self._resume_speech_ms = 0
             self._reset_utterance_state()
@@ -1560,6 +1610,7 @@ class ParticipantAudioSession:
         error_stage = ""
         response_published = False
         suppress_response = False
+        rescue_only = False
         llm_latency_ms = 0
         tts_latency_ms = 0
 
@@ -1586,13 +1637,19 @@ class ParticipantAudioSession:
 
             normalized_text = self._normalizer.normalize(transcript.text)
             if is_low_information_transcript(transcript.text, normalized_text):
-                suppress_response = True
-                error_stage = "ignored_low_information"
-                self._log(
-                    f"ignored low-information transcript participant={self._participant.identity} "
-                    f"utterance_id={utterance_id} text={transcript.text!r}"
-                )
-                return
+                if self._needs_rescue_prompt:
+                    response_text = self._responses.rescue_prompt()
+                    suppress_response = False
+                    rescue_only = True
+                    self._needs_rescue_prompt = False
+                else:
+                    suppress_response = True
+                    error_stage = "ignored_low_information"
+                    self._log(
+                        f"ignored low-information transcript participant={self._participant.identity} "
+                        f"utterance_id={utterance_id} text={transcript.text!r}"
+                    )
+                    return
             if self._is_stale_turn(turn_revision):
                 suppress_response = True
                 error_stage = "superseded_turn"
@@ -1602,53 +1659,64 @@ class ParticipantAudioSession:
                 )
                 return
 
-            if transcript.text:
-                self._history.append({"role": "user", "text": normalized_text or transcript.text})
-                self._history = self._history[-12:]
-            await self._publish_status("routing_intent")
-            intent = self._router.route(normalized_text)
-            await self._event_bus.publish_json(
-                {
-                    "type": "intent",
-                    "utterance_id": utterance_id,
-                    "participant_identity": self._participant.identity,
-                    "intent": intent.intent,
-                    "confidence": intent.confidence,
-                    "use_llm": intent.use_llm,
-                    "action": intent.action,
-                },
-                destination_identities=[self._participant.identity],
-            )
+            if not rescue_only:
+                if transcript.text:
+                    self._dialogue_state.update_from_user(transcript.text, normalized_text)
+                    self._history.append({"role": "user", "text": normalized_text or transcript.text})
+                    self._history = self._history[-12:]
+                await self._publish_status("routing_intent")
+                intent = self._router.route(normalized_text)
+                await self._event_bus.publish_json(
+                    {
+                        "type": "intent",
+                        "utterance_id": utterance_id,
+                        "participant_identity": self._participant.identity,
+                        "intent": intent.intent,
+                        "confidence": intent.confidence,
+                        "use_llm": intent.use_llm,
+                        "action": intent.action,
+                    },
+                    destination_identities=[self._participant.identity],
+                )
 
-            if not transcript.text or transcript.confidence < self._config.stt_confidence_floor:
-                response_text = self._config.fallback_low_confidence_text
-            else:
-                if intent.use_llm:
-                    await self._publish_status("complex_request_detected")
-                    if self._llm_service.enabled:
-                        try:
-                            llm_reply, llm_latency_ms = await self._llm_service.generate_response(
-                                normalized_text=normalized_text,
-                                history=self._history,
-                            )
-                            response_text = llm_reply.reply_tts
-                        except Exception as exc:
-                            self._log(f"llm fallback failed for {self._participant.identity}: {exc}")
+                if not transcript.text or transcript.confidence < self._config.stt_confidence_floor:
+                    response_text = self._config.fallback_low_confidence_text
+                else:
+                    if intent.use_llm:
+                        await self._publish_status("complex_request_detected")
+                        if self._llm_service.enabled:
+                            try:
+                                state_snapshot = self._dialogue_state.snapshot()
+                                knowledge = self._rag.retrieve(normalized_text, state_snapshot)
+                                llm_reply, llm_latency_ms = await self._llm_service.generate_response(
+                                    normalized_text=normalized_text,
+                                    history=self._history,
+                                    dialogue_state=state_snapshot,
+                                    knowledge=knowledge,
+                                )
+                                response_text = validate_llm_reply(
+                                    reply_tts=llm_reply.reply_tts,
+                                    fallback_reply=self._config.fallback_complex_text,
+                                    state=state_snapshot,
+                                    knowledge=knowledge,
+                                )
+                            except Exception as exc:
+                                self._log(f"llm fallback failed for {self._participant.identity}: {exc}")
+                                response_text = self._responses.choose(
+                                    intent,
+                                    last_agent_message=self._last_agent_message,
+                                )
+                        else:
                             response_text = self._responses.choose(
                                 intent,
                                 last_agent_message=self._last_agent_message,
                             )
                     else:
+                        await self._publish_status("simple_intent_detected")
                         response_text = self._responses.choose(
                             intent,
                             last_agent_message=self._last_agent_message,
                         )
-                else:
-                    await self._publish_status("simple_intent_detected")
-                    response_text = self._responses.choose(
-                        intent,
-                        last_agent_message=self._last_agent_message,
-                    )
 
             if self._is_stale_turn(turn_revision):
                 suppress_response = True
@@ -1660,8 +1728,13 @@ class ParticipantAudioSession:
                 return
 
             self._last_agent_message = response_text
+            self._dialogue_state.update_from_agent(
+                response_text,
+                llm_reply.next_step if llm_reply else "",
+            )
             self._history.append({"role": "assistant", "text": response_text})
             self._history = self._history[-12:]
+            self._needs_rescue_prompt = False
 
             await self._event_bus.publish_json(
                 {
