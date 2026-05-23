@@ -76,7 +76,41 @@ class ToolGraphRuntime:
         if not isinstance(known_facts, dict):
             known_facts = {}
 
-        scenario = str(state.get("scenario", "")).strip()
+        plan_name = str(state.get("plan_name", "")).strip() or str(known_facts.get("plan_name", "")).strip()
+        credit_closed = str(known_facts.get("credit_closed", "")).strip()
+        if str(known_facts.get("amount_needs_clarification", "")).strip() == "yes":
+            return self._fallback_question(
+                "clarify_amount_units",
+                "Подскажите, пожалуйста, речь про рубли, тысячи или миллионы?",
+            )
+
+        if plan_name == "refinance_or_returning_customer":
+            if not credit_closed:
+                return self._fallback_question(
+                    "refinance_credit_closed",
+                    "Подскажите, пожалуйста, текущий кредит уже закрыт или вы его ещё выплачиваете?",
+                )
+            if credit_closed == "no":
+                if not self._has_value(known_facts, "остаток_долга", "remaining_debt"):
+                    return self._fallback_question(
+                        "refinance_collect_current_credit",
+                        "Подскажите, пожалуйста, какой сейчас остаток долга по текущему кредиту?",
+                    )
+                if not self._has_value(known_facts, "вид_объекта", "object_type"):
+                    return self._slot_question("collect_object_type")
+                if not self._has_value(known_facts, "регион", "region"):
+                    return self._slot_question("collect_region")
+                if not self._has_value(known_facts, "обременение", "encumbrance", "collateral"):
+                    return self._slot_question("collect_encumbrance")
+                if not self._has_value(known_facts, "собственники", "owner", "owners"):
+                    return self._slot_question("collect_owner")
+                if not self._has_value(known_facts, "priority"):
+                    return self._fallback_question(
+                        "collect_priority",
+                        "Что для вас сейчас важнее: скорость получения денег или минимальная ставка?",
+                    )
+                return None
+
         if not self._has_value(known_facts, "нужная_сумма", "amount"):
             return self._slot_question("collect_amount")
         if not self._has_value(known_facts, "вид_объекта", "object_type"):
@@ -85,14 +119,13 @@ class ToolGraphRuntime:
             return self._slot_question("collect_region")
         if not self._has_value(known_facts, "обременение", "encumbrance", "collateral"):
             return self._slot_question("collect_encumbrance")
-        if scenario == "квалификация_рефинансирования":
-            if not self._has_value(known_facts, "остаток_долга", "remaining_debt"):
-                return self._fallback_question(
-                    "refinance_collect_current_credit",
-                    "Подскажите, пожалуйста, какой сейчас остаток долга по текущему кредиту?",
-                )
         if not self._has_value(known_facts, "собственники", "owner", "owners"):
             return self._slot_question("collect_owner")
+        if not self._has_value(known_facts, "priority"):
+            return self._fallback_question(
+                "collect_priority",
+                "Что для вас сейчас важнее: скорость получения денег или минимальная ставка?",
+            )
         return None
 
     def llm_context_for_text(self, text: str, state: dict[str, Any]) -> dict[str, Any]:
@@ -123,10 +156,15 @@ class ToolGraphRuntime:
             node_name = "pitch_short"
 
         node = self._nodes.get(node_name, {})
+        resume = self.question_for_state(state)
         return {
             "node_name": node_name,
             "node_type": str(node.get("type", "")),
             "goal": str(node.get("goal", "")),
+            "plan_name": str(state.get("plan_name", "")).strip(),
+            "next_required_field": str(state.get("next_required_field", "")).strip(),
+            "resume_node": resume[0] if resume else "",
+            "resume_question": resume[1] if resume else "",
             "rules": [str(item).strip() for item in node.get("rules", []) if str(item).strip()],
             "good_example": str(node.get("good_example", "")).strip(),
             "allowed_topics": [str(item).strip() for item in node.get("allowed_topics", []) if str(item).strip()],

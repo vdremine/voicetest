@@ -933,6 +933,27 @@ TTS:
             fallback_search_seed=normalized_text,
         ), latency_ms
 
+    async def warmup(self) -> None:
+        if not self.enabled:
+            return
+        client = self._ensure_client()
+        started_at = time.perf_counter()
+        try:
+            await client.chat.completions.create(
+                model=self._config.llm_model,
+                temperature=0.0,
+                max_tokens=24,
+                response_format=self._response_format(self._LLM_JSON_SCHEMA),
+                messages=[
+                    {"role": "system", "content": self._LOCAL_MANAGER_PROMPT},
+                    {"role": "user", "content": "Верни короткий валидный JSON для проверки готовности."},
+                ],
+            )
+            latency_ms = int((time.perf_counter() - started_at) * 1000)
+            self._log(f"llm warmup done latency_ms={latency_ms}")
+        except Exception as exc:
+            self._log(f"llm warmup skipped: {exc}")
+
 
 def sanitize_voice_response(text: str, *, fallback: str) -> str:
     value = text.strip()
@@ -1715,11 +1736,32 @@ class SimpleIntentRouter:
     def _looks_like_amount(text: str) -> bool:
         return bool(_AMOUNT_TOKEN_RE.search(text))
 
-    def route(self, text: str) -> IntentResult:
+    def route(self, text: str, *, current_node: str = "", stage: str = "") -> IntentResult:
         if not text:
             return IntentResult(Intent.CLARIFY.value, 0.0, False, Action.ASK_REPEAT.value)
 
-        if text in self._greeting or text.startswith(("привет", "здравствуйте", "добрый ", "алло", "ало")):
+        opening_nodes = {
+            "opening",
+            "check_convenience",
+            "small_talk",
+            "who_are_you",
+            "identity_company_faq",
+            "source_of_number_faq",
+            "robot_check",
+            "memory_denial_faq",
+            "callback_reentry",
+        }
+        is_opening_context = current_node in opening_nodes or stage == "greeting"
+        if text in {"але", "алло", "ало"}:
+            if is_opening_context:
+                return IntentResult(Intent.GREETING.value, 0.9, False, Action.ACK_GREETING.value)
+            return IntentResult(Intent.LINE_ISSUE.value, 0.88, False, Action.REPEAT_LAST_AGENT_MESSAGE.value)
+
+        if (
+            text in self._greeting
+            or text.startswith(("привет", "здравствуйте", "добрый ", "алло", "ало"))
+            or any(marker in text for marker in ("добрый день", "добрый вечер", "здравствуйте"))
+        ):
             return IntentResult(Intent.GREETING.value, 0.99, False, Action.ACK_GREETING.value)
         if (
             text in self._ready_to_talk
@@ -1727,7 +1769,11 @@ class SimpleIntentRouter:
             or ("слушаю" in text and any(token in text for token in ("да", "удобно", "говорите")))
         ):
             return IntentResult(Intent.READY_TO_TALK.value, 0.99, False, Action.CONTINUE_OPENING.value)
-        if text in self._identify or text.startswith(("это кто", "кто это", "кто вы", "представьтесь", "кто со мной")):
+        if (
+            text in self._identify
+            or text.startswith(("это кто", "кто это", "кто вы", "представьтесь", "кто со мной"))
+            or any(marker in text for marker in ("это кто", "кто звонит", "кто вы", "представьтесь"))
+        ):
             return IntentResult(Intent.IDENTIFY_SELF.value, 0.99, False, Action.INTRODUCE_SELF.value)
         if any(marker in text for marker in self._identity_mismatch_markers):
             return IntentResult(Intent.IDENTITY_MISMATCH.value, 0.95, False, Action.CLARIFY_IDENTITY.value)
@@ -2321,6 +2367,39 @@ class ParticipantAudioSession:
             return self._kb.question_for_field(next_field)
         return self._config.fallback_complex_text
 
+    def _state_guided_reply(self, intent: IntentResult) -> str:
+        next_question = self._state_fallback_reply()
+        known_facts = self._dialogue_state.known_facts
+        amount = self._dialogue_state.amount_text.strip()
+        goal = self._dialogue_state.goal.strip()
+        object_type = self._dialogue_state.object_type.strip()
+        region = self._dialogue_state.city.strip()
+
+        if str(known_facts.get("amount_needs_clarification", "")).strip() == "yes":
+            return next_question
+
+        if intent.intent == Intent.AMOUNT_PROVIDED.value and amount:
+            if not goal:
+                return f"Хмм, понял. Сумму {amount} вижу. С такой суммой, скорее всего, работаем. {next_question}"
+            if not object_type:
+                return (
+                    f"Хмм, понял. Сумму {amount} зафиксировал. "
+                    f"Под такую цель, скорее всего, посмотрим варианты. {next_question}"
+                )
+
+        if intent.intent in {Intent.SLOT_ANSWER.value, Intent.COMPLEX_REQUEST.value}:
+            if goal and not object_type:
+                return f"Понял, цель {goal}. {next_question}"
+            if object_type and not region:
+                return f"Понял, {object_type}. {next_question}"
+            if region and not self._dialogue_state.collateral:
+                return f"Понял, объект в {region}. {next_question}"
+            if self._dialogue_state.collateral and not str(known_facts.get('owners', '') or known_facts.get('owner', '')).strip():
+                collateral = self._dialogue_state.collateral.strip()
+                return f"Понял, по обременению отметил: {collateral}. {next_question}"
+
+        return next_question
+
     def _llm_bridge_text(self) -> str:
         name = self._dialogue_state.name.strip()
         if name:
@@ -2577,7 +2656,11 @@ class ParticipantAudioSession:
                 )
                 await self._publish_status("routing_intent")
                 decision_started_at = time.perf_counter()
-                intent = self._router.route(normalized_text)
+                intent = self._router.route(
+                    normalized_text,
+                    current_node=str(state_snapshot.get("current_node", "")).strip(),
+                    stage=str(state_snapshot.get("stage", "")).strip(),
+                )
                 if (
                     transcript.text
                     and transcript.confidence >= self._config.stt_confidence_floor
@@ -2625,14 +2708,14 @@ class ParticipantAudioSession:
                     and str(state_snapshot.get("current_node", "")).strip() in opening_nodes
                 ):
                     await self._publish_status("simple_intent_detected")
-                    response_text = self._state_fallback_reply()
+                    response_text = self._state_guided_reply(intent)
                     next_graph_node = self._dialogue_state.current_node
                 elif faq_answer:
                     await self._publish_status("simple_intent_detected")
                     response_text = faq_answer
                 elif self._should_advance_by_state(intent, updated_fields):
                     await self._publish_status("simple_intent_detected")
-                    response_text = self._state_fallback_reply()
+                    response_text = self._state_guided_reply(intent)
                     next_graph_node = self._dialogue_state.current_node
                 elif intent.use_llm:
                     await self._publish_status("complex_request_detected")
@@ -2697,7 +2780,7 @@ class ParticipantAudioSession:
                         next_graph_node = self._dialogue_state.current_node
                 else:
                     if intent.action == "ask_next_slot":
-                        response_text = self._state_fallback_reply()
+                        response_text = self._state_guided_reply(intent)
                         next_graph_node = self._dialogue_state.current_node
                     else:
                         await self._publish_status("simple_intent_detected")

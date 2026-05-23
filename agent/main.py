@@ -245,6 +245,8 @@ async def run() -> None:
         except NotImplementedError:
             pass
 
+    await llm_service.warmup()
+
     while True:
         try:
             token_payload = await fetch_token()

@@ -8,7 +8,7 @@ from .knowledge_base import KnowledgeBase
 
 
 _AMOUNT_RE = re.compile(
-    r"(?P<num>\d+(?:[\.,]\d+)?)\s*(?P<unit>млн|миллион|миллиона|миллионов|тыс|тысяч|тысячи)?",
+    r"(?P<num>\d+(?:[\.,]\d+)?)\s*(?P<unit>млн|миллион|миллиона|миллионов|тыс|тысяч|тысячи|руб|рубль|рубля|рублей)?",
     flags=re.IGNORECASE,
 )
 _CITY_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
@@ -30,6 +30,7 @@ class DialogueState:
     stage: str = "greeting"
     current_node: str = "opening"
     scenario: str = ""
+    plan_name: str = "new_loan"
     object_type: str = ""
     amount_text: str = ""
     goal: str = ""
@@ -67,6 +68,10 @@ class DialogueState:
             self.amount_text = amount
             self.known_facts["amount"] = amount
             self.known_facts["нужная_сумма"] = amount
+            if self._amount_needs_clarification(amount):
+                self.known_facts["amount_needs_clarification"] = "yes"
+            else:
+                self.known_facts.pop("amount_needs_clarification", None)
 
         goal = self._detect_goal(lowered)
         if goal:
@@ -112,6 +117,29 @@ class DialogueState:
         if any(marker in lowered for marker in ("жалоб", "грубо", "нехорош", "запись разговора")):
             self.complaint_active = True
 
+        credit_closed = self._detect_credit_closed(lowered)
+        if credit_closed:
+            updated_fields.add("credit_closed")
+            self.known_facts["credit_closed"] = credit_closed
+
+        owner = self._detect_owner(lowered)
+        if owner:
+            updated_fields.add("собственники")
+            self.known_facts["owner"] = owner
+            self.known_facts["owners"] = owner
+            self.known_facts["собственники"] = owner
+
+        priority = self._detect_priority(lowered)
+        if priority:
+            updated_fields.add("priority")
+            self.known_facts["priority"] = priority
+
+        remaining_debt = self._detect_remaining_debt(text)
+        if remaining_debt:
+            updated_fields.add("остаток_долга")
+            self.known_facts["remaining_debt"] = remaining_debt
+            self.known_facts["остаток_долга"] = remaining_debt
+
         if kb is not None:
             self.object_type = self._detect_object_type(lowered)
             if self.object_type:
@@ -122,9 +150,12 @@ class DialogueState:
                 updated_fields.add("сценарий")
                 self.known_facts["сценарий"] = self.scenario
 
+        self.plan_name = self._resolve_plan_name(lowered)
+        self.known_facts["plan_name"] = self.plan_name
+
         self._advance_stage()
         if kb is not None:
-            self.next_required_field = kb.next_required_field(self.snapshot())
+            self.next_required_field = self._resolve_next_required_field(kb)
         return updated_fields
 
     def update_from_agent(
@@ -141,7 +172,7 @@ class DialogueState:
         self.awaiting_field = self._detect_awaiting_field(reply_tts, next_step)
         self._advance_stage()
         if kb is not None:
-            self.next_required_field = kb.next_required_field(self.snapshot())
+            self.next_required_field = self._resolve_next_required_field(kb)
 
     def snapshot(self) -> dict[str, Any]:
         summary_parts: list[str] = []
@@ -169,6 +200,7 @@ class DialogueState:
             "stage": self.stage,
             "current_node": self.current_node,
             "scenario": self.scenario,
+            "plan_name": self.plan_name,
             "object_type": self.object_type,
             "awaiting_field": self.awaiting_field,
             "next_required_field": self.next_required_field,
@@ -193,6 +225,23 @@ class DialogueState:
         return best
 
     @staticmethod
+    def _amount_needs_clarification(amount_text: str) -> bool:
+        parts = amount_text.lower().split()
+        if not parts:
+            return False
+        raw_num = parts[0].replace(",", ".")
+        try:
+            value = float(raw_num)
+        except Exception:
+            return False
+        unit = parts[1] if len(parts) > 1 else ""
+        if unit.startswith("руб") and value < 1000:
+            return True
+        if not unit and value < 1000:
+            return True
+        return False
+
+    @staticmethod
     def _detect_goal(text: str) -> str:
         if "машин" in text or "автомоб" in text:
             return "покупка автомобиля"
@@ -204,6 +253,14 @@ class DialogueState:
             return "оплата или отсрочка"
         if "недвижим" in text:
             return "кредит под залог недвижимости"
+        return ""
+
+    @staticmethod
+    def _detect_credit_closed(text: str) -> str:
+        if any(marker in text for marker in ("не закрыт", "не погашен", "еще плачу", "ещё плачу")):
+            return "no"
+        if any(marker in text for marker in ("закрыт", "погашен", "уже выплатил", "уже выплатили")):
+            return "yes"
         return ""
 
     @staticmethod
@@ -222,6 +279,33 @@ class DialogueState:
             return "официальная работа"
         if "неофициаль" in text or "официально не" in text:
             return "неофициальная работа"
+        return ""
+
+    @staticmethod
+    def _detect_owner(text: str) -> str:
+        if any(marker in text for marker in ("я один", "только я", "один собственник", "собственник я")):
+            return "single_owner"
+        if any(marker in text for marker in ("жена и я", "мы с женой", "я и жена", "несколько собственников", "я и дочь", "я и сын")):
+            return "multiple_owners"
+        return ""
+
+    @staticmethod
+    def _detect_priority(text: str) -> str:
+        if "скорост" in text or "быстро" in text or "срочно" in text:
+            return "speed"
+        if "ставк" in text or "минимальн" in text or "подешевле" in text:
+            return "rate"
+        return ""
+
+    @staticmethod
+    def _detect_remaining_debt(text: str) -> str:
+        for match in _AMOUNT_RE.finditer(text):
+            num = match.group("num")
+            unit = (match.group("unit") or "").lower()
+            if not num:
+                continue
+            if unit:
+                return f"{num} {unit}"
         return ""
 
     def _detect_city(self, text: str) -> str:
@@ -290,6 +374,42 @@ class DialogueState:
             return "квалификация_недвижимости"
         return self.scenario
 
+    def _resolve_plan_name(self, text: str) -> str:
+        if self.known_facts.get("credit_closed") == "no":
+            return "refinance_or_returning_customer"
+        if any(marker in text for marker in ("рефинанс", "остаток долга", "текущий кредит", "ипотек")):
+            return "refinance_or_returning_customer"
+        return "new_loan"
+
+    def _resolve_next_required_field(self, kb: KnowledgeBase | None) -> str:
+        if self.plan_name == "refinance_or_returning_customer":
+            credit_closed = str(self.known_facts.get("credit_closed", "")).strip()
+            if not credit_closed:
+                return "credit_closed"
+            if credit_closed == "no":
+                refinance_sequence = (
+                    "остаток_долга",
+                    "вид_объекта",
+                    "регион",
+                    "обременение",
+                    "собственники",
+                    "priority",
+                )
+                for field in refinance_sequence:
+                    if not str(self.known_facts.get(_field_alias(field), "")).strip() and not str(self.known_facts.get(field, "")).strip():
+                        return field
+                return ""
+
+        if kb is not None:
+            fallback = kb.next_required_field(self.snapshot())
+            if fallback:
+                return fallback
+
+        for field in ("нужная_сумма", "вид_объекта", "регион", "обременение", "собственники", "priority"):
+            if not str(self.known_facts.get(_field_alias(field), "")).strip() and not str(self.known_facts.get(field, "")).strip():
+                return field
+        return ""
+
     def _advance_stage(self) -> None:
         if self.complaint_active:
             self.stage = "objection_handling"
@@ -302,3 +422,15 @@ class DialogueState:
             return
         if self.last_user_text:
             self.stage = "need_detection"
+
+
+def _field_alias(field: str) -> str:
+    aliases = {
+        "нужная_сумма": "amount",
+        "вид_объекта": "object_type",
+        "регион": "region",
+        "обременение": "collateral",
+        "собственники": "owners",
+        "остаток_долга": "remaining_debt",
+    }
+    return aliases.get(field, field)

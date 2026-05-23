@@ -206,36 +206,21 @@ class KnowledgeBase:
             if text:
                 truth_rules.append(text)
 
-        train_path = data_dir / "train_yandex_v2.jsonl"
-        if train_path.is_file():
-            example_index = 0
-            for raw_line in train_path.read_text(encoding="utf-8").splitlines():
-                line = raw_line.strip()
-                if not line:
-                    continue
-                try:
-                    payload = json.loads(line)
-                except Exception:
-                    continue
-                items = payload.get("сообщения", [])
-                messages: list[dict[str, str]] = []
-                for item in items:
-                    role_map = {"система": "system", "пользователь": "user", "помощник": "assistant"}
-                    role = role_map.get(str(item.get("роль", "")).strip().lower())
-                    text = str(item.get("текст", "")).strip()
-                    if role and text:
-                        messages.append({"role": role, "content": text})
-                if messages:
-                    example_index += 1
-                    examples.append(TrainingExample(messages=messages))
-                    joined = " ".join(f"{msg['role']}: {msg['content']}" for msg in messages)
-                    snippets.append(
-                        KnowledgeSnippet(
-                            key=f"train_example:{example_index}",
-                            text=joined,
-                            keywords=tuple(_keywords_from_text(joined)[:36]),
-                        )
-                    )
+        example_index = 0
+        for example_messages in _iter_training_examples(
+            data_dir / "train_yandex_v2.jsonl",
+            data_dir.parent / "voice_agent_graph_v0_1" / "examples.jsonl",
+        ):
+            example_index += 1
+            examples.append(TrainingExample(messages=example_messages))
+            joined = " ".join(f"{msg['role']}: {msg['content']}" for msg in example_messages)
+            snippets.append(
+                KnowledgeSnippet(
+                    key=f"train_example:{example_index}",
+                    text=joined,
+                    keywords=tuple(_keywords_from_text(joined)[:36]),
+                )
+            )
 
         return cls(
             snippets=snippets,
@@ -380,14 +365,29 @@ class KnowledgeBase:
         }
         return prompts.get(field, "Подскажите, пожалуйста, уточняющую деталь по вашему запросу.")
 
-    def relevant_examples(self, query: str, *, limit: int = 2) -> list[list[dict[str, str]]]:
+    def relevant_examples(self, query: str, *, limit: int = 4) -> list[list[dict[str, str]]]:
         lowered = _normalize_text(query)
         query_tokens = set(_keywords_from_text(lowered))
         ranked: list[tuple[int, list[dict[str, str]]]] = []
         for example in self._examples:
             text = _normalize_text(" ".join(item["content"] for item in example.messages))
             score = 0
-            for token in ("рефинанс", "плохая", "доли", "материн", "отмените", "не звоните", "таунхаус"):
+            for token in (
+                "рефинанс",
+                "плохая",
+                "доли",
+                "материн",
+                "отмените",
+                "не звоните",
+                "таунхаус",
+                "кто звонит",
+                "что за компания",
+                "вы робот",
+                "откуда у вас",
+                "не помню",
+                "комисси",
+                "перезвоните",
+            ):
                 if token in lowered and token in text:
                     score += 2
             for word in query_tokens:
@@ -414,6 +414,43 @@ def _load_json(path: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def _iter_training_examples(*paths: Path) -> list[list[dict[str, str]]]:
+    collected: list[list[dict[str, str]]] = []
+    for path in paths:
+        if not path.is_file():
+            continue
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except Exception:
+                continue
+
+            messages: list[dict[str, str]] = []
+            items = payload.get("сообщения", [])
+            if isinstance(items, list) and items:
+                role_map = {"система": "system", "пользователь": "user", "помощник": "assistant"}
+                for item in items:
+                    role = role_map.get(str(item.get("роль", "")).strip().lower())
+                    text = str(item.get("текст", "")).strip()
+                    if role and text:
+                        messages.append({"role": role, "content": text})
+
+            turns = payload.get("turns", [])
+            if not messages and isinstance(turns, list) and turns:
+                for item in turns:
+                    role = str(item.get("role", "")).strip().lower()
+                    text = str(item.get("text", "")).strip()
+                    if role in {"user", "assistant", "system"} and text:
+                        messages.append({"role": role, "content": text})
+
+            if messages:
+                collected.append(messages)
+    return collected
 
 
 def _keywords_from_text(text: str) -> list[str]:
