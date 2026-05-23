@@ -11,9 +11,9 @@ from voice_loop import (
     AgentEventBus,
     LiveKitAudioPublisher,
     OpenAiLlmService,
-    SileroTtsService,
     VoicePipelineConfig,
     VoiceSessionManager,
+    build_tts_service,
 )
 
 
@@ -117,7 +117,7 @@ async def run() -> None:
     pipeline_config = VoicePipelineConfig.from_env()
     event_bus = AgentEventBus(room, topic=pipeline_config.events_topic, log=log)
     llm_service = OpenAiLlmService(pipeline_config, log)
-    tts_service = SileroTtsService(pipeline_config, log)
+    tts_service = build_tts_service(pipeline_config, log)
     audio_publisher = LiveKitAudioPublisher(room, pipeline_config, log)
     voice_sessions = VoiceSessionManager(
         room=room,
