@@ -1,22 +1,6 @@
 services:
-  caddy:
-    image: caddy:2.9-alpine
-    profiles: ["edge"]
-    restart: unless-stopped
-    depends_on:
-      - frontend
-      - livekit
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile.prod:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-
   livekit:
     image: livekit/livekit-server:latest
-    restart: unless-stopped
     command:
       - --dev
       - --bind
@@ -24,6 +8,7 @@ services:
     ports:
       - "7880:7880/tcp"
       - "7881:7881/tcp"
+    restart: unless-stopped
 
   token_server:
     build:
@@ -33,9 +18,9 @@ services:
       - livekit
     command: uvicorn main:app --host 0.0.0.0 --port 8000
     environment:
-      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-voice-agent-prod}
-      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-replace-with-long-random-secret}
-      LIVEKIT_URL_PUBLIC: ${LIVEKIT_URL_PUBLIC:-wss://livekit.vdremin.ru}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secret}
+      LIVEKIT_URL_PUBLIC: ${LIVEKIT_URL_PUBLIC:-ws://127.0.0.1:7880}
       TOKEN_TTL_MINUTES: ${TOKEN_TTL_MINUTES:-60}
       CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-*}
 
@@ -45,18 +30,49 @@ services:
     depends_on:
       - token_server
     ports:
-      - "8080:8080"
+      - "8080:8080/tcp"
     volumes:
       - ./frontend/index.html:/usr/share/nginx/html/index.html:ro
       - ./frontend/nginx.prod.conf:/etc/nginx/nginx.conf:ro
+
+  llm:
+    image: vllm/vllm-openai:latest
+    restart: unless-stopped
+    gpus: all
+    ipc: host
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+    command:
+      - --model
+      - ${LLM_MODEL:-Qwen/Qwen3-8B}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8001"
+      - --api-key
+      - ${LLM_API_KEY:-local-token}
+      - --dtype
+      - auto
+      - --gpu-memory-utilization
+      - ${LLM_GPU_MEMORY_UTILIZATION:-0.55}
+      - --max-model-len
+      - ${LLM_MAX_MODEL_LEN:-3072}
+      - --max-num-seqs
+      - ${LLM_MAX_NUM_SEQS:-2}
+      - --enforce-eager
+    volumes:
+      - ${MODEL_CACHE_DIR:-/opt/models}/huggingface:/root/.cache/huggingface
 
   agent:
     build:
       context: ./agent
     restart: unless-stopped
+    gpus: all
     depends_on:
       - livekit
       - token_server
+      - llm
     environment:
       TOKEN_SERVER_URL: http://token_server:8000/token
       LIVEKIT_URL_INTERNAL: ws://livekit:7880
@@ -80,7 +96,7 @@ services:
       TORCH_NUM_THREADS: ${TORCH_NUM_THREADS:-1}
       STT_ENABLED: ${STT_ENABLED:-true}
       STT_MODEL: ${STT_MODEL:-Systran/faster-whisper-medium}
-      STT_DEVICE: ${STT_DEVICE:-auto}
+      STT_DEVICE: ${STT_DEVICE:-cuda}
       STT_COMPUTE_TYPE_CPU: ${STT_COMPUTE_TYPE_CPU:-int8}
       STT_COMPUTE_TYPE_GPU: ${STT_COMPUTE_TYPE_GPU:-float16}
       STT_LANGUAGE: ${STT_LANGUAGE:-ru}
@@ -88,14 +104,14 @@ services:
       STT_CONFIDENCE_FLOOR: ${STT_CONFIDENCE_FLOOR:-0.25}
       DEBUG_SAVE_WAV: ${DEBUG_SAVE_WAV:-false}
       LLM_ENABLED: ${LLM_ENABLED:-true}
-      LLM_PROVIDER: ${LLM_PROVIDER:-}
-      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      LLM_MODEL: ${LLM_MODEL:-Qwen/Qwen3-8B}
       LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-low}
-      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-15}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-20}
       LLM_BASE_URL: ${LLM_BASE_URL:-http://llm:8001/v1}
       LLM_API_KEY: ${LLM_API_KEY:-local-token}
       LLM_PROJECT: ${LLM_PROJECT:-}
-      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.2}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.15}
       LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-96}
       ADAPTIVE_CLASSIFIER_ENABLED: ${ADAPTIVE_CLASSIFIER_ENABLED:-false}
       TTS_ENABLED: ${TTS_ENABLED:-true}
@@ -113,7 +129,7 @@ services:
       BARGE_IN_ENABLED: ${BARGE_IN_ENABLED:-false}
       VOICE_FILLERS_ENABLED: ${VOICE_FILLERS_ENABLED:-false}
       VOICE_FILLERS_LEVEL: ${VOICE_FILLERS_LEVEL:-light}
-      VOICE_FILLERS_PROBABILITY: ${VOICE_FILLERS_PROBABILITY:-0.35}
+      VOICE_FILLERS_PROBABILITY: ${VOICE_FILLERS_PROBABILITY:-0.25}
       VOICE_BRIDGE_ON_LLM: ${VOICE_BRIDGE_ON_LLM:-false}
       AGENT_DATA_DIR: /app/data
       UTTERANCE_DIR: /tmp/voice-agent/utterances
@@ -124,7 +140,3 @@ services:
       - ${MODEL_CACHE_DIR:-/opt/models}:/models
       - ${VOICE_AGENT_DATA_DIR:-/opt/voice-agent-data}:/tmp/voice-agent
       - ./data:/app/data:ro
-
-volumes:
-  caddy_data:
-  caddy_config:

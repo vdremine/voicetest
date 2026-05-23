@@ -5,6 +5,7 @@ services:
       STT_DEVICE: cuda
       STT_MODEL: ${STT_MODEL:-Systran/faster-whisper-medium}
       STT_COMPUTE_TYPE_GPU: ${STT_COMPUTE_TYPE_GPU:-float16}
+      TTS_DEVICE: ${TTS_DEVICE:-cuda}
       STT_BEAM_SIZE: ${STT_BEAM_SIZE:-3}
       STT_CONFIDENCE_FLOOR: ${STT_CONFIDENCE_FLOOR:-0.25}
       DEBUG_SAVE_WAV: ${DEBUG_SAVE_WAV:-false}

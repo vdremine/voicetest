@@ -20,9 +20,12 @@ services:
       - --dtype
       - auto
       - --gpu-memory-utilization
-      - ${LLM_GPU_MEMORY_UTILIZATION:-0.9}
+      - ${LLM_GPU_MEMORY_UTILIZATION:-0.55}
       - --max-model-len
-      - ${LLM_MAX_MODEL_LEN:-32768}
+      - ${LLM_MAX_MODEL_LEN:-3072}
+      - --max-num-seqs
+      - ${LLM_MAX_NUM_SEQS:-2}
+      - --enforce-eager
     volumes:
       - ${MODEL_CACHE_DIR:-/opt/models}/huggingface:/root/.cache/huggingface
 
