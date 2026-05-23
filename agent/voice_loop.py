@@ -79,6 +79,7 @@ class VoicePipelineConfig:
     llm_temperature: float
     llm_max_tokens: int
     adaptive_classifier_enabled: bool
+    llm_orchestrates_all: bool
     tts_enabled: bool
     tts_model_path: Path
     tts_model_url: str
@@ -161,6 +162,7 @@ class VoicePipelineConfig:
             llm_temperature=float(os.getenv("LLM_TEMPERATURE", "0.2")),
             llm_max_tokens=int(os.getenv("LLM_MAX_TOKENS", "96")),
             adaptive_classifier_enabled=env_bool("ADAPTIVE_CLASSIFIER_ENABLED", False),
+            llm_orchestrates_all=env_bool("LLM_ORCHESTRATES_ALL", True),
             tts_enabled=env_bool("TTS_ENABLED", True),
             tts_model_path=Path(os.getenv("TTS_MODEL_PATH", "/models/silero-tts/ru/v5_4_ru.pt")),
             tts_model_url=os.getenv(
@@ -615,6 +617,8 @@ action используй только из списка:
 - выявить потребность клиента;
 - подобрать подходящий продукт;
 - продвинуть разговор на один шаг вперёд.
+- самостоятельно оркестрировать разговор на каждом ходе, опираясь на историю и состояние диалога;
+- корректно трактовать короткие ответы в контексте последнего вопроса, например: "да", "нет", "Москва", "в Москве", "квартира", "не сегодня".
 
 Стиль:
 - говори коротко, живо, уверенно;
@@ -639,6 +643,7 @@ action используй только из списка:
 - если клиент отвечает общо, сам переводи разговор в конкретику;
 - если клиент говорит коротко, продолжай разговор сам;
 - если клиент возражает, коротко сними напряжение и веди дальше.
+- если клиент ответил коротко, но по делу, не проси повторить тот же вопрос, а используй этот ответ как следующий слот разговора;
 - если клиент спрашивает "это кто", сразу коротко представься и напомни причину звонка;
 - если клиент жалуется на грубый прошлый разговор, коротко извинись, признай проблему и верни разговор к практическому решению;
 - если клиент исправил имя, один раз извинись и дальше используй только правильное имя;
@@ -651,6 +656,7 @@ action используй только из списка:
 - если клиент говорит, что его с кем-то перепутали, не спорь и не дави; уточни, как к нему обращаться, и актуален ли вопрос по кредиту вообще;
 - если клиент хочет взять деньги на покупку автомобиля, не предлагай залог ПТС, если у него ещё нет автомобиля;
 - если клиент сказал, что работает официально, а до этого распознавание ошиблось, коротко прими исправление и опирайся на новую информацию.
+- если клиент грубит, посылает или явно требует прекратить разговор, не возвращайся к квалификации и спокойно заверши разговор.
 
 Что нужно выяснить:
 - какая сумма нужна;
@@ -2361,6 +2367,31 @@ class ParticipantAudioSession:
             return True
         return False
 
+    def _should_use_llm_orchestrator(
+        self,
+        *,
+        transcript: TranscriptResult,
+        normalized_text: str,
+        rescue_only: bool,
+    ) -> bool:
+        return (
+            self._config.llm_orchestrates_all
+            and self._llm_service.enabled
+            and not rescue_only
+            and bool(transcript.text.strip())
+            and bool(normalized_text.strip())
+            and transcript.confidence >= self._config.stt_confidence_floor
+        )
+
+    @staticmethod
+    def _llm_orchestrator_intent() -> IntentResult:
+        return IntentResult(
+            Intent.COMPLEX_REQUEST.value,
+            1.0,
+            True,
+            Action.CALL_LLM.value,
+        )
+
     @staticmethod
     def _skip_confidence_gate_for(intent: IntentResult) -> bool:
         return intent.intent in {
@@ -2498,7 +2529,6 @@ class ParticipantAudioSession:
                 return
 
             if not rescue_only:
-                faq_answer = self._kb.match_faq(normalized_text)
                 if transcript.text:
                     updated_fields = self._dialogue_state.update_from_user(
                         transcript.text,
@@ -2518,25 +2548,34 @@ class ParticipantAudioSession:
                 )
                 await self._publish_status("routing_intent")
                 decision_started_at = time.perf_counter()
-                intent = self._router.route(normalized_text)
-                if (
-                    transcript.text
-                    and transcript.confidence >= self._config.stt_confidence_floor
-                    and not faq_answer
-                    and self._should_use_adaptive_classifier(intent, normalized_text)
-                ):
-                    try:
-                        intent, classifier_latency_ms = await self._llm_service.classify_intent(
-                            normalized_text=normalized_text,
-                            history=self._history,
-                            dialogue_state=state_snapshot,
-                            initial_intent=intent,
-                        )
-                    except Exception as exc:
-                        self._log(
-                            f"adaptive classifier fallback for {self._participant.identity}: {exc}"
-                        )
-                if decision_started_at > 0:
+                use_llm_orchestrator = self._should_use_llm_orchestrator(
+                    transcript=transcript,
+                    normalized_text=normalized_text,
+                    rescue_only=rescue_only,
+                )
+                if use_llm_orchestrator:
+                    intent = self._llm_orchestrator_intent()
+                else:
+                    faq_answer = self._kb.match_faq(normalized_text)
+                    intent = self._router.route(normalized_text)
+                    if (
+                        transcript.text
+                        and transcript.confidence >= self._config.stt_confidence_floor
+                        and not faq_answer
+                        and self._should_use_adaptive_classifier(intent, normalized_text)
+                    ):
+                        try:
+                            intent, classifier_latency_ms = await self._llm_service.classify_intent(
+                                normalized_text=normalized_text,
+                                history=self._history,
+                                dialogue_state=state_snapshot,
+                                initial_intent=intent,
+                            )
+                        except Exception as exc:
+                            self._log(
+                                f"adaptive classifier fallback for {self._participant.identity}: {exc}"
+                            )
+                if decision_started_at > 0 and not use_llm_orchestrator:
                     decision_latency_ms = int((time.perf_counter() - decision_started_at) * 1000)
                     router_latency_ms = max(0, decision_latency_ms - classifier_latency_ms)
                 intent_ready_time_ms = int(time.time() * 1000)
@@ -2561,6 +2600,66 @@ class ParticipantAudioSession:
                     and not self._skip_confidence_gate_for(intent)
                 ):
                     response_text = self._config.fallback_low_confidence_text
+                elif use_llm_orchestrator:
+                    await self._publish_status("complex_request_detected")
+                    try:
+                        state_snapshot = self._dialogue_state.snapshot()
+                        knowledge = self._kb.retrieve(normalized_text, state_snapshot)
+                        examples = self._kb.relevant_examples(normalized_text)
+                        llm_task = asyncio.create_task(
+                            self._llm_service.generate_response(
+                                normalized_text=normalized_text,
+                                history=self._history,
+                                dialogue_state=state_snapshot,
+                                knowledge=knowledge,
+                                truth_rules=self._kb.truth_rules,
+                                examples=examples,
+                            )
+                        )
+                        if self._config.voice_bridge_on_llm and self._config.tts_enabled:
+                            bridge_text = self._llm_bridge_text()
+                            if bridge_text and not self._is_stale_turn(turn_revision):
+                                self._log(
+                                    f"llm bridge start participant={self._participant.identity} "
+                                    f"utterance_id={utterance_id} text={bridge_text!r}"
+                                )
+                                await self._publish_status("speaking")
+                                self._is_speaking = True
+                                try:
+                                    _, _, _, _, _, _, _ = await self._speak_response(
+                                        utterance_id=f"{utterance_id}-bridge",
+                                        response_text=bridge_text,
+                                        intent_value=Intent.COMPLEX_REQUEST.value,
+                                    )
+                                finally:
+                                    self._is_speaking = False
+                                self._log(
+                                    f"llm bridge done participant={self._participant.identity} "
+                                    f"utterance_id={utterance_id}"
+                                )
+                                await self._publish_status("complex_request_detected")
+                        llm_reply, llm_latency_ms = await llm_task
+                        self._log(
+                            f"llm raw reply participant={self._participant.identity} "
+                            f"utterance_id={utterance_id} raw_text={llm_reply.raw_text!r} "
+                            f"reply_tts={llm_reply.reply_tts!r} intent={llm_reply.intent!r} "
+                            f"next_step={llm_reply.next_step!r}"
+                        )
+                        response_text, llm_validation_reason = inspect_llm_reply(
+                            reply_tts=llm_reply.reply_tts,
+                            fallback_reply=self._state_fallback_reply(),
+                            state=state_snapshot,
+                            knowledge=knowledge,
+                            truth_rules=self._kb.truth_rules,
+                        )
+                        self._log(
+                            f"llm validated reply participant={self._participant.identity} "
+                            f"utterance_id={utterance_id} reason={llm_validation_reason} "
+                            f"result={response_text!r}"
+                        )
+                    except Exception as exc:
+                        self._log(f"llm fallback failed for {self._participant.identity}: {exc}")
+                        response_text = self._state_fallback_reply()
                 elif faq_answer and not intent.use_llm:
                     await self._publish_status("simple_intent_detected")
                     response_text = faq_answer
