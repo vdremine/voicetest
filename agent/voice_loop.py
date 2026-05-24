@@ -47,7 +47,8 @@ def env_nonempty(name: str, default: str = "") -> str:
 
 
 _AMOUNT_TOKEN_RE = re.compile(
-    r"\b\d+(?:[\.,]\d+)?\s*(?:млн|миллион|миллиона|миллионов|тыс|тысяч|тысячи)?\b",
+    r"\b(?:\d+(?:[\.,]\d+)?|один|одна|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять|полтора)\s*"
+    r"(?:млн|миллион|миллиона|миллионов|тыс|тысяч|тысячи|руб|рубль|рубля|рублей)?\b",
     flags=re.IGNORECASE,
 )
 
@@ -737,6 +738,22 @@ TTS:
 - обязательно помогай с произношением: Влад+имир;
 - если нужно, размечай суммы, проценты, сроки, сложные названия и слово зал+ог."""
 
+    _LOCAL_RENDER_PROMPT = """Ты — голосовой менеджер по кредиту. Верни только JSON.
+Твоя роль не выбирать сценарий, а коротко сформулировать реплику внутри уже выбранного runtime-шага.
+Не меняй следующий слот самостоятельно. Не начинай звонок заново.
+Сначала ответь по сути, если клиент задал вопрос или возник конфликт. Потом мягко вернись к текущему шагу.
+reply_tts: короткая фраза для озвучки, 1-2 предложения максимум.
+next_step: короткий следующий шаг менеджера.
+Без текста вне JSON."""
+
+    _LOCAL_REPAIR_PROMPT = """Ты — быстрый repair-слой голосового агента. Верни только JSON.
+Задача: увидеть, что диалог застрял или ответ клиента уже был дан, коротко признать это и продолжить.
+Нельзя повторять тот же вопрос теми же словами.
+Нельзя начинать сценарий заново.
+reply_tts: максимум 1-2 коротких предложения для озвучки.
+next_step: короткий следующий шаг менеджера.
+Без текста вне JSON."""
+
     def __init__(self, config: VoicePipelineConfig, log: Callable[[str], None]) -> None:
         self._config = config
         self._log = log
@@ -903,10 +920,16 @@ TTS:
 
         client = self._ensure_client()
         started_at = time.perf_counter()
+        prompt_text = self._LOCAL_MANAGER_PROMPT
+        if graph_context:
+            if graph_context.get("mode") == "adaptive_repair" or graph_context.get("stalled_slot_recovery"):
+                prompt_text = self._LOCAL_REPAIR_PROMPT
+            else:
+                prompt_text = self._LOCAL_RENDER_PROMPT
         messages: list[dict[str, str]] = [
             {
                 "role": "system",
-                "content": self._LOCAL_MANAGER_PROMPT,
+                "content": prompt_text,
             },
             {
                 "role": "system",
@@ -3184,7 +3207,7 @@ class ParticipantAudioSession:
                 await self._publish_status("complex_request_detected")
 
                 state_snapshot = self._dialogue_state.snapshot()
-                knowledge = self._kb.retrieve(normalized_text, state_snapshot)
+                knowledge = self._kb.retrieve(normalized_text, state_snapshot, limit=2)
                 examples = self._kb.relevant_examples(normalized_text)[:2]
 
                 graph_context = (
@@ -3198,7 +3221,7 @@ class ParticipantAudioSession:
 
                 llm_reply, llm_latency_ms = await self._llm_service.generate_response(
                     normalized_text=normalized_text,
-                    history=self._history[-6:],
+                    history=self._history[-4:],
                     dialogue_state=state_snapshot,
                     knowledge=knowledge,
                     truth_rules=self._kb.truth_rules,

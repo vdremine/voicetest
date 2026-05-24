@@ -11,6 +11,26 @@ _AMOUNT_RE = re.compile(
     r"(?P<num>\d+(?:[\.,]\d+)?)\s*(?P<unit>млн|миллион|миллиона|миллионов|тыс|тысяч|тысячи|руб|рубль|рубля|рублей)?",
     flags=re.IGNORECASE,
 )
+_VERBAL_AMOUNT_RE = re.compile(
+    r"\b(?P<num>один|одна|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять|полтора)\s+"
+    r"(?P<unit>млн|миллион|миллиона|миллионов|тыс|тысяч|тысячи|руб|рубль|рубля|рублей)\b",
+    flags=re.IGNORECASE,
+)
+_VERBAL_NUM_MAP = {
+    "один": "1",
+    "одна": "1",
+    "два": "2",
+    "две": "2",
+    "три": "3",
+    "четыре": "4",
+    "пять": "5",
+    "шесть": "6",
+    "семь": "7",
+    "восемь": "8",
+    "девять": "9",
+    "десять": "10",
+    "полтора": "1.5",
+}
 _CITY_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bмоскв(?:а|е|ы|у|ой)?\b", flags=re.IGNORECASE), "Москва"),
     (
@@ -290,6 +310,15 @@ class DialogueState:
                 best = f"{num} {unit}"
             elif float(num.replace(",", ".")) >= 10000:
                 best = num
+        if best:
+            return best
+        verbal = _VERBAL_AMOUNT_RE.search(text)
+        if verbal:
+            raw_num = verbal.group("num").lower()
+            unit = (verbal.group("unit") or "").lower()
+            mapped = _VERBAL_NUM_MAP.get(raw_num, "")
+            if mapped and unit:
+                return f"{mapped} {unit}"
         return best
 
     @staticmethod
@@ -491,11 +520,6 @@ class DialogueState:
                     if not str(self.known_facts.get(_field_alias(field), "")).strip() and not str(self.known_facts.get(field, "")).strip():
                         return field
                 return ""
-
-        if kb is not None:
-            fallback = kb.next_required_field(self.snapshot())
-            if fallback:
-                return fallback
 
         for field in ("нужная_сумма", "вид_объекта", "регион", "обременение", "собственники", "priority"):
             if not str(self.known_facts.get(_field_alias(field), "")).strip() and not str(self.known_facts.get(field, "")).strip():
