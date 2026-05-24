@@ -1469,12 +1469,7 @@ class TtsMarkupService:
     @staticmethod
     def _split_for_speech(text: str) -> str:
         value = re.sub(r"\s+", " ", text).strip()
-        value = value.replace(" — ", ". ")
-        value = value.replace("? ", "? ... ")
-        value = value.replace("! ", "! ... ")
-        value = re.sub(r"(?<!\.)\.\s+(?=[А-ЯA-Z])", ". ... ", value)
-        value = re.sub(r"(?:\.\s*\.\.\.\s*){2,}", ". ... ", value)
-        return value
+        return value.replace(" — ", ". ")
 
 
 class VoiceStyleAdapter:
@@ -1637,18 +1632,6 @@ class SalesSpeechStyler:
         return self._light_prefix(value, intent=intent, stage=stage)
 
     def speech_rate(self, *, situation: str, intent: str) -> float:
-        if situation == SpeechSituation.REPAIR.value:
-            return 0.97
-        if situation == SpeechSituation.OBJECTION.value:
-            return 0.96
-        if situation == SpeechSituation.THINKING.value:
-            return 0.99
-        if situation == SpeechSituation.SLOT_BRIDGE.value:
-            return 1.02 if intent == Intent.AMOUNT_PROVIDED.value else 1.01
-        if situation == SpeechSituation.HANDOFF.value:
-            return 1.01
-        if situation == SpeechSituation.OPENING.value:
-            return 0.99
         return 1.0
 
     def _choose(self, variants: list[str]) -> str:
@@ -1710,7 +1693,7 @@ class SalesSpeechStyler:
             return f"Да, понял вас. Переформулирую проще. {text}"
         if "not_actual" in repair_reason:
             return f"Понял, не буду давить. {text}"
-        return f"Так, понял. {text}"
+        return text
 
     def _style_objection(self, text: str) -> str:
         prefix = self._choose(
@@ -1725,10 +1708,8 @@ class SalesSpeechStyler:
     def _style_thinking(self, text: str) -> str:
         prefix = self._choose(
             [
-                "Так, секунду.",
                 "Сейчас сориентирую.",
-                "Угу, смотрю по ситуации.",
-                "Нуу, смотрите.",
+                "Смотрите.",
             ]
         )
         return f"{prefix} {text}".strip() if prefix else text
@@ -1791,19 +1772,7 @@ class SileroTtsService:
 
     @staticmethod
     def _apply_speed(pcm16: np.ndarray, *, sample_rate: int, speed: float) -> np.ndarray:
-        if len(pcm16) == 0:
-            return pcm16
-        clamped_speed = max(0.94, min(1.08, float(speed or 1.0)))
-        if abs(clamped_speed - 1.0) < 0.015:
-            return pcm16
-        source = torch.from_numpy(pcm16.astype(np.float32)).view(1, -1)
-        target_rate = max(8000, int(sample_rate / clamped_speed))
-        resampled = torchaudio_f.resample(
-            source,
-            orig_freq=sample_rate,
-            new_freq=target_rate,
-        )
-        return np.clip(resampled.view(-1).cpu().numpy(), -32768.0, 32767.0).astype(np.int16)
+        return pcm16
 
     def synthesize_segment(
         self,
@@ -2217,7 +2186,8 @@ class SimpleIntentRouter:
         if (
             text in self._greeting
             or text.startswith(("привет", "здравствуйте", "добрый ", "алло", "ало"))
-            or any(marker in text for marker in ("добрый день", "добрый вечер", "здравствуйте"))
+            or any(marker in text for marker in ("добрый день", "добрый вечер", "здравствуйте", " привет"))
+            or "привет" in text.split()
         ):
             return IntentResult(Intent.GREETING.value, 0.99, False, Action.ACK_GREETING.value)
         if (
@@ -3044,6 +3014,11 @@ class ParticipantAudioSession:
             response_text=style_result.styled_text,
             prepared_text=prepared_text,
             segments=segments,
+        )
+        self._log(
+            f"tts plan participant={self._participant.identity} "
+            f"utterance_id={utterance_id} speed={tts_speed:.2f} "
+            f"prepared_text={prepared_text!r} segments={segments!r}"
         )
         request = TtsRequest(text=style_result.styled_text, speaker=self._config.tts_speaker, speed=tts_speed)
         if len(segments) == 1:
