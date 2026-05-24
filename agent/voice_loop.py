@@ -321,6 +321,18 @@ class Action(str, Enum):
     ACK_AMOUNT_AND_CONTINUE = "ack_amount_and_continue"
 
 
+class SpeechSituation(str, Enum):
+    OPENING = "opening"
+    SLOT_BRIDGE = "slot_bridge"
+    CLARIFICATION = "clarification"
+    OBJECTION = "objection"
+    REPAIR = "repair"
+    THINKING = "thinking"
+    HANDOFF = "handoff"
+    CLOSING = "closing"
+    DEFAULT = "default"
+
+
 class Int16ChunkBuffer:
     def __init__(self) -> None:
         self._chunks: deque[np.ndarray] = deque()
@@ -1321,6 +1333,21 @@ def split_into_tts_segments(text: str) -> list[str]:
     return segments
 
 
+def pause_after_segment_ms(segment: str, default_ms: int) -> int:
+    value = segment.strip().lower()
+    if not value:
+        return default_ms
+    if value.endswith("?"):
+        return max(default_ms, 180)
+    if value in {"ага.", "так.", "понял.", "хорошо.", "смотрите.", "алло."}:
+        return 120
+    if "извините" in value or "вы правы" in value:
+        return 220
+    if len(value) < 18:
+        return 100
+    return default_ms
+
+
 def silence_ms(ms: int, sample_rate: int) -> np.ndarray:
     samples = max(0, int(sample_rate * ms / 1000))
     return np.zeros(samples, dtype=np.int16)
@@ -1407,7 +1434,13 @@ class TtsMarkupService:
 
     @staticmethod
     def _split_for_speech(text: str) -> str:
-        return re.sub(r"\s+", " ", text).strip()
+        value = re.sub(r"\s+", " ", text).strip()
+        value = value.replace(" — ", ". ")
+        value = value.replace("? ", "? ... ")
+        value = value.replace("! ", "! ... ")
+        value = re.sub(r"(?<!\.)\.\s+(?=[А-ЯA-Z])", ". ... ", value)
+        value = re.sub(r"(?:\.\s*\.\.\.\s*){2,}", ". ... ", value)
+        return value
 
 
 class VoiceStyleAdapter:
@@ -1442,6 +1475,9 @@ class VoiceStyleAdapter:
             return VoiceStyleResult("", False, "", original)
 
         lowered_original = original.lower()
+        if self._starts_with_spoken_prefix(lowered_original):
+            self._previous_had_filler = False
+            return VoiceStyleResult(original, False, "", original)
         if "не расслышал" in lowered_original:
             self._previous_had_filler = False
             return VoiceStyleResult(original, False, "", original)
@@ -1505,6 +1541,157 @@ class VoiceStyleAdapter:
             return table.get("complex_request", [])
         return []
 
+    @staticmethod
+    def _starts_with_spoken_prefix(lowered_text: str) -> bool:
+        prefixes = (
+            "алло.",
+            "алл+о.",
+            "ага.",
+            "так.",
+            "такс.",
+            "хорошо.",
+            "понял.",
+            "смотрите.",
+            "да, смотрите.",
+            "нуу, смотрите.",
+            "так, секунду.",
+            "сейчас сориентирую.",
+            "понимаю вас.",
+            "да, вы правы",
+            "извините,",
+        )
+        return any(lowered_text.startswith(prefix) for prefix in prefixes)
+
+
+class SalesSpeechStyler:
+    def __init__(self, config: VoicePipelineConfig) -> None:
+        self._config = config
+        self._random = random.Random()
+        self._last_filler = ""
+
+    def style(
+        self,
+        text: str,
+        *,
+        intent: str,
+        stage: str,
+        situation: str,
+        known_facts: dict[str, Any] | None = None,
+        repair_reason: str = "",
+    ) -> str:
+        value = re.sub(r"\s+", " ", text.strip())
+        if not value:
+            return value
+
+        known_facts = known_facts or {}
+        lowered = value.lower()
+        if "не расслышал" in lowered or "повторите" in lowered:
+            return value
+
+        if situation == SpeechSituation.REPAIR.value:
+            return self._style_repair(value, repair_reason=repair_reason)
+        if situation == SpeechSituation.SLOT_BRIDGE.value:
+            return self._style_slot_bridge(value, known_facts=known_facts)
+        if situation == SpeechSituation.OBJECTION.value:
+            return self._style_objection(value)
+        if situation == SpeechSituation.THINKING.value:
+            return self._style_thinking(value)
+        if situation == SpeechSituation.HANDOFF.value:
+            return self._style_handoff(value)
+        if situation == SpeechSituation.OPENING.value and not lowered.startswith(("алло", "алл")):
+            return f"Алл+о. {value}"
+        return self._light_prefix(value, intent=intent, stage=stage)
+
+    def speech_rate(self, *, situation: str, intent: str) -> float:
+        if situation == SpeechSituation.REPAIR.value:
+            return 0.97
+        if situation == SpeechSituation.OBJECTION.value:
+            return 0.96
+        if situation == SpeechSituation.THINKING.value:
+            return 0.99
+        if situation == SpeechSituation.SLOT_BRIDGE.value:
+            return 1.02 if intent == Intent.AMOUNT_PROVIDED.value else 1.01
+        if situation == SpeechSituation.HANDOFF.value:
+            return 1.01
+        if situation == SpeechSituation.OPENING.value:
+            return 0.99
+        return 1.0
+
+    def _choose(self, variants: list[str]) -> str:
+        items = [item for item in variants if item and item != self._last_filler]
+        if not items:
+            items = [item for item in variants if item]
+        if not items:
+            return ""
+        picked = self._random.choice(items)
+        self._last_filler = picked
+        return picked
+
+    def _light_prefix(self, text: str, *, intent: str, stage: str) -> str:
+        variants = ["Ага.", "Так.", "Хорошо.", "Понял."]
+        if intent in {Intent.COMPLEX_REQUEST.value, Intent.CLARIFY.value}:
+            variants = ["Смотрите.", "Да, смотрите.", "Так, сейчас."]
+        elif stage == "qualification":
+            variants = ["Ага.", "Так.", "Понял."]
+        prefix = self._choose(variants)
+        return f"{prefix} {text}".strip() if prefix else text
+
+    def _style_slot_bridge(self, text: str, *, known_facts: dict[str, Any]) -> str:
+        lowered = text.lower()
+        amount = str(known_facts.get("amount") or known_facts.get("нужная_сумма") or "").strip()
+        object_type = str(known_facts.get("вид_объекта") or known_facts.get("object_type") or "").strip()
+        region = str(known_facts.get("region") or known_facts.get("регион") or "").strip()
+        encumbrance = str(known_facts.get("обременение") or known_facts.get("collateral") or "").strip()
+
+        if amount and "какая недвижимость" in lowered:
+            return (
+                f"Ага, {amount} понял. С такой суммой, скорее всего, можно работать. "
+                f"Какая недвижимость есть в собственности?"
+            )
+        if object_type and "регион" in lowered:
+            return f"Понял, {object_type}. В каком регионе находится объект?"
+        if region and ("залог" in lowered or "обремен" in lowered):
+            return f"Хорошо, объект в {region}. Он сейчас свободен от залога или уже в обременении?"
+        if encumbrance and "собствен" in lowered:
+            enc_lower = encumbrance.lower()
+            if "свобод" in enc_lower or "без" in enc_lower or "нет" in enc_lower:
+                return "Понял, объект свободен от залога. Собственник вы?"
+            return "Понял, по обременению зафиксировал. Собственник объекта вы?"
+        return self._light_prefix(text, intent=Intent.SLOT_ANSWER.value, stage="qualification")
+
+    def _style_repair(self, text: str, *, repair_reason: str) -> str:
+        if "repeat" in repair_reason or "repeated" in repair_reason:
+            return f"Да, вы правы, извините, повторился. {text}"
+        if "confused" in repair_reason or "не понял" in repair_reason:
+            return f"Да, понял вас. Переформулирую проще. {text}"
+        if "not_actual" in repair_reason:
+            return f"Понял, не буду давить. {text}"
+        return f"Так, понял. {text}"
+
+    def _style_objection(self, text: str) -> str:
+        prefix = self._choose(
+            [
+                "Понимаю вас.",
+                "Да, логичный вопрос.",
+                "Смотрите, объясню коротко.",
+            ]
+        )
+        return f"{prefix} {text}".strip() if prefix else text
+
+    def _style_thinking(self, text: str) -> str:
+        prefix = self._choose(
+            [
+                "Так, секунду.",
+                "Сейчас сориентирую.",
+                "Угу, смотрю по ситуации.",
+                "Нуу, смотрите.",
+            ]
+        )
+        return f"{prefix} {text}".strip() if prefix else text
+
+    def _style_handoff(self, text: str) -> str:
+        return f"Отлично. {text}"
+
 
 class SileroTtsService:
     def __init__(self, config: VoicePipelineConfig, log: Callable[[str], None]) -> None:
@@ -1551,7 +1738,28 @@ class SileroTtsService:
             sample_rate=self._config.tts_sample_rate,
             fade_ms=self._config.tts_fade_ms,
         )
+        pcm16 = self._apply_speed(
+            pcm16,
+            sample_rate=self._config.tts_sample_rate,
+            speed=request.speed,
+        )
         return pcm16
+
+    @staticmethod
+    def _apply_speed(pcm16: np.ndarray, *, sample_rate: int, speed: float) -> np.ndarray:
+        if len(pcm16) == 0:
+            return pcm16
+        clamped_speed = max(0.94, min(1.08, float(speed or 1.0)))
+        if abs(clamped_speed - 1.0) < 0.015:
+            return pcm16
+        source = torch.from_numpy(pcm16.astype(np.float32)).view(1, -1)
+        target_rate = max(8000, int(sample_rate / clamped_speed))
+        resampled = torchaudio_f.resample(
+            source,
+            orig_freq=sample_rate,
+            new_freq=target_rate,
+        )
+        return np.clip(resampled.view(-1).cpu().numpy(), -32768.0, 32767.0).astype(np.int16)
 
     def synthesize_segment(
         self,
@@ -1580,9 +1788,12 @@ class SileroTtsService:
             for index, segment in enumerate(segments):
                 pcm16 = self._render_segment_pcm(model, request, segment)
                 rendered_segments.append(pcm16)
-                if index < len(segments) - 1 and self._config.tts_segment_pause_ms > 0:
+                if index < len(segments) - 1:
+                    pause_ms = pause_after_segment_ms(segment, self._config.tts_segment_pause_ms)
+                    if pause_ms <= 0:
+                        continue
                     rendered_segments.append(
-                        silence_ms(self._config.tts_segment_pause_ms, self._config.tts_sample_rate)
+                        silence_ms(pause_ms, self._config.tts_sample_rate)
                     )
 
         if not rendered_segments:
@@ -2149,6 +2360,7 @@ class ParticipantAudioSession:
         self._responses = CannedResponseEngine(config)
         self._vad = SileroVadEngine(config)
         self._tts_markup = TtsMarkupService()
+        self._sales_speech_styler = SalesSpeechStyler(config)
         self._voice_style = VoiceStyleAdapter(config)
         self._dialogue_state = DialogueState()
         try:
@@ -2614,6 +2826,31 @@ class ParticipantAudioSession:
             return f"Да, понимаю. Извините, если прозвучало неудачно. Давайте коротко и по делу. {next_question}"
         return next_question
 
+    def _detect_speech_situation(
+        self,
+        *,
+        intent: IntentResult,
+        updated_fields: set[str],
+        repair_reason: str = "",
+    ) -> str:
+        if repair_reason:
+            return SpeechSituation.REPAIR.value
+        if intent.intent in {Intent.GREETING.value, Intent.READY_TO_TALK.value, Intent.IDENTIFY_SELF.value}:
+            return SpeechSituation.OPENING.value
+        if intent.intent in {Intent.REJECT.value, Intent.SERVICE_COMPLAINT.value, Intent.WHY_NEED_INFO.value}:
+            return SpeechSituation.OBJECTION.value
+        if updated_fields:
+            return SpeechSituation.SLOT_BRIDGE.value
+        if intent.action == Action.HANDOFF_TO_HUMAN.value:
+            return SpeechSituation.HANDOFF.value
+        if intent.action == Action.END_SESSION.value:
+            return SpeechSituation.CLOSING.value
+        if intent.use_llm or intent.action == Action.CALL_LLM.value:
+            return SpeechSituation.THINKING.value
+        if intent.intent in {Intent.CLARIFY.value, Intent.UNKNOWN_SHORT.value, Intent.LINE_ISSUE.value}:
+            return SpeechSituation.CLARIFICATION.value
+        return SpeechSituation.DEFAULT.value
+
     def _validate_and_log_llm_reply(
         self,
         *,
@@ -2749,6 +2986,7 @@ class ParticipantAudioSession:
         utterance_id: str,
         response_text: str,
         intent_value: str,
+        tts_speed: float = 1.0,
     ) -> tuple[str, str, list[str], int, bool, bool, str]:
         style_result, prepared_text, segments = self._prepare_tts_output(
             response_text,
@@ -2762,7 +3000,7 @@ class ParticipantAudioSession:
             prepared_text=prepared_text,
             segments=segments,
         )
-        request = TtsRequest(text=style_result.styled_text, speaker=self._config.tts_speaker)
+        request = TtsRequest(text=style_result.styled_text, speaker=self._config.tts_speaker, speed=tts_speed)
         if len(segments) == 1:
             tts_pcm16, tts_sample_rate, tts_latency_ms = await asyncio.to_thread(
                 self._tts_service.synthesize_segments,
@@ -2779,7 +3017,9 @@ class ParticipantAudioSession:
                 self._tts_service.synthesize_segment,
                 request,
                 first_segment,
-                trailing_pause_ms=self._config.tts_segment_pause_ms if remaining_segments else 0,
+                trailing_pause_ms=pause_after_segment_ms(first_segment, self._config.tts_segment_pause_ms)
+                if remaining_segments
+                else 0,
             )
             rest_task: asyncio.Task[tuple[np.ndarray, int, int]] | None = None
             if remaining_segments:
@@ -3090,6 +3330,20 @@ class ParticipantAudioSession:
                 f"utterance_id={utterance_id} raw_stt_text={transcript.text!r} "
                 f"normalized_text={normalized_text!r} confidence={transcript.confidence:.3f}"
             )
+            await self._event_bus.publish_json(
+                {
+                    "type": "transcript",
+                    "utterance_id": utterance_id,
+                    "participant_identity": self._participant.identity,
+                    "text": transcript.text,
+                    "normalized_text": normalized_text,
+                    "final": True,
+                    "confidence": transcript.confidence,
+                    "duration_ms": duration_ms,
+                    "ts_ms": stt_done_time_ms,
+                },
+                destination_identities=[self._participant.identity],
+            )
 
             error_stage = "routing"
             updated_fields = self._dialogue_state.update_from_user(
@@ -3131,6 +3385,19 @@ class ParticipantAudioSession:
             )
             router_latency_ms = int((time.perf_counter() - router_started_at) * 1000)
             intent_ready_time_ms = int(time.time() * 1000)
+            await self._event_bus.publish_json(
+                {
+                    "type": "intent",
+                    "utterance_id": utterance_id,
+                    "participant_identity": self._participant.identity,
+                    "intent": intent.intent,
+                    "confidence": intent.confidence,
+                    "use_llm": intent.use_llm,
+                    "action": intent.action,
+                    "ts_ms": intent_ready_time_ms,
+                },
+                destination_identities=[self._participant.identity],
+            )
 
             candidate_response = ""
             candidate_node = self._dialogue_state.current_node
@@ -3189,7 +3456,16 @@ class ParticipantAudioSession:
                 )
 
             elif intent.intent in canned_intents:
-                if intent.intent == Intent.READY_TO_TALK.value and self._dialogue_state.last_agent_text:
+                if intent.intent == Intent.GREETING.value and not (self._dialogue_state.last_agent_text or self._last_agent_message):
+                    opening = self._tool_graph.opening_prompt() if self._tool_graph is not None else None
+                    if opening is not None:
+                        candidate_node, candidate_response = opening
+                    else:
+                        candidate_response = self._responses.choose(
+                            intent,
+                            last_agent_message=None,
+                        )
+                elif intent.intent == Intent.READY_TO_TALK.value and self._dialogue_state.last_agent_text:
                     if graph_question:
                         candidate_node, candidate_response = graph_question
                     else:
@@ -3317,7 +3593,24 @@ class ParticipantAudioSession:
                     utterance_id=utterance_id,
                 )
 
+            speech_situation = self._detect_speech_situation(
+                intent=intent,
+                updated_fields=updated_fields,
+                repair_reason=repair_reason,
+            )
             raw_response_text = response_text
+            response_text = self._sales_speech_styler.style(
+                response_text,
+                intent=intent.intent,
+                stage=str(self._dialogue_state.stage),
+                situation=speech_situation,
+                known_facts=state_snapshot.get("known_facts", {}),
+                repair_reason=repair_reason,
+            )
+            tts_speed = self._sales_speech_styler.speech_rate(
+                situation=speech_situation,
+                intent=intent.intent,
+            )
             response_ready_time_ms = int(time.time() * 1000)
             self._log(
                 f"turn decision participant={self._participant.identity} "
@@ -3379,6 +3672,7 @@ class ParticipantAudioSession:
                     utterance_id=utterance_id,
                     response_text=response_text,
                     intent_value=intent.intent,
+                    tts_speed=tts_speed,
                 )
                 response_text = spoken_text
                 self._log(

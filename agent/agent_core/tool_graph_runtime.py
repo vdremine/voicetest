@@ -40,6 +40,15 @@ class ToolGraphRuntime:
     def start_node(self) -> str:
         return self._start_node
 
+    def opening_prompt(self) -> tuple[str, str] | None:
+        node = self._nodes.get(self._start_node)
+        if not node:
+            return None
+        reply_text = self._node_reply_text(node)
+        if not reply_text:
+            return None
+        return self._start_node, reply_text
+
     def cached_reply_for_text(self, text: str, state: dict[str, Any]) -> CachedNodeReply | None:
         lowered = self._normalize(text)
         current_node = str(state.get("current_node", "")).strip() or self._start_node
