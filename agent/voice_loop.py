@@ -8,6 +8,7 @@ import random
 import re
 import threading
 import time
+import traceback
 import uuid
 import wave
 from collections import deque
@@ -1010,11 +1011,22 @@ next_step: короткий следующий шаг менеджера.
             await client.chat.completions.create(
                 model=self._config.llm_model,
                 temperature=0.0,
-                max_tokens=24,
+                max_tokens=16,
                 response_format=self._response_format(self._LLM_JSON_SCHEMA),
                 messages=[
-                    {"role": "system", "content": self._LOCAL_MANAGER_PROMPT},
-                    {"role": "user", "content": "Верни короткий валидный JSON для проверки готовности."},
+                    {
+                        "role": "system",
+                        "content": (
+                            "Верни только JSON с полями "
+                            "reply_tts, search_index, intent, next_step."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            '{"reply_tts":"ok","search_index":[],"intent":"warmup","next_step":"ready"}'
+                        ),
+                    },
                 ],
             )
             latency_ms = int((time.perf_counter() - started_at) * 1000)
@@ -1628,6 +1640,16 @@ class SalesSpeechStyler:
         return picked
 
     def _light_prefix(self, text: str, *, intent: str, stage: str) -> str:
+        if intent in {
+            Intent.LINE_ISSUE.value,
+            Intent.REPEAT.value,
+            Intent.GREETING.value,
+            Intent.UNKNOWN_SHORT.value,
+            Intent.CLARIFY.value,
+        }:
+            return text
+        if text.endswith("?") and len(text) <= 80:
+            return text
         variants = ["Ага.", "Так.", "Хорошо.", "Понял."]
         if intent in {Intent.COMPLEX_REQUEST.value, Intent.CLARIFY.value}:
             variants = ["Смотрите.", "Да, смотрите.", "Так, сейчас."]
@@ -2263,7 +2285,7 @@ class CannedResponseEngine:
                 "Подскажите, пожалуйста, как к вам обращаться и вопрос по кредиту для вас вообще актуален?"
             )
         if intent.intent == "line_issue":
-            repeated = self._first_sentence(last_agent_message)
+            repeated = (last_agent_message or "").strip()
             return repeated or "Повторю коротко. Подскажите, пожалуйста, удобно сейчас говорить?"
         if intent.intent == "why_need_info":
             return (
@@ -2402,6 +2424,7 @@ class ParticipantAudioSession:
         self._active_utterance_id: str | None = None
         self._utterance_counter = 0
         self._last_agent_message: str | None = None
+        self._last_semantic_agent_message: str | None = None
         self._history: list[dict[str, str]] = []
         self._is_speaking = False
         self._is_processing = False
@@ -3473,7 +3496,9 @@ class ParticipantAudioSession:
                 else:
                     candidate_response = self._responses.choose(
                         intent,
-                        last_agent_message=self._dialogue_state.last_agent_text or self._last_agent_message,
+                        last_agent_message=self._last_semantic_agent_message
+                        or self._dialogue_state.last_agent_text
+                        or self._last_agent_message,
                     )
                     if intent.intent in opening_intents:
                         candidate_node = "check_convenience"
@@ -3495,7 +3520,9 @@ class ParticipantAudioSession:
                 else:
                     candidate_response = self._responses.choose(
                         intent,
-                        last_agent_message=self._dialogue_state.last_agent_text or self._last_agent_message,
+                        last_agent_message=self._last_semantic_agent_message
+                        or self._dialogue_state.last_agent_text
+                        or self._last_agent_message,
                     )
 
             force_llm, repair_reason = should_force_llm_repair(
@@ -3599,6 +3626,7 @@ class ParticipantAudioSession:
                 repair_reason=repair_reason,
             )
             raw_response_text = response_text
+            self._last_semantic_agent_message = raw_response_text
             response_text = self._sales_speech_styler.style(
                 response_text,
                 intent=intent.intent,
@@ -3655,6 +3683,7 @@ class ParticipantAudioSession:
                     return
                 await self._publish_status("speaking")
                 self._is_speaking = True
+                error_stage = "tts"
                 tts_synth_start_time_ms = int(time.time() * 1000)
                 self._log(
                     f"tts synth start participant={self._participant.identity} "
@@ -3702,12 +3731,18 @@ class ParticipantAudioSession:
                         f"utterance_id={utterance_id}"
                     )
         except Exception as exc:
-            error_stage = "stt"
-            self._log(f"utterance processing failed participant={self._participant.identity}: {exc}")
+            if not error_stage:
+                error_stage = "processing"
+            error_message = str(exc) or repr(exc) or exc.__class__.__name__
+            self._log(
+                f"utterance processing failed participant={self._participant.identity} "
+                f"stage={error_stage} error={error_message}"
+            )
+            self._log(traceback.format_exc())
             response_text = self._config.fallback_low_confidence_text
             await self._event_bus.publish_error(
                 stage=error_stage,
-                message=str(exc),
+                message=error_message,
                 participant_identity=self._participant.identity,
                 destination_identities=[self._participant.identity],
                 utterance_id=utterance_id,
