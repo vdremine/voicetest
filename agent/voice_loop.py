@@ -11,14 +11,20 @@ import time
 import uuid
 import wave
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 import numpy as np
 import torch
 import torchaudio.functional as torchaudio_f
-from agent_core import DialogueState, KnowledgeBase, ToolGraphRuntime, build_context_messages, validate_llm_reply
+from agent_core import (
+    DialogueState,
+    KnowledgeBase,
+    ToolGraphRuntime,
+    build_context_messages,
+    inspect_llm_reply,
+)
 from faster_whisper import WhisperModel
 from livekit import rtc
 from openai import AsyncOpenAI
@@ -240,6 +246,31 @@ class VoiceStyleResult:
     filler_added: bool
     filler_type: str
     original_text: str
+
+
+@dataclass(slots=True)
+class PlaybackState:
+    utterance_id: str = ""
+    response_text: str = ""
+    prepared_text: str = ""
+    segments: list[str] = field(default_factory=list)
+    next_segment_index: int = 0
+    interrupted: bool = False
+    last_interrupted_at_ms: int = 0
+    completed: bool = True
+
+    def reset(self) -> None:
+        self.utterance_id = ""
+        self.response_text = ""
+        self.prepared_text = ""
+        self.segments = []
+        self.next_segment_index = 0
+        self.interrupted = False
+        self.last_interrupted_at_ms = 0
+        self.completed = True
+
+    def has_remaining(self) -> bool:
+        return self.next_segment_index < len(self.segments)
 
 
 class Intent(str, Enum):
@@ -864,6 +895,8 @@ TTS:
         truth_rules: tuple[str, ...] = (),
         examples: list[list[dict[str, str]]] | None = None,
         graph_context: dict[str, Any] | None = None,
+        temperature_override: float | None = None,
+        max_tokens_override: int | None = None,
     ) -> tuple[LlmReply, int]:
         if not self.enabled:
             raise RuntimeError("LLM is disabled by configuration")
@@ -911,8 +944,8 @@ TTS:
 
         completion = await client.chat.completions.create(
             model=self._config.llm_model,
-            temperature=self._config.llm_temperature,
-            max_tokens=self._config.llm_max_tokens,
+            temperature=self._config.llm_temperature if temperature_override is None else temperature_override,
+            max_tokens=self._config.llm_max_tokens if max_tokens_override is None else max_tokens_override,
             response_format=self._response_format(self._LLM_JSON_SCHEMA),
             messages=messages,
         )
@@ -1477,29 +1510,52 @@ class SileroTtsService:
         )
         return self._model
 
+    def _render_segment_pcm(self, model: Any, request: TtsRequest, segment: str) -> np.ndarray:
+        audio = model.apply_tts(
+            text=segment,
+            speaker=request.speaker or self._config.tts_speaker,
+            sample_rate=self._config.tts_sample_rate,
+        )
+        if isinstance(audio, torch.Tensor):
+            audio_np = audio.detach().cpu().numpy()
+        else:
+            audio_np = np.asarray(audio)
+        audio_np = np.clip(audio_np, -1.0, 1.0)
+        pcm16 = (audio_np * 32767.0).astype(np.int16)
+        pcm16 = trim_silence(pcm16)
+        pcm16 = apply_fade(
+            pcm16,
+            sample_rate=self._config.tts_sample_rate,
+            fade_ms=self._config.tts_fade_ms,
+        )
+        return pcm16
+
+    def synthesize_segment(
+        self,
+        request: TtsRequest,
+        segment: str,
+        *,
+        trailing_pause_ms: int = 0,
+    ) -> tuple[np.ndarray, int, int]:
+        started_at = time.perf_counter()
+        with self._lock:
+            model = self._ensure_model()
+            pcm16 = self._render_segment_pcm(model, request, segment)
+        if trailing_pause_ms > 0:
+            pcm16 = np.concatenate(
+                [pcm16, silence_ms(trailing_pause_ms, self._config.tts_sample_rate)]
+            )
+        pcm16 = normalize_peak(pcm16, target_peak=self._config.tts_normalize_peak)
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        return pcm16, self._config.tts_sample_rate, latency_ms
+
     def synthesize_segments(self, request: TtsRequest, segments: list[str]) -> tuple[np.ndarray, int, int]:
         started_at = time.perf_counter()
         with self._lock:
             model = self._ensure_model()
             rendered_segments: list[np.ndarray] = []
             for index, segment in enumerate(segments):
-                audio = model.apply_tts(
-                    text=segment,
-                    speaker=request.speaker or self._config.tts_speaker,
-                    sample_rate=self._config.tts_sample_rate,
-                )
-                if isinstance(audio, torch.Tensor):
-                    audio_np = audio.detach().cpu().numpy()
-                else:
-                    audio_np = np.asarray(audio)
-                audio_np = np.clip(audio_np, -1.0, 1.0)
-                pcm16 = (audio_np * 32767.0).astype(np.int16)
-                pcm16 = trim_silence(pcm16)
-                pcm16 = apply_fade(
-                    pcm16,
-                    sample_rate=self._config.tts_sample_rate,
-                    fade_ms=self._config.tts_fade_ms,
-                )
+                pcm16 = self._render_segment_pcm(model, request, segment)
                 rendered_segments.append(pcm16)
                 if index < len(segments) - 1 and self._config.tts_segment_pause_ms > 0:
                     rendered_segments.append(
@@ -2126,6 +2182,7 @@ class ParticipantAudioSession:
         self._resume_probe_buffer = Int16ChunkBuffer()
         self._resume_buffer_limit = self._config.sample_rate * 6
         self._needs_rescue_prompt = False
+        self._playback_state = PlaybackState()
         self._spoken_turn_count = 0
         self._greeting_was_spoken = False
 
@@ -2332,6 +2389,7 @@ class ParticipantAudioSession:
                     f"vad_probability={probability:.3f}"
                 )
                 self._audio_publisher.interrupt_playback()
+                self._mark_playback_interrupted()
                 self._is_speaking = False
             else:
                 self._log(
@@ -2533,6 +2591,101 @@ class ParticipantAudioSession:
             return f"Да, понимаю. Извините, если прозвучало неудачно. Давайте коротко и по делу. {next_question}"
         return next_question
 
+    def _validate_and_log_llm_reply(
+        self,
+        *,
+        reply_tts: str,
+        fallback_reply: str,
+        state: dict[str, Any],
+        knowledge: list[Any],
+        truth_rules: tuple[str, ...],
+        utterance_id: str,
+        mode: str,
+        reason_hint: str = "",
+    ) -> str:
+        validated_text, validation_reason = inspect_llm_reply(
+            reply_tts=reply_tts,
+            fallback_reply=fallback_reply,
+            state=state,
+            knowledge=knowledge,
+            truth_rules=truth_rules,
+        )
+        was_replaced = normalize_for_compare(validated_text) != normalize_for_compare(reply_tts)
+        self._log(
+            f"llm validation participant={self._participant.identity} "
+            f"utterance_id={utterance_id} "
+            f"mode={mode} "
+            f"reason_hint={reason_hint!r} "
+            f"validation_reason={validation_reason!r} "
+            f"was_replaced={str(was_replaced).lower()} "
+            f"raw_reply={reply_tts!r} "
+            f"validated_reply={validated_text!r} "
+            f"fallback_reply={fallback_reply!r}"
+        )
+        return validated_text
+
+    def _start_playback_state(
+        self,
+        *,
+        utterance_id: str,
+        response_text: str,
+        prepared_text: str,
+        segments: list[str],
+    ) -> None:
+        self._playback_state.utterance_id = utterance_id
+        self._playback_state.response_text = response_text
+        self._playback_state.prepared_text = prepared_text
+        self._playback_state.segments = list(segments)
+        self._playback_state.next_segment_index = 0
+        self._playback_state.interrupted = False
+        self._playback_state.last_interrupted_at_ms = 0
+        self._playback_state.completed = False
+
+    def _mark_playback_segment_completed(self, segment_index: int) -> None:
+        if segment_index + 1 > self._playback_state.next_segment_index:
+            self._playback_state.next_segment_index = segment_index + 1
+
+    def _mark_playback_interrupted(self) -> None:
+        if not self._playback_state.segments:
+            return
+        self._playback_state.interrupted = True
+        self._playback_state.completed = False
+        self._playback_state.last_interrupted_at_ms = int(time.time() * 1000)
+
+    def _complete_playback_state(self) -> None:
+        self._playback_state.completed = True
+        self._playback_state.interrupted = False
+        self._playback_state.next_segment_index = len(self._playback_state.segments)
+
+    def _should_resume_previous_playback(self, raw_text: str, normalized_text: str) -> bool:
+        if not self._needs_rescue_prompt:
+            return False
+        if not self._playback_state.interrupted or not self._playback_state.has_remaining():
+            return False
+        if not self._playback_state.last_interrupted_at_ms:
+            return False
+        if int(time.time() * 1000) - self._playback_state.last_interrupted_at_ms > 2500:
+            return False
+        lowered = normalize_for_compare(normalized_text)
+        if is_low_information_transcript(raw_text, normalized_text):
+            return True
+        return lowered in {"алло", "ало", "але", "слышно", "меня слышно", "вы тут"}
+
+    def _build_resume_playback_text(self, normalized_text: str) -> str:
+        remaining_segments = self._playback_state.segments[self._playback_state.next_segment_index :]
+        if not remaining_segments:
+            return ""
+        lowered = normalize_for_compare(normalized_text)
+        if "слыш" in lowered:
+            bridge = "Да, слышно."
+        elif lowered in {"алло", "ало", "але"}:
+            bridge = "Да, алло."
+        elif self._playback_state.next_segment_index == 0:
+            bridge = "Да, смотрите."
+        else:
+            bridge = "Так вот."
+        return f"{bridge} {' '.join(remaining_segments)}".strip()
+
     def _llm_bridge_text(self) -> str:
         name = self._dialogue_state.name.strip()
         if name:
@@ -2580,12 +2733,57 @@ class ParticipantAudioSession:
         )
         if not segments:
             segments = [prepared_text] if prepared_text else [style_result.styled_text]
-        tts_pcm16, tts_sample_rate, tts_latency_ms = await asyncio.to_thread(
-            self._tts_service.synthesize_segments,
-            TtsRequest(text=style_result.styled_text, speaker=self._config.tts_speaker),
-            segments,
+        self._start_playback_state(
+            utterance_id=utterance_id,
+            response_text=style_result.styled_text,
+            prepared_text=prepared_text,
+            segments=segments,
         )
-        playback_completed = await self._audio_publisher.speak_pcm(tts_pcm16, tts_sample_rate)
+        request = TtsRequest(text=style_result.styled_text, speaker=self._config.tts_speaker)
+        if len(segments) == 1:
+            tts_pcm16, tts_sample_rate, tts_latency_ms = await asyncio.to_thread(
+                self._tts_service.synthesize_segments,
+                request,
+                segments,
+            )
+            playback_completed = await self._audio_publisher.speak_pcm(tts_pcm16, tts_sample_rate)
+            if playback_completed:
+                self._mark_playback_segment_completed(0)
+        else:
+            first_segment = segments[0]
+            remaining_segments = segments[1:]
+            first_pcm16, tts_sample_rate, first_latency_ms = await asyncio.to_thread(
+                self._tts_service.synthesize_segment,
+                request,
+                first_segment,
+                trailing_pause_ms=self._config.tts_segment_pause_ms if remaining_segments else 0,
+            )
+            rest_task: asyncio.Task[tuple[np.ndarray, int, int]] | None = None
+            if remaining_segments:
+                rest_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        self._tts_service.synthesize_segments,
+                        request,
+                        remaining_segments,
+                    )
+                )
+            first_completed = await self._audio_publisher.speak_pcm(first_pcm16, tts_sample_rate)
+            playback_completed = first_completed
+            tts_latency_ms = first_latency_ms
+            if first_completed:
+                self._mark_playback_segment_completed(0)
+            if first_completed and rest_task is not None:
+                rest_pcm16, rest_sample_rate, _rest_latency_ms = await rest_task
+                if len(rest_pcm16) > 0:
+                    playback_completed = await self._audio_publisher.speak_pcm(rest_pcm16, rest_sample_rate)
+                    if playback_completed:
+                        self._mark_playback_segment_completed(len(segments) - 1)
+            elif rest_task is not None:
+                rest_task.cancel()
+        if playback_completed:
+            self._complete_playback_state()
+        else:
+            self._mark_playback_interrupted()
         self._spoken_turn_count += 1
         if not self._greeting_was_spoken and style_result.styled_text.lower().startswith(("алло", "алл")):
             self._greeting_was_spoken = True
@@ -2631,6 +2829,8 @@ class ParticipantAudioSession:
         }
 
     def _should_advance_by_state(self, intent: IntentResult, updated_fields: set[str]) -> bool:
+        if intent.use_llm or intent.action == Action.CALL_LLM.value:
+            return False
         slot_fields = {
             "нужная_сумма",
             "цель",
@@ -2650,8 +2850,6 @@ class ParticipantAudioSession:
             Intent.AMOUNT_PROVIDED.value,
             Intent.CONFIRM_INTEREST.value,
             Intent.SLOT_ANSWER.value,
-            Intent.UNKNOWN_SHORT.value,
-            Intent.COMPLEX_REQUEST.value,
         }
 
     def _should_try_stalled_slot_rescue(
@@ -2729,28 +2927,34 @@ class ParticipantAudioSession:
         }
 
         try:
+            safe_repair_fallback = "Понял вас. Давайте уточню по-другому."
             llm_reply, llm_latency_ms = await self._llm_service.generate_response(
                 normalized_text=normalized_text,
-                history=self._history,
+                history=self._history[-4:],
                 dialogue_state=state,
-                knowledge=self._kb.retrieve(normalized_text, state, limit=4) if self._kb else [],
+                knowledge=[],
                 truth_rules=self._kb.truth_rules if self._kb else (),
                 examples=[],
                 graph_context={**graph_context, **repair_context},
+                temperature_override=0.0,
+                max_tokens_override=min(96, self._config.llm_max_tokens),
             )
-            response_text = sanitize_voice_response(
-                llm_reply.reply_tts,
-                fallback=self._config.fallback_complex_text,
+            response_text = self._validate_and_log_llm_reply(
+                reply_tts=llm_reply.reply_tts,
+                fallback_reply=safe_repair_fallback,
+                state=state,
+                knowledge=[],
+                truth_rules=self._kb.truth_rules if self._kb else (),
+                utterance_id=utterance_id,
+                mode="adaptive_repair",
+                reason_hint=reason,
             )
             return response_text, llm_reply, llm_latency_ms
 
         except Exception as exc:
             self._log(f"adaptive repair failed utterance={utterance_id}: {exc}")
 
-            if resume_question:
-                return resume_question, None, 0
-
-            return self._config.fallback_complex_text, None, 0
+            return "Понял вас. Давайте уточню по-другому.", None, 0
     
     async def _generate_stalled_slot_rescue(
         self,
@@ -2764,8 +2968,6 @@ class ParticipantAudioSession:
         if not self._llm_service.enabled:
             return self._repair_and_resume_reply(IntentResult(Intent.SERVICE_COMPLAINT.value, 0.0, False, "")), None, 0
         try:
-            knowledge = self._kb.retrieve(normalized_text, state_snapshot)
-            examples = self._kb.relevant_examples(normalized_text)
             graph_context = (
                 self._tool_graph.llm_context_for_text(normalized_text, state_snapshot)
                 if self._tool_graph is not None
@@ -2785,19 +2987,24 @@ class ParticipantAudioSession:
             ]
             llm_reply, llm_latency_ms = await self._llm_service.generate_response(
                 normalized_text=normalized_text,
-                history=history,
+                history=history[-4:],
                 dialogue_state=state_snapshot,
-                knowledge=knowledge,
+                knowledge=[],
                 truth_rules=self._kb.truth_rules,
-                examples=examples,
+                examples=[],
                 graph_context=graph_context,
+                temperature_override=0.0,
+                max_tokens_override=min(96, self._config.llm_max_tokens),
             )
-            response_text = validate_llm_reply(
+            response_text = self._validate_and_log_llm_reply(
                 reply_tts=llm_reply.reply_tts,
                 fallback_reply=f"Да, возможно, я неточно понял. {resume_question}",
                 state=state_snapshot,
-                knowledge=knowledge,
+                knowledge=[],
                 truth_rules=self._kb.truth_rules,
+                utterance_id=utterance_id,
+                mode="stalled_slot_rescue",
+                reason_hint=str(state_snapshot.get("next_required_field", "")),
             )
             self._log(
                 f"stalled-slot rescue participant={self._participant.identity} "
@@ -2890,18 +3097,33 @@ class ParticipantAudioSession:
             # 7. Готовим candidate, но НЕ отправляем сразу
             candidate_response = ""
             candidate_node = self._dialogue_state.current_node
+            playback_resume_selected = False
 
-            cached = (
-                self._tool_graph.cached_reply_for_text(normalized_text, state_snapshot)
-                if self._tool_graph is not None
-                else None
-            )
+            if self._should_resume_previous_playback(transcript.text, normalized_text):
+                candidate_response = self._build_resume_playback_text(normalized_text)
+                if candidate_response:
+                    playback_resume_selected = True
+                    intent = IntentResult("playback_resume", 0.99, False, "resume_playback")
+                    self._log(
+                        f"playback resume participant={self._participant.identity} "
+                        f"utterance_id={utterance_id} next_segment_index={self._playback_state.next_segment_index} "
+                        f"resume_text={candidate_response!r}"
+                    )
+                    self._needs_rescue_prompt = False
+
+            cached = None
+            if not playback_resume_selected:
+                cached = (
+                    self._tool_graph.cached_reply_for_text(normalized_text, state_snapshot)
+                    if self._tool_graph is not None
+                    else None
+                )
 
             if cached:
                 candidate_response = cached.reply_text
                 candidate_node = cached.next_node
 
-            elif updated_fields:
+            elif updated_fields and not playback_resume_selected:
                 graph_question = (
                     self._tool_graph.question_for_state(state_snapshot)
                     if self._tool_graph is not None
@@ -2916,7 +3138,7 @@ class ParticipantAudioSession:
                         graph_question=graph_question_text,
                     )
 
-            elif not intent.use_llm and intent.action != Action.CALL_LLM.value:
+            elif not playback_resume_selected and not intent.use_llm and intent.action != Action.CALL_LLM.value:
                 graph_question = (
                     self._tool_graph.question_for_state(state_snapshot)
                     if self._tool_graph is not None
@@ -2963,7 +3185,7 @@ class ParticipantAudioSession:
 
                 state_snapshot = self._dialogue_state.snapshot()
                 knowledge = self._kb.retrieve(normalized_text, state_snapshot)
-                examples = self._kb.relevant_examples(normalized_text)
+                examples = self._kb.relevant_examples(normalized_text)[:2]
 
                 graph_context = (
                     self._tool_graph.llm_context_for_text(normalized_text, state_snapshot)
@@ -2976,20 +3198,24 @@ class ParticipantAudioSession:
 
                 llm_reply, llm_latency_ms = await self._llm_service.generate_response(
                     normalized_text=normalized_text,
-                    history=self._history,
+                    history=self._history[-6:],
                     dialogue_state=state_snapshot,
                     knowledge=knowledge,
                     truth_rules=self._kb.truth_rules,
                     examples=examples,
                     graph_context=graph_context,
+                    max_tokens_override=min(140, self._config.llm_max_tokens),
                 )
 
-                response_text = validate_llm_reply(
+                response_text = self._validate_and_log_llm_reply(
                     reply_tts=llm_reply.reply_tts,
                     fallback_reply=self._state_fallback_reply(),
                     state=state_snapshot,
                     knowledge=knowledge,
                     truth_rules=self._kb.truth_rules,
+                    utterance_id=utterance_id,
+                    mode="normal_llm",
+                    reason_hint="normal_generation",
                 )
 
             # 11. Финальный anti-repeat перед отправкой
@@ -3146,7 +3372,7 @@ class ParticipantAudioSession:
                 f"router_ms={router_latency_ms} "
                 f"classifier_ms={classifier_latency_ms} "
                 f"llm_ms={llm_latency_ms} "
-                f"tts_ms={tts_latency_ms} "
+                f"tts_first_segment_ms={tts_latency_ms} "
                 f"perceived_latency_ms={perceived_latency_ms} "
                 f"finalized_to_intent_ms={finalized_to_intent_ms} "
                 f"finalized_to_response_ms={finalized_to_response_ms} "
@@ -3201,6 +3427,7 @@ class ParticipantAudioSession:
                     "llm_reply_search_index": llm_reply.search_index if llm_reply else [],
                     "llm_reply_next_step": llm_reply.next_step if llm_reply else "",
                     "tts_latency_ms": tts_latency_ms,
+                    "tts_first_segment_latency_ms": tts_latency_ms,
                     "stt_done_time_ms": stt_done_time_ms,
                     "intent_ready_time_ms": intent_ready_time_ms,
                     "response_ready_time_ms": response_ready_time_ms,
