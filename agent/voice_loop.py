@@ -1342,7 +1342,29 @@ def split_into_tts_segments(text: str) -> list[str]:
     segments = [segment.strip() for segment in re.split(r"(?<=[.!?])\s+", stripped) if segment.strip()]
     if not segments:
         return [stripped]
-    return segments
+    merged: list[str] = []
+    index = 0
+    while index < len(segments):
+        current = segments[index]
+        normalized = normalize_for_compare(current.replace("+", ""))
+        is_short_lead = normalized in {
+            "алло",
+            "ало",
+            "ага",
+            "так",
+            "такс",
+            "понял",
+            "хорошо",
+            "смотрите",
+            "да",
+        }
+        if index == 0 and is_short_lead and index + 1 < len(segments):
+            merged.append(f"{current} {segments[index + 1]}".strip())
+            index += 2
+            continue
+        merged.append(current)
+        index += 1
+    return merged
 
 
 def pause_after_segment_ms(segment: str, default_ms: int) -> int:
@@ -3059,11 +3081,18 @@ class ParticipantAudioSession:
             if first_completed:
                 self._mark_playback_segment_completed(0)
             if first_completed and rest_task is not None:
-                rest_pcm16, rest_sample_rate, _rest_latency_ms = await rest_task
-                if len(rest_pcm16) > 0:
-                    playback_completed = await self._audio_publisher.speak_pcm(rest_pcm16, rest_sample_rate)
-                    if playback_completed:
-                        self._mark_playback_segment_completed(len(segments) - 1)
+                try:
+                    rest_pcm16, rest_sample_rate, _rest_latency_ms = await rest_task
+                    if len(rest_pcm16) > 0:
+                        playback_completed = await self._audio_publisher.speak_pcm(rest_pcm16, rest_sample_rate)
+                        if playback_completed:
+                            self._mark_playback_segment_completed(len(segments) - 1)
+                except Exception as exc:
+                    self._log(
+                        f"tts tail synthesis failed participant={self._participant.identity} "
+                        f"utterance_id={utterance_id} error={str(exc) or repr(exc)}"
+                    )
+                    playback_completed = first_completed
             elif rest_task is not None:
                 rest_task.cancel()
         if playback_completed:
