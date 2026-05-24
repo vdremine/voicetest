@@ -3062,11 +3062,9 @@ class ParticipantAudioSession:
         error_stage = ""
         response_published = False
         suppress_response = False
-        rescue_only = False
         updated_fields: set[str] = set()
         classifier_latency_ms = 0
         router_latency_ms = 0
-        decision_started_at = 0.0
         stt_done_time_ms = 0
         intent_ready_time_ms = 0
         response_ready_time_ms = 0
@@ -3083,10 +3081,17 @@ class ParticipantAudioSession:
         next_graph_node = self._dialogue_state.current_node
 
         try:
-            # 1. STT -> normalize
+            error_stage = "stt"
+            transcript = await asyncio.to_thread(self._stt_service.transcribe, audio_samples, duration_ms)
+            stt_done_time_ms = int(time.time() * 1000)
             normalized_text = self._normalizer.normalize(transcript.text)
+            self._log(
+                f"turn transcript participant={self._participant.identity} "
+                f"utterance_id={utterance_id} raw_stt_text={transcript.text!r} "
+                f"normalized_text={normalized_text!r} confidence={transcript.confidence:.3f}"
+            )
 
-            # 2. Обновляем state
+            error_stage = "routing"
             updated_fields = self._dialogue_state.update_from_user(
                 transcript.text,
                 normalized_text,
@@ -3103,24 +3108,54 @@ class ParticipantAudioSession:
                 updated_fields |= forced_fields
                 self._log(f"force captured expected slot: {sorted(forced_fields)}")
 
-            # 4. История
-            self._history.append({"role": "user", "text": normalized_text or transcript.text})
-            self._history = self._history[-12:]
-
-            # 5. Snapshot после обновления state
             state_snapshot = self._dialogue_state.snapshot()
+            self._log(
+                f"turn state participant={self._participant.identity} "
+                f"utterance_id={utterance_id} updated_fields={sorted(updated_fields)!r} "
+                f"scenario={state_snapshot.get('scenario', '')!r} "
+                f"awaiting_field={state_snapshot.get('awaiting_field', '')!r} "
+                f"next_required_field={state_snapshot.get('next_required_field', '')!r} "
+                f"known_facts={state_snapshot.get('known_facts', {})!r}"
+            )
 
-            # 6. Router / classifier
+            if transcript.text.strip():
+                self._history.append({"role": "user", "text": normalized_text or transcript.text})
+                self._history = self._history[-12:]
+
+            await self._publish_status("routing_intent")
+            router_started_at = time.perf_counter()
             intent = self._router.route(
                 normalized_text,
                 current_node=str(state_snapshot.get("current_node", "")).strip(),
                 stage=str(state_snapshot.get("stage", "")).strip(),
             )
+            router_latency_ms = int((time.perf_counter() - router_started_at) * 1000)
+            intent_ready_time_ms = int(time.time() * 1000)
 
-            # 7. Готовим candidate, но НЕ отправляем сразу
             candidate_response = ""
             candidate_node = self._dialogue_state.current_node
             playback_resume_selected = False
+            graph_question = (
+                self._tool_graph.question_for_state(state_snapshot)
+                if self._tool_graph is not None
+                else None
+            )
+
+            opening_intents = {
+                Intent.GREETING.value,
+                Intent.READY_TO_TALK.value,
+                Intent.IDENTIFY_SELF.value,
+                Intent.IDENTITY_MISMATCH.value,
+            }
+            canned_intents = opening_intents | {
+                Intent.LINE_ISSUE.value,
+                Intent.REPEAT.value,
+                Intent.WAIT.value,
+                Intent.HUMAN_HANDOFF.value,
+                Intent.CANCEL.value,
+                Intent.REJECT.value,
+                Intent.END_SESSION.value,
+            }
 
             if self._should_resume_previous_playback(transcript.text, normalized_text):
                 candidate_response = self._build_resume_playback_text(normalized_text)
@@ -3146,38 +3181,56 @@ class ParticipantAudioSession:
                 candidate_response = cached.reply_text
                 candidate_node = cached.next_node
 
-            elif updated_fields and not playback_resume_selected:
-                graph_question = (
-                    self._tool_graph.question_for_state(state_snapshot)
-                    if self._tool_graph is not None
-                    else None
+            elif not normalized_text:
+                candidate_response = (
+                    self._responses.rescue_prompt()
+                    if self._dialogue_state.stage == "greeting"
+                    else self._config.fallback_low_confidence_text
                 )
 
-                if graph_question:
-                    candidate_node, graph_question_text = graph_question
-                    candidate_response = bridge_response_for_updated_fields(
-                        updated_fields=updated_fields,
-                        state=state_snapshot,
-                        graph_question=graph_question_text,
+            elif intent.intent in canned_intents:
+                if intent.intent == Intent.READY_TO_TALK.value and self._dialogue_state.last_agent_text:
+                    if graph_question:
+                        candidate_node, candidate_response = graph_question
+                    else:
+                        candidate_response = self._state_fallback_reply()
+                else:
+                    candidate_response = self._responses.choose(
+                        intent,
+                        last_agent_message=self._dialogue_state.last_agent_text or self._last_agent_message,
                     )
+                    if intent.intent in opening_intents:
+                        candidate_node = "check_convenience"
+
+            elif intent.intent in {Intent.WHY_NEED_INFO.value, Intent.SERVICE_COMPLAINT.value}:
+                candidate_response = self._repair_and_resume_reply(intent)
+
+            elif intent.intent == Intent.LATENCY_QUESTION.value:
+                candidate_response = f"Связь чуть задержалась. {self._state_fallback_reply()}"
+
+            elif updated_fields and not playback_resume_selected:
+                if graph_question:
+                    candidate_node, _graph_question_text = graph_question
+                candidate_response = self._state_guided_reply(intent)
 
             elif not playback_resume_selected and not intent.use_llm and intent.action != Action.CALL_LLM.value:
-                graph_question = (
-                    self._tool_graph.question_for_state(state_snapshot)
-                    if self._tool_graph is not None
-                    else None
-                )
-
                 if graph_question:
                     candidate_node, candidate_response = graph_question
+                else:
+                    candidate_response = self._responses.choose(
+                        intent,
+                        last_agent_message=self._dialogue_state.last_agent_text or self._last_agent_message,
+                    )
 
-            # 8. Главное: semantic gate / anti-stuck / fallback -> LLM repair
             force_llm, repair_reason = should_force_llm_repair(
                 intent=intent,
                 normalized_text=normalized_text,
                 state=state_snapshot,
                 candidate_response=candidate_response,
             )
+            if updated_fields and repair_reason == "intent_requested_llm":
+                force_llm = False
+                repair_reason = ""
 
             if force_llm:
                 await self._publish_status("complex_request_detected")
@@ -3193,7 +3246,6 @@ class ParticipantAudioSession:
 
                 next_graph_node = candidate_node or self._dialogue_state.current_node
 
-            # 9. Если LLM не нужна, отдаём candidate
             elif candidate_response:
                 await self._publish_status("simple_intent_detected")
 
@@ -3202,7 +3254,21 @@ class ParticipantAudioSession:
                 llm_latency_ms = 0
                 next_graph_node = candidate_node or self._dialogue_state.current_node
 
-            # 10. Если вообще нет candidate — обычный LLM
+            elif self._should_try_stalled_slot_rescue(
+                normalized_text=normalized_text,
+                intent=intent,
+                updated_fields=updated_fields,
+                state_snapshot=state_snapshot,
+            ):
+                await self._publish_status("complex_request_detected")
+                response_text, llm_reply, llm_latency_ms = await self._generate_stalled_slot_rescue(
+                    normalized_text=normalized_text,
+                    history=self._history,
+                    state_snapshot=state_snapshot,
+                    utterance_id=utterance_id,
+                )
+                next_graph_node = candidate_node or self._dialogue_state.current_node
+
             else:
                 await self._publish_status("complex_request_detected")
 
@@ -3241,7 +3307,6 @@ class ParticipantAudioSession:
                     reason_hint="normal_generation",
                 )
 
-            # 11. Финальный anti-repeat перед отправкой
             if normalize_for_compare(response_text) == normalize_for_compare(self._dialogue_state.last_agent_text):
                 response_text, llm_reply, llm_latency_ms = await self._generate_adaptive_repair_reply(
                     participant_identity=self._participant.identity,
@@ -3252,14 +3317,22 @@ class ParticipantAudioSession:
                     utterance_id=utterance_id,
                 )
 
-            # 12. Обновляем state после ответа
+            raw_response_text = response_text
+            response_ready_time_ms = int(time.time() * 1000)
+            self._log(
+                f"turn decision participant={self._participant.identity} "
+                f"utterance_id={utterance_id} router_intent={intent.intent} "
+                f"action={intent.action} use_llm={str(intent.use_llm).lower()} "
+                f"final_response_text={response_text!r}"
+            )
+
             self._dialogue_state.update_from_agent(
                 response_text,
                 llm_reply.next_step if llm_reply else "",
                 kb=self._kb,
                 current_node=next_graph_node,
             )
-
+            self._last_agent_message = response_text
             self._history.append({"role": "assistant", "text": response_text})
             self._history = self._history[-12:]
             self._needs_rescue_prompt = False
