@@ -1065,6 +1065,121 @@ def dedupe_compact_strings(items: list[str], *, limit: int) -> list[str]:
             break
     return result
 
+def normalize_for_compare(text: str) -> str:
+    value = text.lower().replace("ё", "е")
+    value = re.sub(r"[^\wа-яa-z0-9\s]", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def looks_like_meaningful_unknown(text: str) -> bool:
+    value = normalize_for_compare(text)
+    if not value:
+        return False
+
+    if value in {"ммм", "эм", "ээ", "а", "и", "ну"}:
+        return False
+
+    if len(value.split()) >= 2:
+        return True
+
+    meaningful_singletons = {
+        "москва",
+        "москвe",
+        "питерe",
+        "спб",
+        "авто",
+        "дом",
+        "квартира",
+        "свободен",
+        "свободна",
+        "залог",
+        "залоге",
+        "да",
+        "нет",
+    }
+    return value in meaningful_singletons
+
+
+def detect_repair_markers(text: str) -> list[str]:
+    lowered = normalize_for_compare(text)
+    flags: list[str] = []
+
+    not_actual_markers = (
+        "не актуален",
+        "не актуально",
+        "не нужно",
+        "не интересно",
+        "нет спасибо",
+        "вопрос закрыт",
+        "уже решил",
+    )
+    if any(marker in lowered for marker in not_actual_markers):
+        flags.append("client_not_actual")
+
+    confusion_markers = (
+        "не понял",
+        "что это за вопрос",
+        "по какому поводу",
+        "что вы хотите",
+        "не понимаю",
+        "зачем это",
+    )
+    if any(marker in lowered for marker in confusion_markers):
+        flags.append("client_confused")
+
+    repeat_complaint_markers = (
+        "нельзя один и тот же",
+        "одно и то же",
+        "повторяете",
+        "я уже сказал",
+        "я же говорю",
+        "я ответил",
+    )
+    if any(marker in lowered for marker in repeat_complaint_markers):
+        flags.append("client_complains_repeat")
+
+    irritation_markers = (
+        "ну и что",
+        "и что",
+        "отстаньте",
+        "не звоните",
+    )
+    if any(marker in lowered for marker in irritation_markers):
+        flags.append("client_pressure")
+
+    return flags
+
+
+def should_force_llm_repair(
+    *,
+    intent: IntentResult,
+    normalized_text: str,
+    state: dict[str, Any],
+    candidate_response: str,
+) -> tuple[bool, str]:
+    text = normalize_for_compare(normalized_text)
+    awaiting = str(state.get("awaiting_field", "") or state.get("next_required_field", "")).strip()
+    last_agent = str(state.get("last_agent_text", "")).strip()
+
+    repair_flags = detect_repair_markers(normalized_text)
+    if repair_flags:
+        return True, ",".join(repair_flags)
+
+    if intent.use_llm or intent.action == Action.CALL_LLM.value:
+        return True, "intent_requested_llm"
+
+    if intent.intent in {Intent.UNKNOWN_SHORT.value, Intent.CLARIFY.value} and looks_like_meaningful_unknown(normalized_text):
+        return True, "meaningful_unknown_short"
+
+    if text in {"да", "нет", "угу", "ага"} and awaiting:
+        return True, "short_answer_needs_context"
+
+    if candidate_response and last_agent:
+        if normalize_for_compare(candidate_response) == normalize_for_compare(last_agent):
+            return True, "repeated_agent_response"
+
+    return False, ""
 
 def parse_llm_reply(
     raw_text: str,
@@ -2570,6 +2685,73 @@ class ParticipantAudioSession:
             return False
         return True
 
+    async def _generate_adaptive_repair_reply(
+    self,
+    *,
+    participant_identity: str,
+    normalized_text: str,
+    raw_text: str,
+    reason: str,
+    candidate_response: str,
+    utterance_id: str,
+) -> tuple[str, LlmReply | None, int]:
+        state = self._dialogue_state.snapshot()
+        graph_context = self._tool_graph.llm_context_for_text(normalized_text, state) if self._tool_graph else {}
+        resume_question = ""
+        resume_node = ""
+
+        if self._tool_graph:
+            resume = self._tool_graph.question_for_state(state)
+            if resume:
+                resume_node, resume_question = resume
+
+        repair_context = {
+            "mode": "adaptive_repair",
+            "reason": reason,
+            "client_text": raw_text,
+            "normalized_text": normalized_text,
+            "candidate_bad_response": candidate_response,
+            "last_agent_text": state.get("last_agent_text", ""),
+            "awaiting_field": state.get("awaiting_field", ""),
+            "next_required_field": state.get("next_required_field", ""),
+            "current_node": state.get("current_node", ""),
+            "resume_node": resume_node,
+            "resume_question": resume_question,
+            "known_facts": state.get("known_facts", {}),
+            "rules": [
+                "Если клиент уже ответил на вопрос, не повторяй этот вопрос.",
+                "Если клиент раздражён или не понял вопрос, сначала коротко признай это.",
+                "Если candidate_bad_response повторяет прошлый вопрос, запрещено его использовать.",
+                "Если клиент сказал, что вопрос не актуален, не спрашивай сумму.",
+                "Если клиент дал слот, подтверди его и перейди к следующему слоту.",
+                "Ответ — максимум 1–2 коротких предложения.",
+            ],
+        }
+
+        try:
+            llm_reply, llm_latency_ms = await self._llm_service.generate_response(
+                normalized_text=normalized_text,
+                history=self._history,
+                dialogue_state=state,
+                knowledge=self._kb.retrieve(normalized_text, state, limit=4) if self._kb else [],
+                truth_rules=self._kb.truth_rules if self._kb else (),
+                examples=[],
+                graph_context={**graph_context, **repair_context},
+            )
+            response_text = sanitize_voice_response(
+                llm_reply.reply_tts,
+                fallback=self._config.fallback_complex_text,
+            )
+            return response_text, llm_reply, llm_latency_ms
+
+        except Exception as exc:
+            self._log(f"adaptive repair failed utterance={utterance_id}: {exc}")
+
+            if resume_question:
+                return resume_question, None, 0
+
+            return self._config.fallback_complex_text, None, 0
+    
     async def _generate_stalled_slot_rescue(
         self,
         *,
@@ -2671,281 +2853,164 @@ class ParticipantAudioSession:
         next_graph_node = self._dialogue_state.current_node
 
         try:
-            if not self._config.stt_enabled:
-                raise RuntimeError("STT is disabled by configuration")
-
-            transcript = await asyncio.to_thread(self._stt_service.transcribe, audio_samples, duration_ms)
-
-            await self._event_bus.publish_json(
-                {
-                    "type": "transcript",
-                    "utterance_id": utterance_id,
-                    "participant_identity": self._participant.identity,
-                    "text": transcript.text,
-                    "language": transcript.language,
-                    "confidence": transcript.confidence,
-                    "final": True,
-                    "duration_ms": transcript.duration_ms,
-                    "stt_latency_ms": transcript.stt_latency_ms,
-                },
-                destination_identities=[self._participant.identity],
-            )
-
+            # 1. STT -> normalize
             normalized_text = self._normalizer.normalize(transcript.text)
-            stt_done_time_ms = int(time.time() * 1000)
-            self._log(
-                f"turn transcript participant={self._participant.identity} "
-                f"utterance_id={utterance_id} raw_stt_text={transcript.text!r} "
-                f"normalized_text={normalized_text!r} confidence={transcript.confidence:.3f}"
+
+            # 2. Обновляем state
+            updated_fields = self._dialogue_state.update_from_user(
+                transcript.text,
+                normalized_text,
+                kb=self._kb,
             )
-            if is_low_information_transcript(transcript.text, normalized_text):
-                if self._needs_rescue_prompt:
-                    response_text = self._responses.rescue_prompt()
-                    suppress_response = False
-                    rescue_only = True
-                    self._needs_rescue_prompt = False
-                else:
-                    suppress_response = True
-                    error_stage = "ignored_low_information"
-                    self._log(
-                        f"ignored low-information transcript participant={self._participant.identity} "
-                        f"utterance_id={utterance_id} text={transcript.text!r}"
-                    )
-                    return
-            if self._is_stale_turn(turn_revision):
-                suppress_response = True
-                error_stage = "superseded_turn"
-                self._log(
-                    f"skipped stale utterance before routing participant={self._participant.identity} "
-                    f"utterance_id={utterance_id}"
-                )
-                return
 
-            if not rescue_only:
-                graph_cached_reply = None
-                if self._tool_graph is not None:
-                    graph_cached_reply = self._tool_graph.cached_reply_for_text(
-                        normalized_text,
-                        self._dialogue_state.snapshot(),
-                    )
-                faq_answer = graph_cached_reply.reply_text if graph_cached_reply else self._kb.match_faq(normalized_text)
-                if graph_cached_reply is not None:
-                    next_graph_node = graph_cached_reply.next_node
-                if transcript.text:
-                    updated_fields = self._dialogue_state.update_from_user(
-                        transcript.text,
-                        normalized_text,
-                        kb=self._kb,
-                    )
-                    if not updated_fields:
-                        forced_fields = self._dialogue_state.force_capture_expected_slot(
-                            transcript.text,
-                            normalized_text,
-                        )
-                        if forced_fields:
-                            updated_fields |= forced_fields
-                            self._dialogue_state.next_required_field = self._dialogue_state._resolve_next_required_field(
-                                self._kb
-                            )
-                    self._history.append({"role": "user", "text": normalized_text or transcript.text})
-                    self._history = self._history[-12:]
-                state_snapshot = self._dialogue_state.snapshot()
-                opening_nodes = {
-                    "opening",
-                    "check_convenience",
-                    "small_talk",
-                    "who_are_you",
-                    "identity_company_faq",
-                    "source_of_number_faq",
-                    "robot_check",
-                    "memory_denial_faq",
-                    "callback_reentry",
-                }
-                self._log(
-                    f"turn state participant={self._participant.identity} "
-                    f"utterance_id={utterance_id} updated_fields={sorted(updated_fields)!r} "
-                    f"scenario={state_snapshot.get('scenario', '')!r} "
-                    f"awaiting_field={state_snapshot.get('awaiting_field', '')!r} "
-                    f"next_required_field={state_snapshot.get('next_required_field', '')!r} "
-                    f"known_facts={state_snapshot.get('known_facts', {})!r}"
-                )
-                await self._publish_status("routing_intent")
-                decision_started_at = time.perf_counter()
-                intent = self._router.route(
-                    normalized_text,
-                    current_node=str(state_snapshot.get("current_node", "")).strip(),
-                    stage=str(state_snapshot.get("stage", "")).strip(),
-                )
-                if (
-                    transcript.text
-                    and transcript.confidence >= self._config.stt_confidence_floor
-                    and not faq_answer
-                    and self._should_use_adaptive_classifier(intent, normalized_text)
-                ):
-                    try:
-                        intent, classifier_latency_ms = await self._llm_service.classify_intent(
-                            normalized_text=normalized_text,
-                            history=self._history,
-                            dialogue_state=state_snapshot,
-                            initial_intent=intent,
-                        )
-                    except Exception as exc:
-                        self._log(
-                            f"adaptive classifier fallback for {self._participant.identity}: {exc}"
-                        )
-                if decision_started_at > 0:
-                    decision_latency_ms = int((time.perf_counter() - decision_started_at) * 1000)
-                    router_latency_ms = max(0, decision_latency_ms - classifier_latency_ms)
-                intent_ready_time_ms = int(time.time() * 1000)
+            # 3. Принудительно пытаемся поймать ожидаемый слот
+            forced_fields = self._dialogue_state.force_capture_expected_slot(
+                transcript.text,
+                normalized_text,
+            )
 
-                await self._event_bus.publish_json(
-                    {
-                        "type": "intent",
-                        "utterance_id": utterance_id,
-                        "participant_identity": self._participant.identity,
-                        "intent": intent.intent,
-                        "confidence": intent.confidence,
-                        "use_llm": intent.use_llm,
-                        "action": intent.action,
-                    },
-                    destination_identities=[self._participant.identity],
+            if forced_fields:
+                updated_fields |= forced_fields
+                self._log(f"force captured expected slot: {sorted(forced_fields)}")
+
+            # 4. История
+            self._history.append({"role": "user", "text": normalized_text or transcript.text})
+            self._history = self._history[-12:]
+
+            # 5. Snapshot после обновления state
+            state_snapshot = self._dialogue_state.snapshot()
+
+            # 6. Router / classifier
+            intent = self._router.route(
+                normalized_text,
+                current_node=str(state_snapshot.get("current_node", "")).strip(),
+                stage=str(state_snapshot.get("stage", "")).strip(),
+            )
+
+            # 7. Готовим candidate, но НЕ отправляем сразу
+            candidate_response = ""
+            candidate_node = self._dialogue_state.current_node
+
+            cached = (
+                self._tool_graph.cached_reply_for_text(normalized_text, state_snapshot)
+                if self._tool_graph is not None
+                else None
+            )
+
+            if cached:
+                candidate_response = cached.reply_text
+                candidate_node = cached.next_node
+
+            elif updated_fields:
+                graph_question = (
+                    self._tool_graph.question_for_state(state_snapshot)
+                    if self._tool_graph is not None
+                    else None
                 )
 
-                if not transcript.text:
-                    response_text = self._config.fallback_low_confidence_text
-                elif (
-                    transcript.confidence < self._config.stt_confidence_floor
-                    and not self._skip_confidence_gate_for(intent)
-                ):
-                    response_text = self._config.fallback_low_confidence_text
-                elif (
-                    intent.intent in {Intent.READY_TO_TALK.value, Intent.CONFIRM.value}
-                    and str(state_snapshot.get("current_node", "")).strip() in opening_nodes
-                ):
-                    await self._publish_status("simple_intent_detected")
-                    response_text = self._state_guided_reply(intent)
-                    next_graph_node = self._dialogue_state.current_node
-                elif intent.intent in {Intent.WHY_NEED_INFO.value, Intent.SERVICE_COMPLAINT.value}:
-                    await self._publish_status("simple_intent_detected")
-                    response_text = self._repair_and_resume_reply(intent)
-                    next_graph_node = self._dialogue_state.current_node
-                elif faq_answer:
-                    await self._publish_status("simple_intent_detected")
-                    response_text = faq_answer
-                elif self._should_advance_by_state(intent, updated_fields):
-                    await self._publish_status("simple_intent_detected")
-                    response_text = self._state_guided_reply(intent)
-                    next_graph_node = self._dialogue_state.current_node
-                elif self._should_try_stalled_slot_rescue(
+                if graph_question:
+                    candidate_node, graph_question_text = graph_question
+                    candidate_response = bridge_response_for_updated_fields(
+                        updated_fields=updated_fields,
+                        state=state_snapshot,
+                        graph_question=graph_question_text,
+                    )
+
+            elif not intent.use_llm and intent.action != Action.CALL_LLM.value:
+                graph_question = (
+                    self._tool_graph.question_for_state(state_snapshot)
+                    if self._tool_graph is not None
+                    else None
+                )
+
+                if graph_question:
+                    candidate_node, candidate_response = graph_question
+
+            # 8. Главное: semantic gate / anti-stuck / fallback -> LLM repair
+            force_llm, repair_reason = should_force_llm_repair(
+                intent=intent,
+                normalized_text=normalized_text,
+                state=state_snapshot,
+                candidate_response=candidate_response,
+            )
+
+            if force_llm:
+                await self._publish_status("complex_request_detected")
+
+                response_text, llm_reply, llm_latency_ms = await self._generate_adaptive_repair_reply(
+                    participant_identity=self._participant.identity,
                     normalized_text=normalized_text,
-                    intent=intent,
-                    updated_fields=updated_fields,
-                    state_snapshot=state_snapshot,
-                ):
-                    await self._publish_status("complex_request_detected")
-                    response_text, llm_reply, llm_latency_ms = await self._generate_stalled_slot_rescue(
-                        normalized_text=normalized_text,
-                        history=self._history,
-                        state_snapshot=state_snapshot,
-                        utterance_id=utterance_id,
-                    )
-                    next_graph_node = self._dialogue_state.current_node
-                elif intent.use_llm:
-                    await self._publish_status("complex_request_detected")
-                    if self._llm_service.enabled:
-                        try:
-                            state_snapshot = self._dialogue_state.snapshot()
-                            knowledge = self._kb.retrieve(normalized_text, state_snapshot)
-                            examples = self._kb.relevant_examples(normalized_text)
-                            graph_context = (
-                                self._tool_graph.llm_context_for_text(normalized_text, state_snapshot)
-                                if self._tool_graph is not None
-                                else None
-                            )
-                            if graph_context:
-                                next_graph_node = str(graph_context.get("node_name", "")).strip() or next_graph_node
-                            llm_task = asyncio.create_task(
-                                self._llm_service.generate_response(
-                                    normalized_text=normalized_text,
-                                    history=self._history,
-                                    dialogue_state=state_snapshot,
-                                    knowledge=knowledge,
-                                    truth_rules=self._kb.truth_rules,
-                                    examples=examples,
-                                    graph_context=graph_context,
-                                )
-                            )
-                            if self._config.voice_bridge_on_llm and self._config.tts_enabled:
-                                bridge_text = self._llm_bridge_text()
-                                if bridge_text and not self._is_stale_turn(turn_revision):
-                                    self._log(
-                                        f"llm bridge start participant={self._participant.identity} "
-                                        f"utterance_id={utterance_id} text={bridge_text!r}"
-                                    )
-                                    await self._publish_status("speaking")
-                                    self._is_speaking = True
-                                    try:
-                                        _, _, _, _, _, _, _ = await self._speak_response(
-                                            utterance_id=f"{utterance_id}-bridge",
-                                            response_text=bridge_text,
-                                            intent_value=Intent.COMPLEX_REQUEST.value,
-                                        )
-                                    finally:
-                                        self._is_speaking = False
-                                    self._log(
-                                        f"llm bridge done participant={self._participant.identity} "
-                                        f"utterance_id={utterance_id}"
-                                    )
-                                    await self._publish_status("complex_request_detected")
-                            llm_reply, llm_latency_ms = await llm_task
-                            response_text = validate_llm_reply(
-                                reply_tts=llm_reply.reply_tts,
-                                fallback_reply=self._state_fallback_reply(),
-                                state=state_snapshot,
-                                knowledge=knowledge,
-                                truth_rules=self._kb.truth_rules,
-                            )
-                        except Exception as exc:
-                            self._log(f"llm fallback failed for {self._participant.identity}: {exc}")
-                            response_text = self._state_fallback_reply()
-                    else:
-                        response_text = self._state_fallback_reply()
-                        next_graph_node = self._dialogue_state.current_node
-                else:
-                    if intent.action == "ask_next_slot":
-                        response_text = self._state_guided_reply(intent)
-                        next_graph_node = self._dialogue_state.current_node
-                    else:
-                        await self._publish_status("simple_intent_detected")
-                        response_text = self._responses.choose(
-                            intent,
-                            last_agent_message=self._last_agent_message,
-                        )
-                raw_response_text = response_text
-                response_ready_time_ms = int(time.time() * 1000)
-                self._log(
-                    f"turn decision participant={self._participant.identity} "
-                    f"utterance_id={utterance_id} router_intent={intent.intent} "
-                    f"action={intent.action} use_llm={str(intent.use_llm).lower()} "
-                    f"final_response_text={response_text!r}"
+                    raw_text=transcript.text,
+                    reason=repair_reason,
+                    candidate_response=candidate_response,
+                    utterance_id=utterance_id,
                 )
 
-            if self._is_stale_turn(turn_revision):
-                suppress_response = True
-                error_stage = "superseded_turn"
-                self._log(
-                    f"skipped stale utterance after routing participant={self._participant.identity} "
-                    f"utterance_id={utterance_id}"
-                )
-                return
+                next_graph_node = candidate_node or self._dialogue_state.current_node
 
-            self._last_agent_message = response_text
+            # 9. Если LLM не нужна, отдаём candidate
+            elif candidate_response:
+                await self._publish_status("simple_intent_detected")
+
+                response_text = candidate_response
+                llm_reply = None
+                llm_latency_ms = 0
+                next_graph_node = candidate_node or self._dialogue_state.current_node
+
+            # 10. Если вообще нет candidate — обычный LLM
+            else:
+                await self._publish_status("complex_request_detected")
+
+                state_snapshot = self._dialogue_state.snapshot()
+                knowledge = self._kb.retrieve(normalized_text, state_snapshot)
+                examples = self._kb.relevant_examples(normalized_text)
+
+                graph_context = (
+                    self._tool_graph.llm_context_for_text(normalized_text, state_snapshot)
+                    if self._tool_graph is not None
+                    else None
+                )
+
+                if graph_context:
+                    next_graph_node = str(graph_context.get("node_name", "")).strip() or next_graph_node
+
+                llm_reply, llm_latency_ms = await self._llm_service.generate_response(
+                    normalized_text=normalized_text,
+                    history=self._history,
+                    dialogue_state=state_snapshot,
+                    knowledge=knowledge,
+                    truth_rules=self._kb.truth_rules,
+                    examples=examples,
+                    graph_context=graph_context,
+                )
+
+                response_text = validate_llm_reply(
+                    reply_tts=llm_reply.reply_tts,
+                    fallback_reply=self._state_fallback_reply(),
+                    state=state_snapshot,
+                    knowledge=knowledge,
+                    truth_rules=self._kb.truth_rules,
+                )
+
+            # 11. Финальный anti-repeat перед отправкой
+            if normalize_for_compare(response_text) == normalize_for_compare(self._dialogue_state.last_agent_text):
+                response_text, llm_reply, llm_latency_ms = await self._generate_adaptive_repair_reply(
+                    participant_identity=self._participant.identity,
+                    normalized_text=normalized_text,
+                    raw_text=transcript.text,
+                    reason="repeated_final_response",
+                    candidate_response=response_text,
+                    utterance_id=utterance_id,
+                )
+
+            # 12. Обновляем state после ответа
             self._dialogue_state.update_from_agent(
                 response_text,
                 llm_reply.next_step if llm_reply else "",
                 kb=self._kb,
                 current_node=next_graph_node,
             )
+
             self._history.append({"role": "assistant", "text": response_text})
             self._history = self._history[-12:]
             self._needs_rescue_prompt = False
