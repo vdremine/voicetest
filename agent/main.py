@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import signal
 from typing import Any
@@ -179,6 +180,23 @@ async def run() -> None:
         sender = data_packet.participant.identity if data_packet.participant else "server"
         topic = data_packet.topic or "-"
         log(f"data received from {sender} on topic={topic}: {payload}")
+        if topic != "agent_input" or data_packet.participant is None:
+            return
+        try:
+            parsed = json.loads(payload)
+        except Exception:
+            return
+        if not isinstance(parsed, dict):
+            return
+        if parsed.get("type") != "lead_profile":
+            return
+        profile = parsed.get("lead_profile")
+        if not isinstance(profile, dict):
+            return
+        schedule(
+            voice_sessions.apply_lead_profile(data_packet.participant, profile),
+            label="apply_lead_profile",
+        )
 
     @room.on("track_published")
     def on_track_published(

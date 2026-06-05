@@ -196,6 +196,8 @@ class DialogueState:
 
     def snapshot(self) -> dict[str, Any]:
         summary_parts: list[str] = []
+        if self.name:
+            summary_parts.append(f"имя: {self.name}")
         if self.amount_text:
             summary_parts.append(f"сумма: {self.amount_text}")
         if self.goal:
@@ -229,6 +231,78 @@ class DialogueState:
             "last_user_text": self.last_user_text,
             "last_agent_text": self.last_agent_text,
         }
+
+    def bootstrap_lead_profile(
+        self,
+        profile: dict[str, Any],
+        *,
+        kb: KnowledgeBase | None = None,
+    ) -> set[str]:
+        updated_fields: set[str] = set()
+        if not isinstance(profile, dict):
+            return updated_fields
+
+        client_name = str(profile.get("client_name", "") or "").strip()
+        desired_amount = str(profile.get("desired_amount", "") or "").strip()
+        property_hint = str(profile.get("property_hint", "") or "").strip()
+        last_contact_context = str(profile.get("last_contact_context", "") or "").strip()
+        scenario_hint = str(profile.get("scenario_hint", "") or "").strip()
+        speed_emphasis = profile.get("speed_emphasis")
+
+        if client_name:
+            self.name = client_name
+            self.known_facts["client_name"] = client_name
+            updated_fields.add("client_name")
+
+        if desired_amount:
+            normalized_amount = desired_amount.lower().replace("ё", "е")
+            parsed_amount = self._extract_amount(normalized_amount)
+            self.known_facts["lead_amount_phrase"] = desired_amount
+            if parsed_amount:
+                self.amount_text = parsed_amount
+                self.known_facts["amount"] = parsed_amount
+                self.known_facts["нужная_сумма"] = parsed_amount
+                updated_fields.add("нужная_сумма")
+
+        if property_hint:
+            normalized_property = property_hint.lower().replace("ё", "е")
+            self.known_facts["property_hint"] = property_hint
+            object_type = self._detect_object_type(normalized_property)
+            if object_type:
+                self.object_type = object_type
+                self.known_facts["вид_объекта"] = object_type
+                updated_fields.add("вид_объекта")
+            city = self._detect_city(property_hint)
+            if city:
+                self.city = city
+                self.known_facts["region"] = city
+                self.known_facts["регион"] = city
+                updated_fields.add("регион")
+
+        if last_contact_context:
+            self.known_facts["last_contact_context"] = last_contact_context
+
+        if scenario_hint:
+            self.known_facts["scenario_hint"] = scenario_hint
+            if scenario_hint == "returning_customer":
+                self.plan_name = "refinance_or_returning_customer"
+                self.current_node = "returning_customer_opening"
+
+        if isinstance(speed_emphasis, bool):
+            if speed_emphasis:
+                self.known_facts["speed_emphasis"] = "yes"
+        elif str(speed_emphasis or "").strip().lower() in {"1", "true", "yes", "да", "speed"}:
+            self.known_facts["speed_emphasis"] = "yes"
+
+        if any((client_name, desired_amount, property_hint, last_contact_context)):
+            self.known_facts["prefilled_lead"] = "yes"
+            if self.current_node == "opening":
+                self.current_node = "callback_reentry"
+            self.stage = "greeting"
+
+        if kb is not None:
+            self.next_required_field = self._resolve_next_required_field(kb)
+        return updated_fields
 
     def force_capture_expected_slot(self, raw_text: str, normalized_text: str) -> set[str]:
         expected = (self.next_required_field or "").strip()

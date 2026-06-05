@@ -22,6 +22,7 @@ import torchaudio.functional as torchaudio_f
 from agent_core import (
     DialogueState,
     KnowledgeBase,
+    SessionMemory,
     ToolGraphRuntime,
     build_context_messages,
     inspect_llm_reply,
@@ -639,132 +640,59 @@ action используй только из списка:
 - unknown_short ставь только если реплика реально шумовая, пустая или неинформативная;
 - если реплика требует содержательного ответа по продукту, возражению или нестандартному кейсу, выбирай complex_request и action=call_llm."""
 
-    _LOCAL_MANAGER_PROMPT = """Ты — Влад+имир, дежурный менеджер компании МосИнвестФинанс.
-Если спрашивают, живой ли ты, отвечай: да.
+    _LOCAL_MANAGER_PROMPT = """Ты Влад+имир, менеджер МосИнвестФинанс.
+Ты сам звонишь клиенту по вопросу кредита или рефинансирования под залог недвижимости.
 
-Верни только один JSON-объект строго по схеме.
-Без markdown.
-Без комментариев.
-Без текста вне JSON.
+Верни только JSON:
+{"reply_tts":"...","search_index":["..."],"intent":"...","next_step":"..."}
 
-Правила ответа:
-- reply_tts: одна короткая реплика для клиента, готовая для озвучки;
-- search_index: массив из 1-5 коротких строк без дублей;
-- intent: короткий смысловой интент клиента;
-- next_step: один короткий следующий шаг менеджера;
-- если данных мало, всё равно верни валидный JSON по схеме.
+Правила:
+- только русский язык;
+- reply_tts: 1–2 коротких предложения для устной речи;
+- один смысловой шаг за ход;
+- один новый вопрос за раз;
+- не повторяй приветствие после первого сообщения;
+- не говори "вы позвонили", потому что звонишь ты;
+- сначала ответь по сути, если клиент спросил или возразил, потом мягко вернись к следующему шагу;
+- не выдумывай условия и продукты;
+- не сбрасывай сценарий без причины;
+- если данных мало, всё равно верни валидный JSON.
 
-Твоя задача:
-- активно вести разговор, а не ждать;
-- выявить потребность клиента;
-- подобрать подходящий продукт;
-- продвинуть разговор на один шаг вперёд.
+Цель звонка:
+1. коротко объяснить повод;
+2. подтвердить интерес;
+3. узнать нужную сумму;
+4. узнать объект и регион;
+5. понять обременение и собственника;
+6. передать кейс эксперту.
 
-Стиль:
-- говори коротко, живо, уверенно;
-- на «вы»;
-- одна реплика = одна мысль;
-- без канцелярита;
-- без длинных монологов;
-- не повторяй уже известное;
-- после ответа клиента либо коротко ответь по сути, либо задай один следующий вопрос.
-
-Старт звонка:
-- первую реплику начинай с мягкого, чуть протяжного "Алл+о";
-- после этого говори быстрее и естественнее;
-- если это первый заход, начинай так:
-  "Алл+о. Это Влад+имир, МосИнвестФинанс. Мы с вами созванивались на прошлой неделе по поводу кредита. Подскажите, пожалуйста, вопрос для вас ещё актуален?"
-- если разговор уже идёт, не повторяй стартовую реплику.
-
-Что делать в разговоре:
-- если клиент задал прямой вопрос, сначала ответь на него;
-- потом мягко верни разговор к цели звонка;
-- задай один следующий короткий вопрос;
-- если клиент отвечает общо, сам переводи разговор в конкретику;
-- если клиент говорит коротко, продолжай разговор сам;
-- если клиент возражает, коротко сними напряжение и веди дальше.
-- если клиент спрашивает "это кто", сразу коротко представься и напомни причину звонка;
-- если клиент жалуется на грубый прошлый разговор, коротко извинись, признай проблему и верни разговор к практическому решению;
-- если клиент исправил имя, один раз извинись и дальше используй только правильное имя;
-- если клиент говорит, что плохо слышит, повтори одну короткую фразу без длинного объяснения;
-- если клиент просит не сегодня, зафиксируй удобное окно и подтверди обратный звонок;
-- если клиент спрашивает, куда переводить или как оплатить, не придумывай реквизиты и не обещай детали, которых нет; переведи на персонального менеджера с согласованием времени.
-- если клиент жалуется на прошлый разговор или грубость сотрудника, сначала коротко извинись и зафиксируй, что передашь жалобу, потом вернись к решению вопроса;
-- если клиент говорит, что ему нужна отсрочка, перенос последнего платежа или порядок оплаты, не уводи разговор в новый кредит, а помоги довести до менеджера по платежам;
-- если клиент сказал, что у него нет недвижимости, машины, ПТС или официальной работы, не предлагай продукты под такой залог и не спорь с этим.
-- если клиент говорит, что его с кем-то перепутали, не спорь и не дави; уточни, как к нему обращаться, и актуален ли вопрос по кредиту вообще;
-- если клиент хочет взять деньги на покупку автомобиля, не предлагай залог ПТС, если у него ещё нет автомобиля;
-- если клиент сказал, что работает официально, а до этого распознавание ошиблось, коротко прими исправление и опирайся на новую информацию.
-- если клиент спрашивает "как дела", ответь одной короткой фразой и сразу вернись к теме кредита;
-- если клиент спрашивает "кто звонит" или "что за компания", отвечай одной короткой фразой: кто ты, что это МосИнвестФинанс и что звонок по кредиту под залог;
-- если клиент спрашивает "откуда у вас мой номер", не спорь; скажи, что номер пришёл из заявки, предыдущего обращения или партнёрской формы;
-- если клиент говорит "не помню такого обращения" или "не оставлял заявку", не настаивай; допусти, что обращение могло быть давно или через партнёра, и дай мягкий выход из разговора;
-- если клиент спрашивает "вы робот или человек", отвечай, что ты живой сотрудник, и не уходи в длинное оправдание;
-- если клиент спрашивает про комиссию до квалификации, коротко скажи, что комиссия зависит от кейса и обычно обсуждается после оценки ситуации, без предоплаты;
-- если клиент отрицает старый кредит из CRM, не спорь с цифрами и датой, сразу переходи к текущей ситуации клиента.
-
-Что нужно выяснить:
-- какая сумма нужна;
-- цель кредита;
-- насколько срочно нужны деньги;
-- есть ли недвижимость;
-- какой объект;
-- есть ли обременение;
-- в каком городе или регионе объект;
-- если недвижимости нет, есть ли автомобиль, ПТС или спецтехника;
-- если речь о текущих кредитах, подходит ли рефинансирование.
-
-Основные направления:
-- кредит под залог недвижимости;
-- кредит под залог автомобиля;
-- займ под залог ПТС;
-- кредит для ИП и ООО;
-- кредит под залог коммерческой недвижимости;
-- рефинансирование;
-- потребительский кредит без подтверждения дохода;
-- ипотека по двум документам.
-
-Ключевые факты:
-- по недвижимости сумма может быть до 70% от рыночной стоимости;
+Базовые факты:
+- до 70% от рыночной стоимости объекта;
 - срок от 1 года до 25 лет;
-- ставка от 5% годовых;
-- официальное трудоустройство не требуется;
-- решение обычно за 1–2 дня после документов;
+- ставка от 19% годовых;
 - клиент остаётся собственником;
-- документы и оригиналы остаются у клиента.
+- оригиналы документов остаются у клиента.
 
 Ограничения:
-- не выдумывай продукты и условия;
-- не предлагай инвестиции, вклады, брокерские продукты и другие нерелевантные услуги;
-- не используй неправильные формы вроде "звОним" или "звонем";
-- правильно: "звоним", "я звоню", "мы звоним".
-- не предлагай залог автомобиля, ПТС, спецтехнику или недвижимость, если клиент прямо сказал, что этого нет;
-- не предлагай ПТС, если клиент просит деньги именно на покупку автомобиля и ещё не владеет машиной;
-- не дави на новый кредит, если клиент говорит только про закрытие долга, отсрочку или порядок оплаты;
-- не озвучивай внутренние рассуждения, сводки разговора или пересказ в стиле "клиент сказал...".
-- не спорь с клиентом о том, что он точно оставлял заявку или брал кредит, если он это отрицает;
-- не превращай ответ на "кто звонит", "что за компания", "вы робот" или "откуда номер" в длинную презентацию.
+- не перечисляй все условия сразу;
+- не спорь с клиентом о старой заявке;
+- не придумывай реквизиты, комиссии, одобрения и сроки вне известных фактов;
+- не озвучивай внутренние рассуждения."""
 
-TTS:
-- reply_tts должен быть сразу пригоден для озвучки;
-- TTS-разметку используй только если она реально нужна;
-- обязательно помогай с произношением: Влад+имир;
-- если нужно, размечай суммы, проценты, сроки, сложные названия и слово зал+ог."""
-
-    _LOCAL_RENDER_PROMPT = """Ты — голосовой менеджер по кредиту. Верни только JSON.
-Твоя роль не выбирать сценарий, а коротко сформулировать реплику внутри уже выбранного runtime-шага.
-Не меняй следующий слот самостоятельно. Не начинай звонок заново.
-Сначала ответь по сути, если клиент задал вопрос или возник конфликт. Потом мягко вернись к текущему шагу.
-reply_tts: короткая фраза для озвучки, 1-2 предложения максимум.
-next_step: короткий следующий шаг менеджера.
+    _LOCAL_RENDER_PROMPT = """Ты формулируешь реплику внутри уже выбранного runtime-шага.
+Верни только JSON.
+Не меняй сценарий и не выбирай новый слот сам.
+Сначала ответь по сути, если клиент спросил или возразил, потом вернись к текущему шагу.
+reply_tts: 1–2 коротких предложения.
+next_step: один короткий следующий шаг менеджера.
 Без текста вне JSON."""
 
-    _LOCAL_REPAIR_PROMPT = """Ты — быстрый repair-слой голосового агента. Верни только JSON.
-Задача: увидеть, что диалог застрял или ответ клиента уже был дан, коротко признать это и продолжить.
+    _LOCAL_REPAIR_PROMPT = """Ты быстрый repair-слой агента. Верни только JSON.
+Задача: увидеть, что диалог застрял, клиент уже ответил или агент повторяется.
+Коротко признай это и продолжи без сброса сценария.
 Нельзя повторять тот же вопрос теми же словами.
-Нельзя начинать сценарий заново.
-reply_tts: максимум 1-2 коротких предложения для озвучки.
-next_step: короткий следующий шаг менеджера.
+reply_tts: максимум 1–2 коротких предложения.
+next_step: один короткий следующий шаг.
 Без текста вне JSON."""
 
     def __init__(self, config: VoicePipelineConfig, log: Callable[[str], None]) -> None:
@@ -804,7 +732,7 @@ next_step: короткий следующий шаг менеджера.
             role = str(item.get("role", "user")).strip().lower()
             if role not in {"user", "assistant", "system"}:
                 role = "user"
-            content = str(item.get("text", "")).strip()
+            content = str(item.get("content", "") or item.get("text", "")).strip()
             if not content:
                 continue
             messages.append({"role": role, "content": content})
@@ -867,7 +795,15 @@ next_step: короткий следующий шаг менеджера.
 
         client = self._ensure_client()
         started_at = time.perf_counter()
-        state_json = json.dumps(dialogue_state, ensure_ascii=False)
+        state_text = str(dialogue_state.get("session_state_text", "")).strip()
+        compact_state = {
+            "stage": str(dialogue_state.get("stage", "")).strip(),
+            "current_node": str(dialogue_state.get("current_node", "")).strip(),
+            "awaiting_field": str(dialogue_state.get("awaiting_field", "")).strip(),
+            "next_required_field": str(dialogue_state.get("next_required_field", "")).strip(),
+            "known_facts": dialogue_state.get("known_facts", {}),
+            "session_state": dialogue_state.get("session_state", {}),
+        }
         messages: list[dict[str, str]] = [
             {
                 "role": "system",
@@ -875,7 +811,11 @@ next_step: короткий следующий шаг менеджера.
             },
             {
                 "role": "system",
-                "content": f"Текущее состояние звонка: {state_json}",
+                "content": (
+                    "Структурированное состояние звонка. "
+                    "Используй его как источник контекста.\n"
+                    f"{state_text or json.dumps(compact_state, ensure_ascii=False)}"
+                ),
             },
             {
                 "role": "system",
@@ -1011,7 +951,7 @@ next_step: короткий следующий шаг менеджера.
             await client.chat.completions.create(
                 model=self._config.llm_model,
                 temperature=0.0,
-                max_tokens=16,
+                max_tokens=8,
                 response_format=self._response_format(self._LLM_JSON_SCHEMA),
                 messages=[
                     {
@@ -1023,9 +963,7 @@ next_step: короткий следующий шаг менеджера.
                     },
                     {
                         "role": "user",
-                        "content": (
-                            '{"reply_tts":"ok","search_index":[],"intent":"warmup","next_step":"ready"}'
-                        ),
+                        "content": "ok",
                     },
                 ],
             )
@@ -2417,7 +2355,7 @@ class ParticipantAudioSession:
         self._utterance_counter = 0
         self._last_agent_message: str | None = None
         self._last_semantic_agent_message: str | None = None
-        self._history: list[dict[str, str]] = []
+        self._session_memory = SessionMemory(max_turns=12)
         self._is_speaking = False
         self._is_processing = False
         self._state = "agent_ready"
@@ -2435,6 +2373,7 @@ class ParticipantAudioSession:
         self._playback_state = PlaybackState()
         self._spoken_turn_count = 0
         self._greeting_was_spoken = False
+        self._last_question_text = ""
 
         self._chunk_ms = int(self._vad.window_size * 1000 / self._config.sample_rate)
         self._pad_chunks = max(1, math.ceil(self._config.vad_speech_pad_ms / self._chunk_ms))
@@ -2787,6 +2726,103 @@ class ParticipantAudioSession:
             handle.setframerate(self._config.sample_rate)
             handle.writeframes(samples.astype(np.int16).tobytes())
 
+    def _recent_history(self, *, limit: int | None = None) -> list[dict[str, str]]:
+        return self._session_memory.recent_history(limit=limit)
+
+    def _llm_state_payload(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        self._session_memory.sync_from_dialogue_state(snapshot, last_question=self._last_question_text)
+        return self._session_memory.llm_state_payload()
+
+    def _remember_agent_question(self, text: str) -> None:
+        value = text.strip()
+        if not value:
+            return
+        if "?" in value or value.lower().startswith(("подскажите", "скажите", "какая", "какой", "кто", "в каком")):
+            self._last_question_text = value
+            self._session_memory.remember_question(value)
+
+    def apply_lead_profile(self, profile: dict[str, Any]) -> None:
+        updated = self._dialogue_state.bootstrap_lead_profile(profile, kb=self._kb)
+        snapshot = self._dialogue_state.snapshot()
+        self._session_memory.sync_from_dialogue_state(snapshot, last_question=self._last_question_text)
+        self._log(
+            f"lead profile applied participant={self._participant.identity} "
+            f"updated_fields={sorted(updated)!r} known_facts={snapshot.get('known_facts', {})!r}"
+        )
+
+    def _has_prefilled_lead(self) -> bool:
+        return str(self._dialogue_state.known_facts.get("prefilled_lead", "")).strip() == "yes"
+
+    def _lead_speed_emphasis(self) -> bool:
+        return str(self._dialogue_state.known_facts.get("speed_emphasis", "")).strip() == "yes"
+
+    def _build_context_sentence_for_lead(self) -> str:
+        facts = self._dialogue_state.known_facts
+        context = str(facts.get("last_contact_context", "")).strip()
+        if context:
+            context = context.rstrip(".!? ")
+            return f"Мы с вами уже говорили {context}."
+
+        amount_phrase = str(facts.get("lead_amount_phrase", "")).strip()
+        property_hint = str(facts.get("property_hint", "")).strip()
+        object_type = str(facts.get("вид_объекта", "")).strip()
+        if amount_phrase and property_hint:
+            return f"Мы с вами уже говорили по вопросу кредита на {amount_phrase}. Тогда речь шла про {property_hint}."
+        if amount_phrase and object_type:
+            return f"Мы с вами уже говорили по вопросу кредита на {amount_phrase} под залог {object_type}."
+        if amount_phrase:
+            return f"Мы с вами уже говорили по вопросу кредита на {amount_phrase}."
+        if property_hint:
+            return f"Мы с вами уже говорили по вопросу кредита. Тогда речь шла про {property_hint}."
+        return "Мы с вами уже говорили по вопросу кредита."
+
+    def _contextual_opening_reply(self) -> tuple[str, str] | None:
+        if not self._has_prefilled_lead():
+            return None
+        facts = self._dialogue_state.known_facts
+        name = str(facts.get("client_name", "")).strip()
+        greeting = f"Да, добрый день, {name}." if name else "Да, добрый день."
+        context_sentence = self._build_context_sentence_for_lead()
+        speed_sentence = (
+            "Если для вас важна скорость, я уточню только главное и быстро передам кейс эксперту."
+            if self._lead_speed_emphasis()
+            else ""
+        )
+        text = " ".join(
+            part
+            for part in (
+                "Алл+о.",
+                greeting,
+                "Это Влад+имир, МосИнвестФинанс.",
+                context_sentence,
+                speed_sentence,
+                "Удобно сейчас коротко продолжить?",
+            )
+            if part
+        )
+        self._remember_agent_question("Удобно сейчас коротко продолжить?")
+        return "callback_reentry", text
+
+    def _contextual_identity_reply(self) -> str:
+        context_sentence = self._build_context_sentence_for_lead()
+        speed_sentence = (
+            "Если для вас важна скорость, я уточню только главное и быстро передам кейс эксперту."
+            if self._lead_speed_emphasis()
+            else ""
+        )
+        response = " ".join(
+            part
+            for part in (
+                "Это Влад+имир, МосИнвестФинанс.",
+                context_sentence,
+                speed_sentence,
+                "Вам ещё актуален этот вопрос?",
+            )
+            if part
+        )
+        self._remember_agent_question("Вам ещё актуален этот вопрос?")
+        return response
+
     def _state_fallback_reply(self) -> str:
         snapshot = self._dialogue_state.snapshot()
         if self._tool_graph is not None:
@@ -2794,10 +2830,13 @@ class ParticipantAudioSession:
             if graph_question is not None:
                 node_name, question = graph_question
                 self._dialogue_state.current_node = node_name
+                self._remember_agent_question(question)
                 return question
         next_field = self._kb.next_required_field(snapshot) or self._dialogue_state.next_required_field
         if next_field:
-            return self._kb.question_for_field(next_field)
+            question = self._kb.question_for_field(next_field)
+            self._remember_agent_question(question)
+            return question
         return self._config.fallback_complex_text
 
     def _state_guided_reply(self, intent: IntentResult) -> str:
@@ -2807,11 +2846,14 @@ class ParticipantAudioSession:
         goal = self._dialogue_state.goal.strip()
         object_type = self._dialogue_state.object_type.strip()
         region = self._dialogue_state.city.strip()
+        speed_emphasis = self._lead_speed_emphasis()
 
         if str(known_facts.get("amount_needs_clarification", "")).strip() == "yes":
             return next_question
 
         if intent.intent == Intent.AMOUNT_PROVIDED.value and amount:
+            if speed_emphasis:
+                return f"Понял. Чтобы не тянуть, уточню только главное и быстро передам кейс эксперту. {next_question}"
             if not goal:
                 return f"Хмм, понял. Сумму {amount} вижу. С такой суммой, скорее всего, работаем. {next_question}"
             if not object_type:
@@ -2821,6 +2863,11 @@ class ParticipantAudioSession:
                 )
 
         if intent.intent in {Intent.SLOT_ANSWER.value, Intent.COMPLEX_REQUEST.value}:
+            if speed_emphasis and next_question:
+                if object_type and not region:
+                    return f"Понял. Чтобы быстрее передать кейс, задам только ключевые вопросы. {next_question}"
+                if region and not self._dialogue_state.collateral:
+                    return f"Хорошо. Иду коротко и по делу, чтобы не тянуть. {next_question}"
             if goal and not object_type:
                 return f"Понял, цель {goal}. {next_question}"
             if object_type and not region:
@@ -3184,6 +3231,7 @@ class ParticipantAudioSession:
     utterance_id: str,
 ) -> tuple[str, LlmReply | None, int]:
         state = self._dialogue_state.snapshot()
+        llm_state = self._llm_state_payload(state)
         graph_context = self._tool_graph.llm_context_for_text(normalized_text, state) if self._tool_graph else {}
         resume_question = ""
         resume_node = ""
@@ -3220,8 +3268,8 @@ class ParticipantAudioSession:
             safe_repair_fallback = "Понял вас. Давайте уточню по-другому."
             llm_reply, llm_latency_ms = await self._llm_service.generate_response(
                 normalized_text=normalized_text,
-                history=self._history[-4:],
-                dialogue_state=state,
+                history=self._recent_history(limit=4),
+                dialogue_state=llm_state,
                 knowledge=[],
                 truth_rules=self._kb.truth_rules if self._kb else (),
                 examples=[],
@@ -3258,6 +3306,7 @@ class ParticipantAudioSession:
         if not self._llm_service.enabled:
             return self._repair_and_resume_reply(IntentResult(Intent.SERVICE_COMPLAINT.value, 0.0, False, "")), None, 0
         try:
+            llm_state = self._llm_state_payload(state_snapshot)
             graph_context = (
                 self._tool_graph.llm_context_for_text(normalized_text, state_snapshot)
                 if self._tool_graph is not None
@@ -3278,7 +3327,7 @@ class ParticipantAudioSession:
             llm_reply, llm_latency_ms = await self._llm_service.generate_response(
                 normalized_text=normalized_text,
                 history=history[-4:],
-                dialogue_state=state_snapshot,
+                dialogue_state=llm_state,
                 knowledge=[],
                 truth_rules=self._kb.truth_rules,
                 examples=[],
@@ -3400,8 +3449,8 @@ class ParticipantAudioSession:
             )
 
             if transcript.text.strip():
-                self._history.append({"role": "user", "text": normalized_text or transcript.text})
-                self._history = self._history[-12:]
+                self._session_memory.add_user(normalized_text or transcript.text)
+            self._session_memory.sync_from_dialogue_state(state_snapshot, last_question=self._last_question_text)
 
             await self._publish_status("routing_intent")
             router_started_at = time.perf_counter()
@@ -3425,6 +3474,13 @@ class ParticipantAudioSession:
                 },
                 destination_identities=[self._participant.identity],
             )
+            if intent.intent in {
+                Intent.SERVICE_COMPLAINT.value,
+                Intent.WHY_NEED_INFO.value,
+                Intent.REJECT.value,
+                Intent.HUMAN_HANDOFF.value,
+            }:
+                self._session_memory.add_objection(normalized_text or transcript.text)
 
             candidate_response = ""
             candidate_node = self._dialogue_state.current_node
@@ -3484,7 +3540,9 @@ class ParticipantAudioSession:
 
             elif intent.intent in canned_intents:
                 if intent.intent == Intent.GREETING.value and not (self._dialogue_state.last_agent_text or self._last_agent_message):
-                    opening = self._tool_graph.opening_prompt() if self._tool_graph is not None else None
+                    opening = self._contextual_opening_reply()
+                    if opening is None:
+                        opening = self._tool_graph.opening_prompt() if self._tool_graph is not None else None
                     if opening is not None:
                         candidate_node, candidate_response = opening
                     else:
@@ -3498,12 +3556,15 @@ class ParticipantAudioSession:
                     else:
                         candidate_response = self._state_fallback_reply()
                 else:
-                    candidate_response = self._responses.choose(
-                        intent,
-                        last_agent_message=self._last_semantic_agent_message
-                        or self._dialogue_state.last_agent_text
-                        or self._last_agent_message,
-                    )
+                    if intent.intent == Intent.IDENTIFY_SELF.value and self._has_prefilled_lead():
+                        candidate_response = self._contextual_identity_reply()
+                    else:
+                        candidate_response = self._responses.choose(
+                            intent,
+                            last_agent_message=self._last_semantic_agent_message
+                            or self._dialogue_state.last_agent_text
+                            or self._last_agent_message,
+                        )
                     if intent.intent in opening_intents:
                         candidate_node = "check_convenience"
 
@@ -3570,7 +3631,7 @@ class ParticipantAudioSession:
                 await self._publish_status("complex_request_detected")
                 response_text, llm_reply, llm_latency_ms = await self._generate_stalled_slot_rescue(
                     normalized_text=normalized_text,
-                    history=self._history,
+                    history=self._recent_history(),
                     state_snapshot=state_snapshot,
                     utterance_id=utterance_id,
                 )
@@ -3592,10 +3653,11 @@ class ParticipantAudioSession:
                 if graph_context:
                     next_graph_node = str(graph_context.get("node_name", "")).strip() or next_graph_node
 
+                llm_state = self._llm_state_payload(state_snapshot)
                 llm_reply, llm_latency_ms = await self._llm_service.generate_response(
                     normalized_text=normalized_text,
-                    history=self._history[-4:],
-                    dialogue_state=state_snapshot,
+                    history=self._recent_history(limit=4),
+                    dialogue_state=llm_state,
                     knowledge=knowledge,
                     truth_rules=self._kb.truth_rules,
                     examples=examples,
@@ -3657,9 +3719,13 @@ class ParticipantAudioSession:
                 kb=self._kb,
                 current_node=next_graph_node,
             )
+            self._remember_agent_question(raw_response_text)
             self._last_agent_message = response_text
-            self._history.append({"role": "assistant", "text": response_text})
-            self._history = self._history[-12:]
+            self._session_memory.add_assistant(response_text)
+            self._session_memory.sync_from_dialogue_state(
+                self._dialogue_state.snapshot(),
+                last_question=self._last_question_text,
+            )
             self._needs_rescue_prompt = False
 
             await self._event_bus.publish_json(
@@ -3913,13 +3979,7 @@ class VoiceSessionManager:
         self._stt = WhisperSttService(config, log)
         self._sessions: dict[str, ParticipantAudioSession] = {}
 
-    async def start_audio_track(
-        self,
-        *,
-        track: rtc.Track,
-        participant: rtc.RemoteParticipant,
-        track_sid: str | None = None,
-    ) -> None:
+    def _ensure_session(self, participant: rtc.RemoteParticipant) -> ParticipantAudioSession:
         session = self._sessions.get(participant.identity)
         if session is None:
             session = ParticipantAudioSession(
@@ -3934,8 +3994,21 @@ class VoiceSessionManager:
                 log=self._log,
             )
             self._sessions[participant.identity] = session
+        return session
 
+    async def start_audio_track(
+        self,
+        *,
+        track: rtc.Track,
+        participant: rtc.RemoteParticipant,
+        track_sid: str | None = None,
+    ) -> None:
+        session = self._ensure_session(participant)
         await session.ensure_started(track, track_sid=track_sid)
+
+    async def apply_lead_profile(self, participant: rtc.RemoteParticipant, profile: dict[str, Any]) -> None:
+        session = self._ensure_session(participant)
+        session.apply_lead_profile(profile)
 
     async def participant_disconnected(self, participant_identity: str) -> None:
         session = self._sessions.pop(participant_identity, None)

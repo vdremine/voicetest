@@ -49,9 +49,10 @@ services:
       - --gpu-memory-utilization
       - ${LLM_GPU_MEMORY_UTILIZATION:-0.82}
       - --max-model-len
-      - ${LLM_MAX_MODEL_LEN:-1536}
+      - ${LLM_MAX_MODEL_LEN:-4096}
       - --max-num-seqs
       - ${LLM_MAX_NUM_SEQS:-1}
+      - --enable-prefix-caching
       - --enforce-eager
     volumes:
       - ${MODEL_CACHE_DIR:-/opt/models}/huggingface:/root/.cache/huggingface
@@ -157,6 +158,32 @@ services:
     volumes:
       - ${MODEL_CACHE_DIR:-/opt/models}:/models
       - ${VOICE_AGENT_DATA_DIR:-/opt/voice-agent-data}:/tmp/voice-agent
+      - ./data:/app/data:ro
+      - ./voice_agent_graph_v0_1:/app/voice_agent_graph_v0_1:ro
+
+  text_llm:
+    build:
+      context: ./agent
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - llm
+    command: uvicorn text_api:app --host 127.0.0.1 --port 8787
+    environment:
+      LLM_ENABLED: ${LLM_ENABLED:-true}
+      LLM_PROVIDER: ${LLM_PROVIDER:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-low}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-15}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://127.0.0.1:8001/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-local-token}
+      LLM_PROJECT: ${LLM_PROJECT:-}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.2}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-180}
+      TOOL_GRAPH_PATH: ${TOOL_GRAPH_PATH:-/app/voice_agent_graph_v0_1/tool_graph.json}
+      AGENT_DATA_DIR: /app/data
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    volumes:
       - ./data:/app/data:ro
       - ./voice_agent_graph_v0_1:/app/voice_agent_graph_v0_1:ro
 

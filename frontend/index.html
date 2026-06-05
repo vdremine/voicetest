@@ -255,6 +255,39 @@
               </label>
             </div>
 
+            <div class="row">
+              <label>
+                Client Name
+                <input id="leadName" placeholder="Станислав Григорьевич" />
+              </label>
+              <label>
+                Desired Amount
+                <input id="leadAmount" placeholder="120 тысяч рублей" />
+              </label>
+            </div>
+
+            <div class="row">
+              <label>
+                Property Hint
+                <input id="leadProperty" placeholder="двухэтажный кирпичный дом в пригороде Санкт-Петербурга" />
+              </label>
+              <label>
+                Last Contact Context
+                <input id="leadContext" placeholder="вчера вечером общались по поводу кредита, связь прервалась" />
+              </label>
+            </div>
+
+            <div class="row">
+              <label>
+                Scenario Hint
+                <input id="leadScenario" placeholder="callback_reentry / returning_customer" />
+              </label>
+              <label>
+                Speed Emphasis
+                <input id="leadSpeed" placeholder="yes" value="yes" />
+              </label>
+            </div>
+
             <div class="actions">
               <button id="joinBtn">Join</button>
               <button id="leaveBtn" class="danger" disabled>Leave</button>
@@ -297,6 +330,12 @@
       const joinBtn = document.getElementById("joinBtn");
       const leaveBtn = document.getElementById("leaveBtn");
       const micBtn = document.getElementById("micBtn");
+      const leadNameInput = document.getElementById("leadName");
+      const leadAmountInput = document.getElementById("leadAmount");
+      const leadPropertyInput = document.getElementById("leadProperty");
+      const leadContextInput = document.getElementById("leadContext");
+      const leadScenarioInput = document.getElementById("leadScenario");
+      const leadSpeedInput = document.getElementById("leadSpeed");
       const eventLog = document.getElementById("eventLog");
       const remoteMedia = document.getElementById("remoteMedia");
       const participantsList = document.getElementById("participants");
@@ -314,6 +353,14 @@
       const remoteAudioElements = new Map();
 
       identityInput.value = `user-${Math.random().toString(36).slice(2, 8)}`;
+
+      const urlParams = new URLSearchParams(window.location.search);
+      if (urlParams.get("lead_name")) leadNameInput.value = urlParams.get("lead_name");
+      if (urlParams.get("lead_amount")) leadAmountInput.value = urlParams.get("lead_amount");
+      if (urlParams.get("lead_property")) leadPropertyInput.value = urlParams.get("lead_property");
+      if (urlParams.get("lead_context")) leadContextInput.value = urlParams.get("lead_context");
+      if (urlParams.get("lead_scenario")) leadScenarioInput.value = urlParams.get("lead_scenario");
+      if (urlParams.get("lead_speed")) leadSpeedInput.value = urlParams.get("lead_speed");
 
       function log(message) {
         const timestamp = new Date().toLocaleTimeString();
@@ -376,6 +423,42 @@
         setButtons({ joined: false });
         setMicButton();
         renderParticipants();
+      }
+
+      function buildLeadProfile() {
+        const profile = {
+          client_name: leadNameInput.value.trim(),
+          desired_amount: leadAmountInput.value.trim(),
+          property_hint: leadPropertyInput.value.trim(),
+          last_contact_context: leadContextInput.value.trim(),
+          scenario_hint: leadScenarioInput.value.trim(),
+          speed_emphasis: leadSpeedInput.value.trim(),
+        };
+        return Object.fromEntries(
+          Object.entries(profile).filter(([, value]) => String(value || "").trim().length > 0),
+        );
+      }
+
+      async function publishLeadProfile(room) {
+        const leadProfile = buildLeadProfile();
+        if (!room || Object.keys(leadProfile).length === 0) {
+          return;
+        }
+        const payload = encoder.encode(
+          JSON.stringify({
+            type: "lead_profile",
+            lead_profile: leadProfile,
+          }),
+        );
+        try {
+          await room.localParticipant.publishData(payload, {
+            reliable: true,
+            topic: "agent_input",
+          });
+        } catch (error) {
+          await room.localParticipant.publishData(payload, true, [], "agent_input");
+        }
+        log(`lead profile sent: ${JSON.stringify(leadProfile)}`);
       }
 
       function attachRemoteTrack(track, publication, participant) {
@@ -588,6 +671,7 @@
 
         setStatus("connecting");
         await room.connect(payload.url, payload.token);
+        await publishLeadProfile(room);
 
         currentRoom = room;
         setButtons({ joined: true });

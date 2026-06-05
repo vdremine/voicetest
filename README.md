@@ -30,6 +30,7 @@
 - agent-side audio receiver для remote microphone track
 - streaming VAD + utterance buffer
 - STT + normalization + simple intent router
+- text-first LLM REPL for prompt/state debugging without STT/TTS
 - bootstrap/user-data скрипты
 - `Caddy` для HTTPS и WSS
 
@@ -86,6 +87,78 @@ URL:
 cd /Users/dr_emin/Desktop/livekit
 cp .env.example .env
 docker compose up --build
+```
+
+### Text-first LLM debug mode
+
+Если нужно быстро проверить именно память, state summary и prompt без голосового контура:
+
+```bash
+cd /Users/dr_emin/Desktop/livekit/agent
+python3 text_llm_cli.py
+```
+
+Команды:
+
+- `/state` — показать текущее структурированное состояние звонка
+- `/reset` — сбросить историю и state
+- `/exit` — выйти
+
+### HTTP text dialogue debug
+
+Если нужно отдельно качать именно диалоговую модель через `curl`, без LiveKit/STT/TTS:
+
+```bash
+cd /Users/dr_emin/Desktop/livekit
+docker compose -f docker-compose.prod.yml -f docker-compose.gpu.yml up -d --build llm text_llm
+```
+
+Проверка:
+
+```bash
+curl -s http://127.0.0.1:8787/healthz
+```
+
+Старт сессии с известным lead profile:
+
+```bash
+curl -s http://127.0.0.1:8787/session/start \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "session_id": "call-001",
+    "lead_profile": {
+      "client_name": "Станислав Григорьевич",
+      "desired_amount": "120 тысяч рублей",
+      "property_hint": "двухэтажный кирпичный дом в пригороде Санкт-Петербурга",
+      "last_contact_context": "вчера вечером общались по поводу кредита, связь прервалась",
+      "speed_emphasis": "yes"
+    }
+  }'
+```
+
+Следующая реплика клиента:
+
+```bash
+curl -s http://127.0.0.1:8787/session/message \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "session_id": "call-001",
+    "text": "ну я слушаю что вы хотите и кто вы"
+  }'
+```
+
+Состояние сессии:
+
+```bash
+curl -s 'http://127.0.0.1:8787/session/state?session_id=call-001'
+```
+
+Сброс:
+
+```bash
+curl -s http://127.0.0.1:8787/session/reset \
+  -H 'Content-Type: application/json' \
+  -d '{"session_id":"call-001"}'
 ```
 
 ### 2. Ubuntu domain baseline
@@ -164,21 +237,20 @@ AUDIO_NUM_CHANNELS=1
 AUDIO_FRAME_SIZE_MS=20
 
 VAD_THRESHOLD=0.45
-VAD_MIN_SPEECH_DURATION_MS=250
-VAD_MIN_SILENCE_DURATION_MS=900
-VAD_SPEECH_PAD_MS=200
+VAD_MIN_SPEECH_DURATION_MS=200
+VAD_MIN_SILENCE_DURATION_MS=500
+VAD_SPEECH_PAD_MS=120
 VAD_USE_ONNX=false
 TORCH_NUM_THREADS=1
 
 STT_ENABLED=true
-STT_MODEL=Systran/faster-whisper-medium
-STT_DEVICE=cuda
+STT_MODEL=Systran/faster-whisper-small
+STT_DEVICE=auto
 STT_COMPUTE_TYPE_CPU=int8
 STT_COMPUTE_TYPE_GPU=float16
 STT_LANGUAGE=ru
-STT_BEAM_SIZE=3
-STT_CONFIDENCE_FLOOR=0.25
-DEBUG_SAVE_WAV=false
+STT_BEAM_SIZE=1
+STT_CONFIDENCE_FLOOR=0.35
 ```
 
 Запуск:
@@ -186,14 +258,14 @@ DEBUG_SAVE_WAV=false
 ```bash
 cd /opt/voice-agent
 cp .env.prod.example .env
-docker compose -f docker-compose.prod.yml -f docker-compose.llm.yml up --build -d
+docker compose -f docker-compose.prod.yml up --build -d
 ```
 
 ### 3. GPU override
 
 Файл: [docker-compose.gpu.yml](/Users/dr_emin/Desktop/livekit/docker-compose.gpu.yml)
 
-Используйте его, если хотите дать `agent` GPU без локального `vLLM`, например только для STT:
+Используйте его только если:
 
 - на хосте есть NVIDIA GPU
 - `nvidia-smi` работает
@@ -267,24 +339,21 @@ docker compose -f docker-compose.prod.yml -f docker-compose.gpu.yml up --build -
 
 ## Models And GPU
 
-Рекомендуемый STT для RTX 4090 в текущем debug-quality профиле:
+Базовый STT по умолчанию:
 
-- `Systran/faster-whisper-medium`
-- если нужна ещё выше точность и VRAM позволяет: `large-v3`
+- `Systran/faster-whisper-small`
 
 Почему так:
 
-- `small` на CPU даёт заметно хуже качество и на реальном звонке легко уводит вас в 5+ секунд полной turn latency
-- `medium` на CUDA даёт заметно более адекватный русский transcript без экстремальной цены по latency
-- модель можно потом поднять до `large-v3`, если 4090 и ваша задержка это позволяют
+- это самый быстрый путь к рабочему русскоязычному loop без сложной инфраструктуры
+- модель можно заменить позже на `medium` или другой backend без слома интерфейса
 
 Текущее поведение по GPU:
 
 - VAD остается легким и может спокойно жить на CPU
-- на 4090 сервере `agent` должен идти с `gpus: all` и `STT_DEVICE=cuda`
+- STT пытается использовать `cuda`, если `STT_DEVICE=auto` и внутри контейнера реально доступна NVIDIA runtime
 - если CUDA недоступна или инициализация падает, agent автоматически откатывается на CPU `int8`
-- `docker-compose.llm.yml` теперь сразу поднимает `agent` с GPU и `STT_MODEL=Systran/faster-whisper-medium`
-- `docker-compose.gpu.yml` нужен только если хотите GPU-STT без локального `vLLM`
+- для реального проброса GPU в контейнер используйте `docker-compose.gpu.yml`
 
 Проверка сервера:
 
@@ -301,13 +370,13 @@ docker compose -f docker-compose.prod.yml -f docker-compose.gpu.yml up --build -
 
 ```bash
 pip install -U "huggingface_hub[cli]"
-huggingface-cli download Systran/faster-whisper-medium --local-dir /opt/models/faster-whisper-medium
+huggingface-cli download Systran/faster-whisper-small --local-dir /opt/models/faster-whisper-small
 ```
 
 Тогда в `.env` можно указать:
 
 ```env
-STT_MODEL=/models/faster-whisper-medium
+STT_MODEL=/models/faster-whisper-small
 ```
 
 ## Token API
