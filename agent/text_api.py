@@ -527,15 +527,21 @@ def _strip_intro_phrase(text: str) -> str:
     return value.strip(" .,!?;:-")
 
 
-def _extract_name_candidate(raw_text: str) -> str:
-    patterns = (
+def _extract_name_candidate(raw_text: str, *, current_stage: str) -> str:
+    explicit_patterns = (
         r"(?:меня зовут|зовут меня|можно ко мне|обращайтесь ко мне)\s+([А-Яа-яЁё-]{2,}(?:\s+[А-Яа-яЁё-]{2,}){0,2})",
-        r"^(?:я\s+)?([А-Яа-яЁё-]{2,}(?:\s+[А-Яа-яЁё-]{2,}){0,2})$",
     )
-    for pattern in patterns:
+    for pattern in explicit_patterns:
         match = re.search(pattern, raw_text, flags=re.IGNORECASE)
         if match:
             candidate = _clean_text(match.group(1)).strip(" .,!?;:-")
+            if candidate and not _contains_any(normalize_for_compare(candidate), ("без фамилий",)):
+                return candidate
+
+    if current_stage == "collect_name":
+        bare_match = re.fullmatch(r"(?:я\s+)?([А-Яа-яЁё-]{2,}(?:\s+[А-Яа-яЁё-]{2,}){0,2})", _clean_text(raw_text))
+        if bare_match:
+            candidate = _clean_text(bare_match.group(1)).strip(" .,!?;:-")
             if candidate and not _contains_any(normalize_for_compare(candidate), ("без фамилий",)):
                 return candidate
     return ""
@@ -773,16 +779,17 @@ def _capture_turn_updates(
     updated_fields: set[str],
 ) -> dict[str, str]:
     updates: dict[str, str] = {}
+    asks_identity = _asks_identity_or_reason(normalized_text)
 
     amount = _clean_text(session.dialogue_state.amount_text or session.dialogue_state.known_facts.get("amount"))
     if amount and "нужная_сумма" in updated_fields:
         updates["desired_amount"] = amount
 
-    name = _extract_name_candidate(raw_text)
+    name = _extract_name_candidate(raw_text, current_stage=current_stage)
     if name:
         updates["client_name"] = name
 
-    permission = _permission_flag(normalized_text)
+    permission = "" if asks_identity else _permission_flag(normalized_text)
     if permission:
         updates["permission_to_continue"] = permission
 
@@ -1067,10 +1074,81 @@ def _bad_reply(*, reply: str, user_text: str, target_stage: str) -> bool:
         return True
     if target_stage == "cold_opening" and _contains_any(
         norm,
-        ("какую сумму", "сумму рассматриваете", "как вас зовут", "какая недвижимость"),
+        (
+            "какую сумму",
+            "сумму рассматриваете",
+            "как вас зовут",
+            "какая недвижимость",
+            "в каком регионе",
+            "в залоге",
+            "ипотека",
+            "кто собственник",
+            "автомобиль у вас есть",
+        ),
+    ):
+        return True
+    if target_stage == "collect_amount" and _contains_any(
+        norm,
+        (
+            "здравствуйте",
+            "добрый день",
+            "меня зовут влад+имир",
+            "мосинвестфинанс",
+            "какая недвижимость",
+            "есть недвижимость",
+            "в каком регионе",
+            "кто собственник",
+        ),
+    ):
+        return True
+    if target_stage == "collect_name" and _contains_any(
+        norm,
+        (
+            "здравствуйте",
+            "добрый день",
+            "меня зовут влад+имир",
+            "мосинвестфинанс",
+            "какая недвижимость",
+            "в каком регионе",
+            "в залоге",
+            "ипотека",
+        ),
+    ):
+        return True
+    if target_stage == "collect_property_type" and _contains_any(
+        norm,
+        (
+            "на какую цель",
+            "зачем вам деньги",
+            "в каком регионе",
+            "в залоге",
+            "кто собственник",
+        ),
     ):
         return True
     return False
+
+
+def _fallback_reply_for_turn(
+    session: DialogueHarnessSession,
+    *,
+    target_stage: str,
+    user_text: str,
+) -> str:
+    norm = normalize_for_compare(user_text)
+    if target_stage == "cold_opening":
+        return _flow_step("cold_opening").fallback_reply
+    if target_stage == "collect_amount" and "не на покупку" in norm:
+        return (
+            "Да, понял, речь не про покупку. Мы как раз больше про кредит под уже имеющуюся "
+            "недвижимость. Скажите, какую сумму примерно рассматриваете?"
+        )
+    if target_stage == "collect_property_type" and _client_refuses_extra_disclosure(norm):
+        return (
+            "Да, понял вас, цель можно не раскрывать. Тогда просто по объекту сориентируюсь: "
+            "какая недвижимость у вас в собственности?"
+        )
+    return _flow_step(target_stage).fallback_reply
 
 
 def _resolve_next_stage_from_facts(
@@ -1302,9 +1380,17 @@ async def _generate_llm_reply(
     else:
         content = str(raw_content)
     parsed, _ = try_parse_json_object(content)
-    reply = _clean_text(parsed.get("reply")) or _flow_step(target_stage).fallback_reply
+    reply = _clean_text(parsed.get("reply")) or _fallback_reply_for_turn(
+        session,
+        target_stage=target_stage,
+        user_text=user_text,
+    )
     if _bad_reply(reply=reply, user_text=user_text, target_stage=target_stage):
-        reply = _flow_step(target_stage).fallback_reply
+        reply = _fallback_reply_for_turn(
+            session,
+            target_stage=target_stage,
+            user_text=user_text,
+        )
     latency_ms = int((time.perf_counter() - started_at) * 1000)
     return reply, parsed, latency_ms
 

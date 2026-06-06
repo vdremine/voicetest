@@ -42,10 +42,6 @@ def render_state_summary(
         known_facts.get("amount"),
         known_facts.get("нужная_сумма"),
     )
-    goal = _first_nonempty(
-        known_facts.get("goal"),
-        known_facts.get("цель"),
-    )
     encumbrance = _first_nonempty(
         known_facts.get("collateral"),
         known_facts.get("обременение"),
@@ -90,7 +86,6 @@ def render_state_summary(
         f"- Регион/город: {region or 'неизвестно'}",
         f"- Объект: {object_type or 'неизвестно'}",
         f"- Нужная сумма: {amount or 'неизвестно'}",
-        f"- Цель: {goal or 'неизвестно'}",
         f"- Обременение: {encumbrance or 'неизвестно'}",
         f"- Собственник: {owner or 'неизвестно'}",
         f"- Остаток долга: {remaining_debt or 'неизвестно'}",
