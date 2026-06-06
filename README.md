@@ -149,7 +149,29 @@ curl -s http://127.0.0.1:8787/session/message \
   -H 'Content-Type: application/json' \
   -d '{
     "session_id": "call-001",
-    "text": "вопрос актуален, сумма нужна 300 тысяч на ремонт"
+    "text": "удобно да, но я не на покупку интересуюсь"
+  }'
+```
+
+Проверка отказа раскрывать лишнее:
+
+```bash
+curl -s http://127.0.0.1:8787/session/message \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "session_id": "call-001",
+    "text": "ну это не так важно, не хочу разглашать"
+  }'
+```
+
+Проверка ветки без недвижимости:
+
+```bash
+curl -s http://127.0.0.1:8787/session/message \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "session_id": "call-001",
+    "text": "недвижимости нет"
   }'
 ```
 
