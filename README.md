@@ -110,6 +110,7 @@ python3 text_llm_cli.py
 
 ```bash
 cd /Users/dr_emin/Desktop/livekit
+cp .env.prod.example .env
 docker compose -f docker-compose.prod.yml -f docker-compose.gpu.yml up -d --build llm text_llm
 ```
 
@@ -119,20 +120,14 @@ docker compose -f docker-compose.prod.yml -f docker-compose.gpu.yml up -d --buil
 curl -s http://127.0.0.1:8787/healthz
 ```
 
-Старт сессии с известным lead profile:
+Cold-start сессия: на старте известен только номер телефона.
 
 ```bash
 curl -s http://127.0.0.1:8787/session/start \
   -H 'Content-Type: application/json' \
   -d '{
     "session_id": "call-001",
-    "lead_profile": {
-      "client_name": "Станислав Григорьевич",
-      "desired_amount": "120 тысяч рублей",
-      "property_hint": "двухэтажный кирпичный дом в пригороде Санкт-Петербурга",
-      "last_contact_context": "вчера вечером общались по поводу кредита, связь прервалась",
-      "speed_emphasis": "yes"
-    }
+    "phone": "+79990000000"
   }'
 ```
 
@@ -143,7 +138,18 @@ curl -s http://127.0.0.1:8787/session/message \
   -H 'Content-Type: application/json' \
   -d '{
     "session_id": "call-001",
-    "text": "ну я слушаю что вы хотите и кто вы"
+    "text": "ну я слушаю, кто вы и что хотите"
+  }'
+```
+
+Ещё ход:
+
+```bash
+curl -s http://127.0.0.1:8787/session/message \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "session_id": "call-001",
+    "text": "вопрос актуален, сумма нужна 300 тысяч на ремонт"
   }'
 ```
 
