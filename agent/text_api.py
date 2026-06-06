@@ -9,7 +9,13 @@ from pydantic import BaseModel, Field
 
 from agent_core import DialogueState, KnowledgeBase, SessionMemory
 from agent_core.rag import KnowledgeSnippet
-from voice_loop import OpenAiLlmService, TranscriptNormalizer, VoicePipelineConfig, try_parse_json_object
+from voice_loop import (
+    OpenAiLlmService,
+    TranscriptNormalizer,
+    VoicePipelineConfig,
+    normalize_for_compare,
+    try_parse_json_object,
+)
 
 
 def log(message: str) -> None:
@@ -205,6 +211,9 @@ _TEXT_DIALOGUE_SYSTEM_PROMPT = """Ты Влад+имир, голосовой м�
 - не повторяй приветствие после первого сообщения;
 - не обещай одобрение кредита;
 - не придумывай заявку, если её нет в известных фактах;
+- не придумывай новые факты сделки; facts_update можно заполнять только тем, что клиент явно сказал в текущей реплике;
+- если клиент ещё не называл сумму, объект, регион, собственников или обременение, оставь их неизвестными;
+- если текущая фраза клиента пустая, не заполняй facts_update вообще;
 - если клиент просит перезвонить позже, перейди к уточнению времени, а не продолжай квалификацию;
 - если клиент не хочет говорить, уважительно завершай разговор.
 
@@ -284,6 +293,17 @@ _warmed_up = False
 
 def _flow_step(stage: str) -> FlowStep:
     return FLOW_STEPS.get(stage, FLOW_STEPS["cold_opening"])
+
+
+def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
+    return any(marker in text for marker in markers)
+
+
+def _contains_amount_token(text: str) -> bool:
+    return any(char.isdigit() for char in text) or _contains_any(
+        normalize_for_compare(text),
+        ("тысяч", "тысяча", "миллион", "миллиона", "млн"),
+    )
 
 
 def _fresh_session(*, phone: str, stage: str) -> DialogueHarnessSession:
@@ -433,6 +453,7 @@ def _build_flow_prompt(
 - не спрашивай уже известные факты;
 - говори коротко, как по телефону;
 - не обещай одобрение кредита;
+- не выдумывай новые факты сделки;
 - если фраза клиента пустая, сам начни звонок в рамках текущего этапа.
 """.strip()
 
@@ -510,6 +531,220 @@ def _apply_known_facts(session: DialogueHarnessSession, updates: dict[str, Any])
             facts[key] = value
 
 
+def _text_supports_name(user_text: str, proposed_name: str) -> bool:
+    normalized_user = normalize_for_compare(user_text)
+    normalized_name = normalize_for_compare(proposed_name)
+    if not normalized_user or not normalized_name:
+        return False
+    if normalized_name in normalized_user:
+        return True
+    name_tokens = [token for token in normalized_name.split() if token]
+    return bool(name_tokens) and all(token in normalized_user for token in name_tokens)
+
+
+def _validate_facts_update(
+    session: DialogueHarnessSession,
+    *,
+    user_text: str,
+    updates: dict[str, Any],
+    is_start: bool,
+    updated_fields: set[str] | None = None,
+) -> dict[str, Any]:
+    if is_start or not normalize_for_compare(user_text):
+        return {}
+
+    state = session.dialogue_state
+    facts = state.known_facts
+    normalized_user = normalize_for_compare(user_text)
+    observed = updated_fields or set()
+    validated: dict[str, Any] = {}
+
+    if "client_name" in updates and _text_supports_name(user_text, str(updates["client_name"])):
+        validated["client_name"] = _clean_text(updates["client_name"])
+
+    amount_value = _clean_text(state.amount_text or facts.get("amount") or facts.get("нужная_сумма"))
+    if amount_value and "desired_amount" in updates and "нужная_сумма" in observed:
+        validated["desired_amount"] = amount_value
+
+    purpose_value = _clean_text(state.goal or facts.get("goal") or facts.get("цель"))
+    if purpose_value and "purpose" in updates and "цель" in observed:
+        validated["purpose"] = purpose_value
+
+    property_value = _clean_text(state.object_type or facts.get("вид_объекта"))
+    if property_value and "property_type" in updates and "вид_объекта" in observed:
+        validated["property_type"] = property_value
+
+    region_value = _clean_text(state.city or facts.get("region") or facts.get("регион"))
+    if region_value and "region" in updates and "регион" in observed:
+        validated["region"] = region_value
+
+    encumbrance_value = _clean_text(state.collateral or facts.get("collateral") or facts.get("обременение"))
+    if encumbrance_value and "encumbrance" in updates and "обременение" in observed:
+        validated["encumbrance"] = encumbrance_value
+
+    owner_value = _clean_text(facts.get("owner") or facts.get("owners") or facts.get("собственники"))
+    if owner_value and "owner_status" in updates and "собственники" in observed:
+        validated["owner_status"] = owner_value
+
+    priority_value = _clean_text(facts.get("priority"))
+    if priority_value and "priority" in updates and "priority" in observed:
+        validated["priority"] = priority_value
+
+    callback_time_value = _clean_text(state.callback_time or facts.get("callback_time"))
+    if callback_time_value and "callback_time" in updates and "callback_time" in observed:
+        validated["callback_time"] = callback_time_value
+
+    if "permission_to_continue" in updates:
+        if _contains_any(
+            normalized_user,
+            (
+                "да",
+                "удобно",
+                "слушаю",
+                "говорите",
+                "можно",
+                "продолжайте",
+                "давайте",
+            ),
+        ):
+            validated["permission_to_continue"] = "yes"
+        elif _contains_any(normalized_user, ("неудобно", "не сейчас", "не могу", "позже", "перезвоните")):
+            validated["permission_to_continue"] = "no"
+
+    if "interest_confirmed" in updates and _contains_any(
+        normalized_user,
+        (
+            "актуален",
+            "актуально",
+            "интересует",
+            "нужен",
+            "рассматриваю",
+            "надо",
+        ),
+    ):
+        validated["interest_confirmed"] = "yes"
+
+    if "callback_consent" in updates:
+        if _contains_any(normalized_user, ("перезвоните", "пусть перезвонит", "давайте", "хорошо")):
+            validated["callback_consent"] = "yes"
+        elif _contains_any(normalized_user, ("не надо", "не звоните", "не нужно")):
+            validated["callback_consent"] = "no"
+
+    if "objection" in updates and _contains_any(
+        normalized_user,
+        (
+            "непонятно",
+            "не знаю",
+            "не дадите",
+            "возраст",
+            "лет",
+            "боюсь",
+            "залог",
+            "смешно",
+            "дорого",
+            "зачем",
+            "кто вы",
+            "что хотите",
+        ),
+    ):
+        validated["objection"] = _clean_text(user_text)[:200]
+
+    return validated
+
+
+def _coerce_next_stage(
+    session: DialogueHarnessSession,
+    *,
+    proposed_stage: str,
+    facts_update: dict[str, Any],
+    user_text: str,
+    is_start: bool,
+    should_end: bool,
+) -> str:
+    if should_end:
+        return "finish"
+
+    if is_start:
+        return session.stage
+
+    current_stage = session.stage
+    normalized_user = normalize_for_compare(user_text)
+
+    if current_stage == "cold_opening":
+        if "callback_time" in facts_update:
+            return "callback_time"
+        if _contains_any(normalized_user, ("не надо", "не интересно", "не звоните", "до свидания")):
+            return "finish"
+        if facts_update.get("permission_to_continue") == "yes" or facts_update.get("interest_confirmed") == "yes":
+            if any(
+                key in facts_update
+                for key in ("desired_amount", "purpose", "property_type", "region", "encumbrance", "owner_status")
+            ):
+                return proposed_stage
+            return "need_detection"
+        return "cold_opening"
+
+    if current_stage == "need_detection":
+        if "callback_time" in facts_update:
+            return "callback_time"
+        if "desired_amount" in facts_update and "purpose" in facts_update:
+            return "collect_property_type"
+        if "desired_amount" in facts_update:
+            return "collect_purpose"
+        if facts_update.get("interest_confirmed") == "yes":
+            return proposed_stage if proposed_stage in ALLOWED_STAGES else "collect_amount"
+        if _contains_any(normalized_user, ("не интересно", "не надо", "не нужно", "до свидания")):
+            return "finish"
+        return proposed_stage if proposed_stage in {"need_detection", "collect_name", "collect_amount"} else "need_detection"
+
+    return proposed_stage if proposed_stage in ALLOWED_STAGES else current_stage
+
+
+def _reply_invents_unknown_facts(session: DialogueHarnessSession, reply: str) -> bool:
+    normalized = normalize_for_compare(reply)
+    facts = session.dialogue_state.known_facts
+
+    if not _clean_text(facts.get("amount")) and not _clean_text(facts.get("нужная_сумма")):
+        if _contains_amount_token(reply):
+            return True
+
+    if not _clean_text(facts.get("region")) and not _clean_text(facts.get("регион")):
+        if session.dialogue_state._detect_city(reply):
+            return True
+
+    if not _clean_text(facts.get("вид_объекта")):
+        if _contains_any(
+            normalized,
+            (
+                "ваш дом",
+                "ваша квартира",
+                "частный дом",
+                "двухкомнатная квартира",
+                "ваш участок",
+            ),
+        ):
+            return True
+
+    if not _clean_text(facts.get("owner")) and not _clean_text(facts.get("owners")) and not _clean_text(facts.get("собственники")):
+        if _contains_any(normalized, ("на половину", "ваша доля", "доля дома", "единоличный собственник")):
+            return True
+
+    if not _clean_text(facts.get("collateral")) and not _clean_text(facts.get("обременение")):
+        if _contains_any(
+            normalized,
+            (
+                "не в залоге",
+                "без обременения",
+                "свободен от залога",
+                "свободна от залога",
+                "объект не в залоге",
+            ),
+        ):
+            return True
+
+    return False
+
+
 def _fallback_reply(stage: str) -> str:
     return _flow_step(stage).fallback_reply
 
@@ -522,8 +757,9 @@ async def _run_dialogue_llm(
     query = _clean_text(user_text) or session.stage
     flow_step = _flow_step(session.stage)
     snapshot = _session_snapshot(session)
-    knowledge = _kb.retrieve(query, snapshot, limit=2)
-    examples = _kb.relevant_examples(query, limit=2)
+    allow_retrieval = bool(normalize_for_compare(user_text)) and session.stage != "cold_opening"
+    knowledge = _kb.retrieve(query, snapshot, limit=2) if allow_retrieval else []
+    examples = _kb.relevant_examples(query, limit=2) if allow_retrieval else []
     client = _llm_service._ensure_client()
     messages: list[dict[str, str]] = [
         {"role": "system", "content": _TEXT_DIALOGUE_SYSTEM_PROMPT},
@@ -620,9 +856,26 @@ async def start_session(request: StartSessionRequest) -> dict[str, Any]:
 
     llm_json, latency_ms = await _run_dialogue_llm(session, user_text="")
     reply = _clean_text(llm_json.get("reply")) or _fallback_reply(session.stage)
-    next_stage = _validate_stage(llm_json.get("next_stage"), fallback=session.stage)
-    awaiting = _clean_text(llm_json.get("awaiting")) or _flow_step(next_stage).awaiting
-    _apply_known_facts(session, _parse_facts_update(llm_json.get("facts_update")))
+    proposed_stage = _validate_stage(llm_json.get("next_stage"), fallback=session.stage)
+    facts_update = _validate_facts_update(
+        session,
+        user_text="",
+        updates=_parse_facts_update(llm_json.get("facts_update")),
+        is_start=True,
+        updated_fields=set(),
+    )
+    _apply_known_facts(session, facts_update)
+    if _reply_invents_unknown_facts(session, reply):
+        reply = _fallback_reply(session.stage)
+    next_stage = _coerce_next_stage(
+        session,
+        proposed_stage=proposed_stage,
+        facts_update=facts_update,
+        user_text="",
+        is_start=True,
+        should_end=bool(llm_json.get("should_end", False)),
+    )
+    awaiting = _flow_step(next_stage).awaiting
 
     session.stage = next_stage
     session.awaiting = awaiting
@@ -643,7 +896,8 @@ async def start_session(request: StartSessionRequest) -> dict[str, Any]:
             "next_stage": session.stage,
             "search_index": _search_index(llm_json.get("search_index")),
             "latency_ms": latency_ms,
-            "should_end": bool(llm_json.get("should_end", False)),
+            "facts_update": facts_update,
+            "should_end": False,
         },
     )
 
@@ -659,19 +913,35 @@ async def chat(request: ChatRequest) -> dict[str, Any]:
     user_text = normalized_text or raw_text
     session.session_memory.add_user(user_text)
 
-    session.dialogue_state.update_from_user(raw_text, user_text, kb=_kb)
+    updated_fields = session.dialogue_state.update_from_user(raw_text, user_text, kb=_kb)
     _sync_session_memory(session)
 
     llm_json, latency_ms = await _run_dialogue_llm(session, user_text=user_text)
     reply = _clean_text(llm_json.get("reply")) or _fallback_reply(session.stage)
-    next_stage = _validate_stage(llm_json.get("next_stage"), fallback=session.stage)
-    awaiting = _clean_text(llm_json.get("awaiting")) or _flow_step(next_stage).awaiting
-    facts_update = _parse_facts_update(llm_json.get("facts_update"))
+    proposed_stage = _validate_stage(llm_json.get("next_stage"), fallback=session.stage)
+    facts_update = _validate_facts_update(
+        session,
+        user_text=user_text,
+        updates=_parse_facts_update(llm_json.get("facts_update")),
+        is_start=False,
+        updated_fields=updated_fields,
+    )
     _apply_known_facts(session, facts_update)
+    if session.stage == "cold_opening" and _reply_invents_unknown_facts(session, reply):
+        reply = _fallback_reply(session.stage)
 
     should_end = bool(llm_json.get("should_end", False))
-    session.stage = "finish" if should_end else next_stage
-    session.awaiting = _flow_step(session.stage).awaiting if should_end else awaiting
+    next_stage = _coerce_next_stage(
+        session,
+        proposed_stage=proposed_stage,
+        facts_update=facts_update,
+        user_text=user_text,
+        is_start=False,
+        should_end=should_end,
+    )
+    proposed_awaiting = _clean_text(llm_json.get("awaiting"))
+    session.stage = next_stage
+    session.awaiting = proposed_awaiting if proposed_awaiting and next_stage == proposed_stage else _flow_step(session.stage).awaiting
     session.dialogue_state.current_node = session.stage
     session.dialogue_state.last_user_text = raw_text
     session.dialogue_state.last_agent_text = reply
@@ -694,6 +964,7 @@ async def chat(request: ChatRequest) -> dict[str, Any]:
             "next_stage": session.stage,
             "search_index": _search_index(llm_json.get("search_index")),
             "facts_update": facts_update,
+            "updated_fields": sorted(updated_fields),
             "should_end": should_end,
         },
     )
