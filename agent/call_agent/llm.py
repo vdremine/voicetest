@@ -53,7 +53,7 @@ class LlmSettings:
             model=os.getenv("LLM_MODEL", "Qwen/Qwen2.5-7B-Instruct").strip() or "Qwen/Qwen2.5-7B-Instruct",
             base_url=os.getenv("LLM_BASE_URL", "http://127.0.0.1:8001/v1").strip() or "http://127.0.0.1:8001/v1",
             api_key=os.getenv("LLM_API_KEY", "local-token").strip() or "local-token",
-            temperature=float(os.getenv("LLM_TEMPERATURE", "0.22")),
+            temperature=float(os.getenv("LLM_TEMPERATURE", "0.08")),
             max_tokens=int(os.getenv("LLM_MAX_TOKENS", "260")),
             timeout_seconds=float(os.getenv("LLM_TIMEOUT_SECONDS", "15")),
         )
@@ -135,6 +135,84 @@ class TurnLlmClient:
         latency_ms = int((time.perf_counter() - started_at) * 1000)
         return decision, latency_ms
 
+    async def repair_turn_llm(
+        self,
+        *,
+        current_node: str,
+        user_text: str,
+        known_facts: dict[str, Any],
+        history: list[dict[str, str]],
+        node_repeat_count: int,
+        bad_decision: dict[str, Any],
+        errors: list[str],
+    ) -> tuple[LlmTurnDecision | None, int]:
+        node = DIALOGUE_GRAPH[current_node]
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "system",
+                "content": (
+                    "Ты не ведёшь разговор заново. Ты исправляешь плохое JSON-решение голосового агента.\n"
+                    "Верни только исправленный JSON по той же схеме.\n"
+                    "Не придумывай факты, которых клиент не говорил.\n"
+                    "Если клиент явно дал новый факт, запиши его в facts_update.\n"
+                    "Если reply задаёт вопрос следующего узла, next_node и reply_asks_node должны совпадать.\n"
+                    "Отвечай только по-русски, без китайского и без смешанного языка.\n"
+                    "Не копируй жаргон клиента как свой стиль."
+                ),
+            },
+            {
+                "role": "system",
+                "content": build_node_prompt(
+                    node=node,
+                    current_node_id=current_node,
+                    last_messages=history[-4:],
+                    known_facts=known_facts,
+                    node_repeat_count=node_repeat_count,
+                    user_text=user_text,
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Текущий узел: {current_node}\n"
+                    f"Реплика клиента: {user_text}\n"
+                    f"Плохое решение: {json.dumps(bad_decision, ensure_ascii=False)}\n"
+                    f"Ошибки: {json.dumps(errors, ensure_ascii=False)}\n"
+                    "Исправь JSON так, чтобы факты, переход и текст ответа были согласованы."
+                ),
+            },
+        ]
+
+        started_at = time.perf_counter()
+        raw_content = ""
+        try:
+            completion = await self._client.chat.completions.create(
+                model=self._settings.model,
+                messages=messages,
+                temperature=0.05,
+                max_tokens=self._settings.max_tokens,
+                response_format={"type": "json_object"},
+            )
+            raw_content = _coerce_message_content(completion.choices[0].message.content)
+            payload = _extract_json_object(raw_content)
+            decision = LlmTurnDecision.model_validate(payload)
+        except Exception:
+            try:
+                completion = await self._client.chat.completions.create(
+                    model=self._settings.model,
+                    messages=messages,
+                    temperature=0.05,
+                    max_tokens=self._settings.max_tokens,
+                )
+                raw_content = _coerce_message_content(completion.choices[0].message.content)
+                decision = LlmTurnDecision.model_validate_json(_clean_text(raw_content))
+            except Exception:
+                decision = None
+
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        return decision, latency_ms
+
     async def call_json_prompt(self, *, system_prompt: str, user_prompt: str) -> dict[str, Any]:
         try:
             completion = await self._client.chat.completions.create(
@@ -156,15 +234,21 @@ class TurnLlmClient:
         if current_node == "call_connected":
             return LlmTurnDecision(
                 reply=DIALOGUE_GRAPH["cold_opening"].ask,
+                heard_summary="Клиент ответил на звонок.",
                 node_complete=True,
                 next_node="cold_opening",
+                reply_asks_node="cold_opening",
+                confidence=1.0,
                 reason="LLM fallback on call_connected",
             )
         node = DIALOGUE_GRAPH[current_node]
         return LlmTurnDecision(
             reply=node.ask,
+            heard_summary="",
             node_complete=False,
             next_node=None,
+            reply_asks_node=current_node if "?" in node.ask else None,
+            confidence=0.0,
             reason=f"LLM fallback on {current_node}",
         )
 

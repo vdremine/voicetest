@@ -10,6 +10,7 @@ class DialogueNode:
     ask: str
     success_criteria: str
     allowed_next: list[str]
+    required_fact_keys: list[str] = field(default_factory=list)
     examples: list[str] = field(default_factory=list)
     filler_words: list[str] = field(default_factory=list)
     rules: list[str] = field(default_factory=list)
@@ -37,7 +38,7 @@ DIALOGUE_GRAPH: dict[str, DialogueNode] = {
         goal="Представиться, объяснить кто мы, проверить можно ли коротко продолжить.",
         ask="Да, добрый день. Это Влад+имир, МосИнвестФинанс. Мы по кредитам под залог недвижимости, хотел буквально пару моментов уточнить — удобно?",
         success_criteria="Клиент понял, кто звонит, и разрешил продолжить, либо хотя бы не возражает.",
-        allowed_next=["collect_amount", "finish"],
+        allowed_next=["collect_amount", "callback_time", "finish"],
         filler_words=[
             "смотрите",
             "да, понял",
@@ -49,12 +50,16 @@ DIALOGUE_GRAPH: dict[str, DialogueNode] = {
             "Да, понял, представлюсь ещё раз. Влад+имир, МосИнвестФинанс, мы кредитный брокер — подбираем варианты по залогу недвижимости и ПТС. Я сейчас просто первично уточняю ситуацию.",
             "Мы не банк напрямую, мы брокер. Работаем с разными банками и инвесторами, поэтому задача — подобрать вариант под вашу ситуацию.",
             "Понимаю, что с холодного звонка это может звучать странно. Коротко: я оператор МосИнвестФинанс, мы кредитный брокер. Если вам неактуально — я не буду вас задерживать.",
+            "Да, понимаю, почему так могло прозвучать. Я Влад+имир, оператор МосИнвестФинанс. Если где-то не так услышал — поправьте меня, я нормально зафиксирую.",
+            "Понял, не буду отвлекать. Когда удобнее набрать — сегодня позже или завтра?",
         ],
         rules=[
             "Не спрашивай сумму, пока клиент не понял, кто звонит.",
             "Если клиент повторно спрашивает кто вы — объясни другими словами.",
             "Если клиент спрашивает какой банк — скажи, что мы брокер, не банк напрямую.",
             "Если клиент раздражён, не дави и не продавай.",
+            "Не говори 'как я могу вам помочь сегодня' — это исходящий звонок, не входящая линия.",
+            "Если клиент занят или за рулём, не дави: предложи перенести звонок на удобное время.",
         ],
     ),
     "collect_amount": DialogueNode(
@@ -67,8 +72,10 @@ DIALOGUE_GRAPH: dict[str, DialogueNode] = {
             "collect_property_type",
             "collect_vehicle_type",
             "partner_format",
+            "callback_time",
             "finish",
         ],
+        required_fact_keys=["desired_amount"],
         filler_words=[
             "угу",
             "понял вас",
@@ -80,6 +87,7 @@ DIALOGUE_GRAPH: dict[str, DialogueNode] = {
             "Да, понял, речь не про покупку. Мы как раз больше про кредит под уже имеющуюся недвижимость или под ПТС. Скажите, какую сумму примерно рассматриваете?",
             "Понял, сумму пока можно не фиксировать. Тогда по объекту сориентируюсь: какая недвижимость у вас в собственности?",
             "Миллион триста, угу, понял. А как я могу к вам обращаться?",
+            "Сумма нужна только чтобы понять порядок варианта. Цель можно не раскрывать. Какую сумму примерно рассматриваете?",
         ],
         rules=[
             "Никогда не спрашивай, на какую цель нужны деньги.",
@@ -87,6 +95,7 @@ DIALOGUE_GRAPH: dict[str, DialogueNode] = {
             "Если клиент спрашивает кто вы/какой банк/комиссия — ответь и вернись к сумме.",
             "Если клиент сказал, что речь про ПТС или автомобиль — переходи в авто-ветку.",
             "Если клиент сказал, что он партнёр/инвестор — переходи в партнёрскую ветку.",
+            "Не звучи как анкета. Сначала коротко отрази, потом один вопрос.",
         ],
     ),
     "collect_name": DialogueNode(
@@ -94,7 +103,7 @@ DIALOGUE_GRAPH: dict[str, DialogueNode] = {
         goal="Узнать, как обращаться к клиенту.",
         ask="Угу, понял. А как я могу к вам обращаться?",
         success_criteria="Клиент назвал имя или отказался назвать.",
-        allowed_next=["collect_property_type"],
+        allowed_next=["collect_property_type", "callback_time"],
         filler_words=[
             "угу",
             "понял",
@@ -121,7 +130,9 @@ DIALOGUE_GRAPH: dict[str, DialogueNode] = {
             "collect_region",
             "no_real_estate_products",
             "collect_vehicle_type",
+            "callback_time",
         ],
+        required_fact_keys=["property_type"],
         filler_words=[
             "угу",
             "понял",
@@ -140,6 +151,8 @@ DIALOGUE_GRAPH: dict[str, DialogueNode] = {
             "Не спорь с клиентом по типу объекта.",
             "Если недвижимости нет — предложи ПТС.",
             "Если клиент говорит 'только недвижимость' — не предлагай ПТС повторно.",
+            "Если клиент сразу назвал и объект, и город или регион, зафиксируй оба факта.",
+            "Если города уже достаточно для региона, можно сразу перейти к вопросу про обременение.",
         ],
     ),
     "collect_region": DialogueNode(
@@ -147,7 +160,8 @@ DIALOGUE_GRAPH: dict[str, DialogueNode] = {
         goal="Узнать регион объекта.",
         ask="Угу, понял. А в каком регионе находится?",
         success_criteria="Клиент назвал регион/город или отказался.",
-        allowed_next=["collect_encumbrance"],
+        allowed_next=["collect_encumbrance", "callback_time"],
+        required_fact_keys=["region"],
         filler_words=[
             "угу",
             "понял",
@@ -161,6 +175,8 @@ DIALOGUE_GRAPH: dict[str, DialogueNode] = {
         rules=[
             "Не спрашивай цель денег.",
             "Не спорь, если клиент называет область, город или район.",
+            "Если клиент уже назвал город уровня Москва или Санкт-Петербург, этого достаточно.",
+            "Не требуй район, если город уже понятен.",
         ],
     ),
     "collect_encumbrance": DialogueNode(
@@ -171,7 +187,9 @@ DIALOGUE_GRAPH: dict[str, DialogueNode] = {
         allowed_next=[
             "collect_encumbrance_details",
             "collect_owner",
+            "callback_time",
         ],
+        required_fact_keys=["encumbrance"],
         filler_words=[
             "угу",
             "понял",
@@ -194,7 +212,7 @@ DIALOGUE_GRAPH: dict[str, DialogueNode] = {
         goal="Если есть обременение, уточнить один параметр за раз.",
         ask="Понял. А остаток долга примерно какой?",
         success_criteria="Клиент сообщил хотя бы остаток долга или детали ситуации.",
-        allowed_next=["collect_owner"],
+        allowed_next=["collect_owner", "callback_time"],
         filler_words=[
             "угу",
             "понял",
@@ -217,7 +235,8 @@ DIALOGUE_GRAPH: dict[str, DialogueNode] = {
         goal="Узнать собственника.",
         ask="И по собственникам: вы один собственник или ещё кто-то есть?",
         success_criteria="Клиент сказал, кто собственник, или что нужно проверить документы.",
-        allowed_next=["pitch_conditions"],
+        allowed_next=["pitch_conditions", "callback_time"],
+        required_fact_keys=["owner_status"],
         filler_words=[
             "угу",
             "понял",
@@ -229,10 +248,12 @@ DIALOGUE_GRAPH: dict[str, DialogueNode] = {
             "Понял, на вас и на сыне, по одной второй. Тогда в целом картинка понятна.",
             "Понял, если нужно проверить документы — это нормально. Для первичного понимания я зафиксирую, что надо уточнить по собственникам.",
             "Моя ошибка, я не так услышал. Повторите, пожалуйста, кто собственник квартиры, чтобы я нормально зафиксировал.",
+            "Понял, собственник вы. Тогда в целом картинка ясна.",
         ],
         rules=[
             "Если клиент сказал, что ты его неправильно понял — признай ошибку и попроси повторить.",
             "Не додумывай собственника.",
+            "Если клиент ответил грубо или обрывком, извлеки смысл и не зеркаль грубость.",
         ],
     ),
     "pitch_conditions": DialogueNode(
@@ -243,6 +264,7 @@ DIALOGUE_GRAPH: dict[str, DialogueNode] = {
         allowed_next=[
             "priority_choice",
             "handoff_consent",
+            "callback_time",
         ],
         filler_words=[
             "смотрите",
@@ -254,12 +276,14 @@ DIALOGUE_GRAPH: dict[str, DialogueNode] = {
             "Смотрите, по таким параметрам можно рассматривать кредит под залог. Обычно это до семидесяти процентов от рыночной стоимости, срок до двадцати пяти лет, ставка от девятнадцати процентов. Точнее уже эксперт рассчитает.",
             "Клиент остаётся собственником, оригиналы документов остаются у вас. Эксперт уже отдельно объяснит, как это оформляется.",
             "Я не буду обещать одобрение по телефону, это неправильно. Но по таким вводным есть смысл передать эксперту, чтобы он нормально посчитал.",
+            "Смотрите, клиент остаётся собственником, оригиналы документов у вас. Но это залоговый продукт, поэтому эксперт отдельно объяснит риски и порядок оформления.",
         ],
         rules=[
             "Не говори 'точно одобрим'.",
             "Не говори 'у вас хорошая кредитная история', если этого нет в фактах.",
             "Не делай длинную простыню.",
             "Если клиент перебил — не продолжай монолог, ответь на новую реплику.",
+            "Если клиент боится за безопасность объекта, отвечай честно и без сказок.",
         ],
     ),
     "priority_choice": DialogueNode(
@@ -267,7 +291,8 @@ DIALOGUE_GRAPH: dict[str, DialogueNode] = {
         goal="Понять, что важнее: скорость, ставка или платёж.",
         ask="А для вас сейчас что важнее — скорость или минимальная ставка?",
         success_criteria="Клиент назвал приоритет или сказал, что не знает.",
-        allowed_next=["handoff_consent"],
+        allowed_next=["handoff_consent", "callback_time"],
+        required_fact_keys=["priority"],
         filler_words=[
             "угу",
             "понял",
@@ -292,6 +317,7 @@ DIALOGUE_GRAPH: dict[str, DialogueNode] = {
             "callback_time",
             "finish",
         ],
+        required_fact_keys=["callback_consent"],
         filler_words=[
             "угу",
             "хорошо",
@@ -314,6 +340,7 @@ DIALOGUE_GRAPH: dict[str, DialogueNode] = {
         ask="Угу, понял. А когда удобнее — сегодня, завтра, после обеда?",
         success_criteria="Клиент назвал время или сказал, что в любое.",
         allowed_next=["finish"],
+        required_fact_keys=["callback_time"],
         filler_words=[
             "угу",
             "понял",
@@ -332,6 +359,7 @@ DIALOGUE_GRAPH: dict[str, DialogueNode] = {
         success_criteria="Клиент сказал, есть автомобиль или нет.",
         allowed_next=[
             "collect_vehicle_type",
+            "callback_time",
             "finish",
         ],
         filler_words=[
@@ -349,7 +377,8 @@ DIALOGUE_GRAPH: dict[str, DialogueNode] = {
         goal="Узнать автомобиль для ПТС.",
         ask="Угу, тогда можно посмотреть вариант под ПТС. Что за автомобиль у вас?",
         success_criteria="Клиент назвал автомобиль.",
-        allowed_next=["collect_vehicle_owner"],
+        allowed_next=["collect_vehicle_owner", "callback_time"],
+        required_fact_keys=["vehicle_type"],
         filler_words=[
             "угу",
             "понял",
@@ -368,7 +397,8 @@ DIALOGUE_GRAPH: dict[str, DialogueNode] = {
         goal="Узнать собственника автомобиля.",
         ask="Понял. А по машине собственник вы или ещё кто-то есть?",
         success_criteria="Клиент сказал, на ком авто.",
-        allowed_next=["collect_vehicle_encumbrance"],
+        allowed_next=["collect_vehicle_encumbrance", "callback_time"],
+        required_fact_keys=["vehicle_owner"],
         filler_words=[
             "угу",
             "понял",
@@ -384,7 +414,8 @@ DIALOGUE_GRAPH: dict[str, DialogueNode] = {
         goal="Узнать, есть ли залог или кредит на авто.",
         ask="И такой момент: машина сейчас в кредите или под залогом где-то?",
         success_criteria="Клиент сказал, чистая машина или в залоге.",
-        allowed_next=["collect_amount"],
+        allowed_next=["collect_amount", "callback_time"],
+        required_fact_keys=["vehicle_encumbrance"],
         filler_words=[
             "угу",
             "понял",
@@ -400,7 +431,7 @@ DIALOGUE_GRAPH: dict[str, DialogueNode] = {
         goal="Если клиент инвестор/партнёр, не вести как заёмщика.",
         ask="Понял вас, то есть вы не как заёмщик, а по партнёрскому направлению. Какой формат сотрудничества интересует?",
         success_criteria="Клиент описал формат партнёрства.",
-        allowed_next=["partner_handoff"],
+        allowed_next=["partner_handoff", "callback_time"],
         filler_words=[
             "понял вас",
             "угу",

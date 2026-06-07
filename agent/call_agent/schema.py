@@ -31,6 +31,10 @@ NodeId = Literal[
 
 class LlmTurnDecision(BaseModel):
     reply: str = Field(..., description="Живая короткая реплика ассистента")
+    heard_summary: str = Field(
+        default="",
+        description="Коротко, что именно модель поняла из текущей реплики клиента",
+    )
     facts_update: dict[str, Any] = Field(
         default_factory=dict,
         description="Только факты, явно сказанные клиентом в текущей реплике",
@@ -43,6 +47,10 @@ class LlmTurnDecision(BaseModel):
         default=None,
         description="Следующий узел, если текущий узел завершён",
     )
+    reply_asks_node: NodeId | None = Field(
+        default=None,
+        description="Какой узел фактически спрашивает текущая reply-реплика",
+    )
     temporary_exit: bool = Field(
         default=False,
         description="true, если клиент задал дополнительный вопрос, и агент временно вышел из узла",
@@ -54,6 +62,10 @@ class LlmTurnDecision(BaseModel):
     client_question_answered: bool = False
     client_resistance: str | None = None
     should_end: bool = False
+    confidence: float = Field(
+        default=0.0,
+        description="Уверенность модели в своём решении от 0.0 до 1.0",
+    )
     repeat_note: str | None = Field(
         default=None,
         description="Как модель изменила ответ, если это повтор на том же узле",
