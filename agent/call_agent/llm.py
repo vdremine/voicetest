@@ -70,7 +70,7 @@ class LlmSettings:
             base_url=os.getenv("LLM_BASE_URL", "http://127.0.0.1:8001/v1").strip() or "http://127.0.0.1:8001/v1",
             api_key=os.getenv("LLM_API_KEY", "local-token").strip() or "local-token",
             temperature=float(os.getenv("LLM_TEMPERATURE", "0.08")),
-            max_tokens=int(os.getenv("LLM_MAX_TOKENS", "320")),
+            max_tokens=int(os.getenv("LLM_MAX_TOKENS", "420")),
             timeout_seconds=float(os.getenv("LLM_TIMEOUT_SECONDS", "15")),
         )
 
@@ -150,6 +150,7 @@ class TurnLlmClient:
                     "Ты не ведешь новый разговор. Ты исправляешь невалидный JSON-ответ того же агента.\n"
                     "Сохрани исходный смысл ответа максимально близко.\n"
                     "Верни только валидный JSON по схеме.\n"
+                    "Сделай JSON компактным: опускай пустые optional-поля.\n"
                     "Не придумывай новые факты от себя."
                 ),
             },
@@ -203,6 +204,7 @@ class TurnLlmClient:
                     "Нельзя выбирать next_node вне allowed_next.\n"
                     "Если текущий узел не завершен, поставь node_complete=false и next_node=null.\n"
                     "Если узел завершен, выбери next_node только из allowed_next.\n"
+                    "Верни компактный JSON без пустых optional-полей.\n"
                     "Смысл reply сохраняй максимально близко."
                 ),
             },

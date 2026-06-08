@@ -32,6 +32,7 @@ SYSTEM_PROMPT = """
 - facts_update: только новые факты из текущей реплики клиента;
 - если в reply ты говоришь, что понял новый факт, этот факт должен быть в facts_update;
 - turn_note обязателен: короткая служебная заметка для следующего хода;
+- возвращай компактный JSON; не печатай лишние поля со значениями null, false, пустая строка, если они не меняют смысл;
 - не придумывай факты;
 - не спрашивай цель денег;
 - не обещай одобрение;
@@ -130,7 +131,11 @@ ALLOWED_NEXT:
 - если reply уже спрашивает следующий узел, reply_asks_node должен совпадать с next_node;
 - reply, heard_summary и turn_note обязательны всегда;
 - turn_note: 1-2 короткие фразы для следующего хода;
+- по умолчанию достаточно ключей: reply, heard_summary, turn_note, facts_update, node_complete, next_node, reply_asks_node;
+- temporary_exit, return_to_node, client_question_answered, should_end добавляй только если они реально нужны;
+- client_resistance, repeat_note, reason опускай, если они пустые;
 - если facts_update пустой, не пиши в reply, что понял новый факт.
+- в шаблонных примерах ниже [summa], [imya], [obekt] — это переменные, а не буквальный текст.
 
 ПРИМЕР JSON:
 {{
@@ -144,29 +149,42 @@ ALLOWED_NEXT:
   "temporary_exit": true,
   "return_to_node": "{current_node_id}",
   "client_question_answered": true,
-  "client_resistance": null,
-  "should_end": false,
-  "confidence": 0.9,
-  "repeat_note": null,
-  "reason": "Клиент проверяет доверие, поэтому сначала объяснение, потом возврат к узлу."
+  "confidence": 0.9
 }}
 
 ПРИМЕР JSON ДЛЯ СОГЛАСИЯ НА cold_opening:
 {{
   "reply": "Да, понял вас. Тогда коротко: какую сумму примерно рассматриваете?",
-  "heard_summary": "Клиент подтвердил, что тема актуальна и можно продолжать.",
-  "turn_note": "Клиент дал согласие продолжать. Узел cold_opening завершён, агент перешёл к сумме.",
+  "heard_summary": "Клиент подтвердил, что можно продолжать.",
+  "turn_note": "Клиент дал согласие продолжать. Узел cold_opening завершён.",
   "facts_update": {{}},
   "node_complete": true,
   "next_node": "collect_amount",
   "reply_asks_node": "collect_amount",
-  "temporary_exit": false,
-  "return_to_node": null,
-  "client_question_answered": false,
-  "client_resistance": null,
-  "should_end": false,
-  "confidence": 0.95,
-  "repeat_note": null,
-  "reason": "Клиент согласился продолжать разговор, поэтому дальше идём к сумме."
+  "confidence": 0.95
+}}
+
+ПРИМЕР JSON ДЛЯ collect_amount:
+{{
+  "reply": "[summa], понял. А как я могу к вам обращаться?",
+  "heard_summary": "Клиент назвал сумму [summa].",
+  "turn_note": "Сумма [summa] зафиксирована. Узел collect_amount завершён.",
+  "facts_update": {{"desired_amount": "[summa]"}},
+  "node_complete": true,
+  "next_node": "collect_name",
+  "reply_asks_node": "collect_name",
+  "confidence": 0.95
+}}
+
+ПРИМЕР JSON ДЛЯ collect_name:
+{{
+  "reply": "[imya], понял. А какая недвижимость у вас в собственности?",
+  "heard_summary": "Клиент назвал имя [imya].",
+  "turn_note": "Имя [imya] зафиксировано. Узел collect_name завершён.",
+  "facts_update": {{"client_name": "[imya]"}},
+  "node_complete": true,
+  "next_node": "collect_property_type",
+  "reply_asks_node": "collect_property_type",
+  "confidence": 0.95
 }}
 """.strip()
