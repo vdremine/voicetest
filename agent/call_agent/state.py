@@ -9,6 +9,7 @@ class CallState(TypedDict, total=False):
 
     current_node: str
     return_to_node: str | None
+    last_turn_note: str
 
     raw_text: str
     user_text: str

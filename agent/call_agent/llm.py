@@ -105,6 +105,7 @@ class TurnLlmClient:
         known_facts: dict[str, Any],
         history: list[dict[str, str]],
         node_repeat_count: int,
+        last_turn_note: str,
     ) -> LlmCallResult:
         node = DIALOGUE_GRAPH[current_node]
         messages = [
@@ -117,6 +118,7 @@ class TurnLlmClient:
                     last_messages=history[-4:],
                     known_facts=known_facts,
                     node_repeat_count=node_repeat_count,
+                    last_turn_note=last_turn_note,
                     user_text=user_text,
                 ),
             },
@@ -135,6 +137,7 @@ class TurnLlmClient:
         known_facts: dict[str, Any],
         history: list[dict[str, str]],
         node_repeat_count: int,
+        last_turn_note: str,
         raw_output: str,
         parse_error: str,
     ) -> LlmCallResult:
@@ -158,6 +161,7 @@ class TurnLlmClient:
                     last_messages=history[-4:],
                     known_facts=known_facts,
                     node_repeat_count=node_repeat_count,
+                    last_turn_note=last_turn_note,
                     user_text=user_text,
                 ),
             },
@@ -185,6 +189,7 @@ class TurnLlmClient:
         known_facts: dict[str, Any],
         history: list[dict[str, str]],
         node_repeat_count: int,
+        last_turn_note: str,
         bad_decision: dict[str, Any],
     ) -> LlmCallResult:
         node = DIALOGUE_GRAPH[current_node]
@@ -209,6 +214,7 @@ class TurnLlmClient:
                     last_messages=history[-4:],
                     known_facts=known_facts,
                     node_repeat_count=node_repeat_count,
+                    last_turn_note=last_turn_note,
                     user_text=user_text,
                 ),
             },

@@ -35,6 +35,13 @@ class LlmTurnDecision(BaseModel):
         default="",
         description="Коротко, что именно модель поняла из текущей реплики клиента",
     )
+    turn_note: str = Field(
+        default="",
+        description=(
+            "Короткая служебная заметка для следующего хода: что произошло на этом ходу, "
+            "что уже было объяснено и с чем надо идти дальше"
+        ),
+    )
     facts_update: dict[str, Any] = Field(
         default_factory=dict,
         description="Только факты, явно сказанные клиентом в текущей реплике",

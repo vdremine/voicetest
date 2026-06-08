@@ -58,6 +58,7 @@ async def start_session(request: StartSessionRequest) -> dict[str, Any]:
         "phone": request.phone,
         "current_node": "call_connected",
         "return_to_node": None,
+        "last_turn_note": "Звонок только начался. Агент сказал 'Алло.' и ждёт, пока клиент ответит на звонок.",
         "raw_text": "",
         "user_text": "",
         "known_facts": known_facts,
@@ -80,6 +81,7 @@ async def start_session(request: StartSessionRequest) -> dict[str, Any]:
         "reply": DIALOGUE_GRAPH["call_connected"].ask,
         "current_node": state["current_node"],
         "known_facts": state["known_facts"],
+        "last_turn_note": state["last_turn_note"],
         "trace": state["trace"],
     }
 
@@ -108,6 +110,7 @@ async def message(request: ChatRequest) -> dict[str, Any]:
         "reply": output_state.get("reply", ""),
         "current_node": output_state.get("current_node", ""),
         "known_facts": output_state.get("known_facts", {}),
+        "last_turn_note": output_state.get("last_turn_note", ""),
         "history": output_state.get("history", [])[-4:],
         "llm_decision": output_state.get("llm_decision", {}),
         "trace": output_state.get("trace", {}),

@@ -50,11 +50,13 @@ class CallGraphRunner:
         repeat_count = state.get("node_repeat_count", {}).get(current_node, 0)
         known_facts = state.get("known_facts", {})
         history = state.get("history", [])[-4:]
+        last_turn_note = state.get("last_turn_note", "")
 
         if current_node == "call_connected":
             decision = LlmTurnDecision(
                 reply=DIALOGUE_GRAPH["cold_opening"].ask,
                 heard_summary="Клиент ответил на звонок.",
+                turn_note="Клиент взял трубку. Агент представился и перевёл разговор в cold_opening.",
                 facts_update={},
                 node_complete=True,
                 next_node="cold_opening",
@@ -74,6 +76,7 @@ class CallGraphRunner:
                 "llm_latency_ms": 0,
                 "raw_llm_output": "",
                 "parse_error": "",
+                "last_turn_note": decision.turn_note,
                 "llm_decision": decision.model_dump(),
             }
             self._metrics.record("cached_answer", 0)
@@ -92,6 +95,7 @@ class CallGraphRunner:
             known_facts=known_facts,
             history=history,
             node_repeat_count=repeat_count,
+            last_turn_note=last_turn_note,
         )
         self._metrics.record("llm_answer", primary_result.latency_ms)
 
@@ -107,6 +111,7 @@ class CallGraphRunner:
                 known_facts=known_facts,
                 history=history,
                 node_repeat_count=repeat_count,
+                last_turn_note=last_turn_note,
                 raw_output=final_result.raw_output,
                 parse_error=final_result.parse_error,
             )
@@ -131,6 +136,7 @@ class CallGraphRunner:
                 known_facts=known_facts,
                 history=history,
                 node_repeat_count=repeat_count,
+                last_turn_note=last_turn_note,
                 bad_decision=final_result.decision.model_dump(),
             )
             total_latency_ms += repaired_transition.latency_ms
@@ -168,6 +174,7 @@ class CallGraphRunner:
             "llm_latency_ms": total_latency_ms,
             "raw_llm_output": primary_result.raw_output,
             "parse_error": primary_result.parse_error,
+            "last_turn_note": final_decision.turn_note or final_decision.heard_summary,
             "llm_decision": final_decision.model_dump(),
             "json_repair": json_repair_trace,
             "transition_repair": transition_repair_trace,
@@ -185,6 +192,7 @@ class CallGraphRunner:
             "reply": final_decision.reply,
             "llm_decision": final_decision.model_dump(),
             "return_to_node": final_decision.return_to_node,
+            "last_turn_note": final_decision.turn_note or final_decision.heard_summary,
             "trace": trace,
         }
 
@@ -247,6 +255,7 @@ class CallGraphRunner:
         return {
             **state,
             "history": history[-12:],
+            "last_turn_note": state.get("last_turn_note", ""),
             "trace": trace,
         }
 
@@ -269,6 +278,7 @@ class CallGraphRunner:
         decision = LlmTurnDecision(
             reply="Секунду, повторите, пожалуйста, я не совсем корректно понял.",
             heard_summary="",
+            turn_note="На этом ходу модель не вернула валидный ответ. Агент попросил клиента повторить.",
             facts_update={},
             node_complete=False,
             next_node=None,

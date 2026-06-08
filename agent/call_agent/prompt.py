@@ -95,6 +95,7 @@ def build_node_prompt(
     last_messages: list[dict[str, str]],
     known_facts: dict[str, Any],
     node_repeat_count: int,
+    last_turn_note: str,
     user_text: str,
 ) -> str:
     history_text = "\n".join(
@@ -112,6 +113,7 @@ def build_node_prompt(
     rules_text = "\n".join(f"- {item}" for item in node.rules) or "- специальных правил нет"
     allowed_next = ", ".join(node.allowed_next) if node.allowed_next else "нет"
     required_facts = ", ".join(node.required_fact_keys) if node.required_fact_keys else "нет обязательных"
+    turn_note_text = last_turn_note.strip() or "Служебной заметки с прошлого хода пока нет."
 
     return f"""
 ТЕКУЩИЙ УЗЕЛ ГРАФА:
@@ -134,6 +136,9 @@ def build_node_prompt(
 
 ИЗВЕСТНЫЕ ФАКТЫ:
 {facts_text}
+
+СЛУЖЕБНАЯ ЗАМЕТКА С ПРОШЛОГО ХОДА:
+{turn_note_text}
 
 ПОСЛЕДНИЕ 4 СООБЩЕНИЯ:
 {history_text}
@@ -158,6 +163,7 @@ def build_node_prompt(
 Объясни проще, короче или с другой стороны.
 Если клиент второй раз спрашивает “кто вы”, ответь подробнее и спокойнее.
 Если клиент раздражён, меньше продавай, больше признавай непонимание.
+Учитывай служебную заметку с прошлого хода и не теряй уже объяснённый контекст.
 
 ПСИХОЛОГИЯ ХОЛОДНОГО ЗВОНКА:
 - Клиент не ждёт звонка и сначала проверяет: кто ты, зачем звонишь, можно ли доверять, сколько это займёт.
@@ -201,6 +207,14 @@ def build_node_prompt(
 
 Если facts_update пустой, но ты в reply пишешь, что понял сумму, квартиру, город, обременение, собственника или приоритет, это ошибка.
 
+КРИТИЧЕСКОЕ ПРАВИЛО КОНТЕКСТА:
+Поле turn_note обязательно заполняй на каждом ходу.
+В turn_note одной-двумя короткими фразами зафиксируй:
+- что клиент имел в виду;
+- что агент уже объяснил или уточнил;
+- на каком смысле должен продолжиться следующий ход.
+turn_note не для клиента. Это служебная заметка для следующего вызова модели.
+
 ИНСТРУКЦИЯ ПО reply_asks_node:
 - Если твоя reply заканчивается вопросом текущего узла, ставь reply_asks_node = текущий узел.
 - Если ты завершил текущий узел и уже задал вопрос следующего узла, ставь reply_asks_node = этот следующий узел.
@@ -209,5 +223,28 @@ def build_node_prompt(
 
 ФОРМАТ СЛУЖЕБНЫХ ПОЛЕЙ:
 - heard_summary: одной короткой строкой, что ты понял из текущей фразы клиента.
+- turn_note: одной-двумя короткими фразами, что произошло на этом ходу и с чем идти в следующий ход.
 - confidence: число от 0.0 до 1.0.
+
+JSON-МИНИМУМ:
+Никогда не пропускай поля reply, heard_summary, turn_note, facts_update, node_complete, next_node, temporary_exit, return_to_node, confidence.
+
+ПРИМЕР ПРАВИЛЬНОГО JSON:
+{{
+  "reply": "Секунду, поясню. Это Влад+имир, МосИнвестФинанс, мы кредитный брокер по залогу недвижимости. Тема вам в целом актуальна?",
+  "heard_summary": "Клиент не понял, кто звонит.",
+  "turn_note": "Клиент переспросил, кто звонит. Агент коротко представился и остался на cold_opening.",
+  "facts_update": {{}},
+  "node_complete": false,
+  "next_node": null,
+  "reply_asks_node": "cold_opening",
+  "temporary_exit": true,
+  "return_to_node": "{current_node_id}",
+  "client_question_answered": true,
+  "client_resistance": null,
+  "should_end": false,
+  "confidence": 0.9,
+  "repeat_note": null,
+  "reason": "Клиент проверяет доверие, поэтому сначала объяснение, потом возврат к узлу."
+}}
 """.strip()
