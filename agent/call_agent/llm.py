@@ -23,6 +23,7 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     value = _clean_text(text)
     if not value:
         return {}
+
     try:
         return json.loads(value)
     except json.JSONDecodeError:
@@ -35,7 +36,22 @@ def _extract_json_object(text: str) -> dict[str, Any]:
             return json.loads(value[start : end + 1])
         except json.JSONDecodeError:
             return {}
+
     return {}
+
+
+def _coerce_message_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                parts.append(_clean_text(item.get("text")))
+            else:
+                parts.append(_clean_text(getattr(item, "text", "")))
+        return "".join(parts)
+    return _clean_text(content)
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +75,15 @@ class LlmSettings:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class LlmCallResult:
+    source: str
+    decision: LlmTurnDecision | None
+    raw_output: str
+    parse_error: str
+    latency_ms: int
+
+
 class TurnLlmClient:
     def __init__(self, settings: LlmSettings) -> None:
         self._settings = settings
@@ -80,7 +105,7 @@ class TurnLlmClient:
         known_facts: dict[str, Any],
         history: list[dict[str, str]],
         node_repeat_count: int,
-    ) -> tuple[LlmTurnDecision, int]:
+    ) -> LlmCallResult:
         node = DIALOGUE_GRAPH[current_node]
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -96,46 +121,13 @@ class TurnLlmClient:
                 ),
             },
         ]
+        return await self._run_messages(
+            messages=messages,
+            temperature=self._settings.temperature,
+            source="main",
+        )
 
-        started_at = time.perf_counter()
-        raw_content = ""
-        try:
-            completion = await self._client.chat.completions.create(
-                model=self._settings.model,
-                messages=messages,
-                temperature=self._settings.temperature,
-                max_tokens=self._settings.max_tokens,
-                response_format={"type": "json_object"},
-            )
-            raw_content = _coerce_message_content(completion.choices[0].message.content)
-            payload = _extract_json_object(raw_content)
-            decision = LlmTurnDecision.model_validate(payload)
-        except Exception:
-            try:
-                completion = await self._client.chat.completions.create(
-                    model=self._settings.model,
-                    messages=messages,
-                    temperature=self._settings.temperature,
-                    max_tokens=self._settings.max_tokens,
-                )
-                raw_content = _coerce_message_content(completion.choices[0].message.content)
-                decision = LlmTurnDecision.model_validate_json(_clean_text(raw_content))
-            except ValidationError:
-                decision = self._fallback_decision(current_node=current_node)
-            except Exception:
-                payload = _extract_json_object(raw_content)
-                if payload:
-                    try:
-                        decision = LlmTurnDecision.model_validate(payload)
-                    except ValidationError:
-                        decision = self._fallback_decision(current_node=current_node)
-                else:
-                    decision = self._fallback_decision(current_node=current_node)
-
-        latency_ms = int((time.perf_counter() - started_at) * 1000)
-        return decision, latency_ms
-
-    async def repair_turn_llm(
+    async def repair_json_llm(
         self,
         *,
         current_node: str,
@@ -143,31 +135,19 @@ class TurnLlmClient:
         known_facts: dict[str, Any],
         history: list[dict[str, str]],
         node_repeat_count: int,
-        bad_decision: dict[str, Any],
-        errors: list[str],
-    ) -> tuple[LlmTurnDecision | None, int]:
+        raw_output: str,
+        parse_error: str,
+    ) -> LlmCallResult:
         node = DIALOGUE_GRAPH[current_node]
-        candidate_next_node_name = ""
-        candidate_next_examples = ""
-        raw_next = bad_decision.get("next_node")
-        if isinstance(raw_next, str) and raw_next in DIALOGUE_GRAPH:
-            candidate_node = DIALOGUE_GRAPH[raw_next]
-            candidate_next_node_name = raw_next
-            candidate_next_examples = "\n".join(f"- {item}" for item in candidate_node.examples[:3])
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {
                 "role": "system",
                 "content": (
-                    "Ты не ведёшь разговор заново. Ты исправляешь плохое JSON-решение голосового агента.\n"
-                    "Верни только исправленный JSON по той же схеме.\n"
-                    "Не придумывай факты, которых клиент не говорил.\n"
-                    "Если клиент явно дал новый факт, запиши его в facts_update.\n"
-                    "Если клиент уже согласился продолжать разговор, не повторяй cold opening.\n"
-                    "Если клиент просит пояснить, кто звонит, не переходи к сумме до короткого пояснения.\n"
-                    "Если reply задаёт вопрос следующего узла, next_node и reply_asks_node должны совпадать.\n"
-                    "Отвечай только по-русски, без китайского и без смешанного языка.\n"
-                    "Не копируй жаргон клиента как свой стиль."
+                    "Ты не ведешь новый разговор. Ты исправляешь невалидный JSON-ответ того же агента.\n"
+                    "Сохрани исходный смысл ответа максимально близко.\n"
+                    "Верни только валидный JSON по схеме.\n"
+                    "Не придумывай новые факты от себя."
                 ),
             },
             {
@@ -185,47 +165,68 @@ class TurnLlmClient:
                 "role": "user",
                 "content": (
                     f"Текущий узел: {current_node}\n"
-                    f"Текущий canonical ask: {node.ask}\n"
-                    f"Кандидат next_node из плохого решения: {candidate_next_node_name or 'нет'}\n"
-                    f"Примеры next_node:\n{candidate_next_examples or '- нет'}\n"
-                    f"Реплика клиента: {user_text}\n"
-                    f"Плохое решение: {json.dumps(bad_decision, ensure_ascii=False)}\n"
-                    f"Ошибки: {json.dumps(errors, ensure_ascii=False)}\n"
-                    "Исправь JSON так, чтобы факты, переход и текст ответа были согласованы.\n"
-                    "Если клиент сказал короткое согласие вроде 'да', 'удобно', 'ну я слушаю', обычно нужен следующий вопрос следующего узла, а не повтор представления.\n"
-                    "Если клиент сказал 'всмысле' или 'кто это', нужен короткий trust-repair внутри cold_opening."
+                    f"Ошибка парсинга/валидации: {parse_error}\n"
+                    f"Сырой вывод модели:\n{raw_output or '<empty>'}\n"
+                    "Преобразуй это в валидный JSON по схеме, не меняя смысл без необходимости."
                 ),
             },
         ]
+        return await self._run_messages(
+            messages=messages,
+            temperature=0.0,
+            source="json_repair",
+        )
 
-        started_at = time.perf_counter()
-        raw_content = ""
-        try:
-            completion = await self._client.chat.completions.create(
-                model=self._settings.model,
-                messages=messages,
-                temperature=0.0,
-                max_tokens=self._settings.max_tokens,
-                response_format={"type": "json_object"},
-            )
-            raw_content = _coerce_message_content(completion.choices[0].message.content)
-            payload = _extract_json_object(raw_content)
-            decision = LlmTurnDecision.model_validate(payload)
-        except Exception:
-            try:
-                completion = await self._client.chat.completions.create(
-                    model=self._settings.model,
-                    messages=messages,
-                    temperature=0.0,
-                    max_tokens=self._settings.max_tokens,
-                )
-                raw_content = _coerce_message_content(completion.choices[0].message.content)
-                decision = LlmTurnDecision.model_validate_json(_clean_text(raw_content))
-            except Exception:
-                decision = None
-
-        latency_ms = int((time.perf_counter() - started_at) * 1000)
-        return decision, latency_ms
+    async def repair_transition_llm(
+        self,
+        *,
+        current_node: str,
+        user_text: str,
+        known_facts: dict[str, Any],
+        history: list[dict[str, str]],
+        node_repeat_count: int,
+        bad_decision: dict[str, Any],
+    ) -> LlmCallResult:
+        node = DIALOGUE_GRAPH[current_node]
+        allowed_next = ", ".join(node.allowed_next) if node.allowed_next else "нет"
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "system",
+                "content": (
+                    "Ты исправляешь только структурную ошибку перехода.\n"
+                    "Нельзя выбирать next_node вне allowed_next.\n"
+                    "Если текущий узел не завершен, поставь node_complete=false и next_node=null.\n"
+                    "Если узел завершен, выбери next_node только из allowed_next.\n"
+                    "Смысл reply сохраняй максимально близко."
+                ),
+            },
+            {
+                "role": "system",
+                "content": build_node_prompt(
+                    node=node,
+                    current_node_id=current_node,
+                    last_messages=history[-4:],
+                    known_facts=known_facts,
+                    node_repeat_count=node_repeat_count,
+                    user_text=user_text,
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Текущий узел: {current_node}\n"
+                    f"allowed_next: {allowed_next}\n"
+                    f"Текущий JSON: {json.dumps(bad_decision, ensure_ascii=False)}\n"
+                    "Верни исправленный JSON. next_node должен быть только из allowed_next или null."
+                ),
+            },
+        ]
+        return await self._run_messages(
+            messages=messages,
+            temperature=0.0,
+            source="transition_repair",
+        )
 
     async def call_json_prompt(self, *, system_prompt: str, user_prompt: str) -> dict[str, Any]:
         try:
@@ -244,38 +245,66 @@ class TurnLlmClient:
         except Exception:
             return {}
 
-    def _fallback_decision(self, *, current_node: str) -> LlmTurnDecision:
-        if current_node == "call_connected":
-            return LlmTurnDecision(
-                reply=DIALOGUE_GRAPH["cold_opening"].ask,
-                heard_summary="Клиент ответил на звонок.",
-                node_complete=True,
-                next_node="cold_opening",
-                reply_asks_node="cold_opening",
-                confidence=1.0,
-                reason="LLM fallback on call_connected",
+    async def _run_messages(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        temperature: float,
+        source: str,
+    ) -> LlmCallResult:
+        started_at = time.perf_counter()
+        raw_output = ""
+        parse_error = ""
+
+        try:
+            completion = await self._client.chat.completions.create(
+                model=self._settings.model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=self._settings.max_tokens,
+                response_format={"type": "json_object"},
             )
-        node = DIALOGUE_GRAPH[current_node]
-        return LlmTurnDecision(
-            reply=node.ask,
-            heard_summary="",
-            node_complete=False,
-            next_node=None,
-            reply_asks_node=current_node if "?" in node.ask else None,
-            confidence=0.0,
-            reason=f"LLM fallback on {current_node}",
+            raw_output = _coerce_message_content(completion.choices[0].message.content)
+        except Exception as exc_json_mode:
+            parse_error = f"json_mode_request_failed: {exc_json_mode}"
+            try:
+                completion = await self._client.chat.completions.create(
+                    model=self._settings.model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=self._settings.max_tokens,
+                )
+                raw_output = _coerce_message_content(completion.choices[0].message.content)
+            except Exception as exc_plain:
+                latency_ms = int((time.perf_counter() - started_at) * 1000)
+                combined = f"{parse_error}; plain_request_failed: {exc_plain}"
+                return LlmCallResult(
+                    source=source,
+                    decision=None,
+                    raw_output=raw_output,
+                    parse_error=combined,
+                    latency_ms=latency_ms,
+                )
+
+        decision, validation_error = self._parse_decision(raw_output)
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        return LlmCallResult(
+            source=source,
+            decision=decision,
+            raw_output=raw_output,
+            parse_error=parse_error or validation_error,
+            latency_ms=latency_ms,
         )
 
+    def _parse_decision(self, raw_output: str) -> tuple[LlmTurnDecision | None, str]:
+        if not _clean_text(raw_output):
+            return None, "empty_llm_output"
 
-def _coerce_message_content(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                parts.append(_clean_text(item.get("text")))
-            else:
-                parts.append(_clean_text(getattr(item, "text", "")))
-        return "".join(parts)
-    return _clean_text(content)
+        payload = _extract_json_object(raw_output)
+        if not payload:
+            return None, "json_not_found_in_output"
+
+        try:
+            return LlmTurnDecision.model_validate(payload), ""
+        except ValidationError as exc:
+            return None, f"schema_validation_failed: {exc}"

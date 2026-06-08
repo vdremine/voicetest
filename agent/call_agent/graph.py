@@ -4,255 +4,10 @@ from typing import Any
 
 from .apply import apply_facts, sanitize_facts_update
 from .graph_spec import DIALOGUE_GRAPH
-from .llm import TurnLlmClient
+from .llm import LlmCallResult, TurnLlmClient
 from .metrics import MetricsCollector
 from .schema import LlmTurnDecision
 from .state import CallState
-
-
-FACT_ALIASES: dict[str, tuple[str, ...]] = {
-    "desired_amount": ("desired_amount", "amount", "нужная_сумма"),
-    "property_type": ("property_type", "no_real_estate"),
-    "region": ("region",),
-    "encumbrance": ("encumbrance",),
-    "owner_status": ("owner_status",),
-    "priority": ("priority",),
-    "vehicle_type": ("vehicle_type",),
-    "vehicle_owner": ("vehicle_owner",),
-    "vehicle_encumbrance": ("vehicle_encumbrance",),
-    "callback_consent": ("callback_consent",),
-    "callback_time": ("callback_time",),
-}
-
-REQUIRED_FACT_EXEMPT_NEXT: dict[str, set[str]] = {
-    "collect_amount": {"collect_vehicle_type", "partner_format", "callback_time", "finish"},
-    "collect_name": {"callback_time", "finish"},
-    "collect_property_type": {"callback_time", "finish"},
-    "collect_region": {"callback_time", "finish"},
-    "collect_encumbrance": {"callback_time", "finish"},
-    "collect_encumbrance_details": {"callback_time", "finish"},
-    "collect_owner": {"callback_time", "finish"},
-    "priority_choice": {"callback_time", "finish"},
-    "collect_vehicle_type": {"callback_time", "finish"},
-    "collect_vehicle_owner": {"callback_time", "finish"},
-    "collect_vehicle_encumbrance": {"callback_time", "finish"},
-    "partner_format": {"callback_time", "finish"},
-}
-
-REVIEW_ALWAYS_NODES = {
-    "cold_opening",
-    "handoff_consent",
-    "callback_time",
-}
-
-FACT_CAPTURE_NODES = {
-    "collect_amount",
-    "collect_name",
-    "collect_property_type",
-    "collect_region",
-    "collect_encumbrance",
-    "collect_encumbrance_details",
-    "collect_owner",
-    "priority_choice",
-    "collect_vehicle_type",
-    "collect_vehicle_owner",
-    "collect_vehicle_encumbrance",
-    "partner_format",
-}
-
-
-def _clean_text(value: Any) -> str:
-    return str(value or "").strip()
-
-
-def _contains_cjk(text: str) -> bool:
-    return any("\u4e00" <= char <= "\u9fff" for char in text)
-
-
-def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
-    normalized = _clean_text(text).lower()
-    return any(marker in normalized for marker in markers)
-
-
-def _normalize_for_compare(text: str) -> str:
-    value = _clean_text(text).lower().replace("ё", "е")
-    value = "".join(char if char.isalnum() or char.isspace() else " " for char in value)
-    return " ".join(value.split())
-
-
-def _fact_present(key: str, facts_update: dict[str, Any], known_facts: dict[str, Any]) -> bool:
-    aliases = FACT_ALIASES.get(key, (key,))
-    for alias in aliases:
-        if _clean_text(facts_update.get(alias)) or _clean_text(known_facts.get(alias)):
-            return True
-    return False
-
-
-def _missing_required_fact_keys(
-    current_node: str,
-    decision: LlmTurnDecision,
-    known_facts: dict[str, Any],
-) -> list[str]:
-    if not decision.node_complete or decision.temporary_exit or decision.should_end:
-        return []
-
-    if decision.next_node in REQUIRED_FACT_EXEMPT_NEXT.get(current_node, set()):
-        return []
-
-    node = DIALOGUE_GRAPH[current_node]
-    missing: list[str] = []
-    for key in node.required_fact_keys:
-        if not _fact_present(key, decision.facts_update, known_facts):
-            missing.append(key)
-    return missing
-
-
-def _decision_errors(
-    current_node: str,
-    decision: LlmTurnDecision,
-    known_facts: dict[str, Any],
-) -> list[str]:
-    errors: list[str] = []
-
-    missing_required = _missing_required_fact_keys(current_node, decision, known_facts)
-    if missing_required:
-        errors.append(
-            "node_complete=true but required facts are missing: "
-            + ", ".join(missing_required)
-        )
-
-    if (
-        not decision.temporary_exit
-        and decision.reply_asks_node
-        and decision.next_node
-        and decision.node_complete
-        and decision.reply_asks_node != decision.next_node
-    ):
-        errors.append(
-            "reply_asks_node does not match next_node: "
-            f"{decision.reply_asks_node} != {decision.next_node}"
-        )
-
-    if (
-        not decision.temporary_exit
-        and decision.reply_asks_node
-        and not decision.node_complete
-        and decision.reply_asks_node != current_node
-    ):
-        errors.append(
-            "reply_asks_node points away from current node while current node is not complete"
-        )
-
-    if _contains_cjk(decision.reply):
-        errors.append("reply contains CJK characters")
-
-    if decision.reply_asks_node and "?" not in decision.reply:
-        errors.append("reply_asks_node is set but reply has no question mark")
-
-    if not decision.reply_asks_node and "?" in decision.reply:
-        errors.append("reply asks a question but reply_asks_node is null")
-
-    current_ask_norm = _normalize_for_compare(DIALOGUE_GRAPH[current_node].ask)
-    reply_norm = _normalize_for_compare(decision.reply)
-    if (
-        decision.node_complete
-        and decision.next_node
-        and decision.next_node != current_node
-        and reply_norm == current_ask_norm
-    ):
-        errors.append("reply repeats current node ask while claiming transition to next node")
-
-    if decision.reply.count("?") > 1:
-        errors.append("reply asks more than one question")
-
-    if _contains_any(
-        decision.reply,
-        (
-            "как я могу вам помочь",
-            "чем могу помочь",
-            "как могу вам помочь",
-        ),
-    ):
-        errors.append("reply slipped into inbound support style")
-
-    if _contains_any(
-        decision.reply,
-        (
-            "хата",
-            "тачка",
-            "бабки",
-            "налик",
-        ),
-    ):
-        errors.append("reply mirrors client slang")
-
-    if _contains_any(
-        decision.reply,
-        (
-            "точно одобрим",
-            "можем одобрить",
-            "точно получится",
-            "у вас хорошая кредитная история",
-        ),
-    ):
-        errors.append("reply promises approval or invents credit quality")
-
-    if _contains_any(
-        decision.reply,
-        (
-            "цель кредита",
-            "зачем вам деньги",
-            "для чего вам деньги",
-        ),
-    ):
-        errors.append("reply asks forbidden money purpose question")
-
-    if not _clean_text(decision.reply):
-        errors.append("reply is empty")
-
-    return errors
-
-
-def _should_review_decision(
-    current_node: str,
-    decision: LlmTurnDecision,
-    errors: list[str],
-) -> bool:
-    if errors:
-        return True
-
-    if current_node in REVIEW_ALWAYS_NODES:
-        return True
-
-    if current_node in FACT_CAPTURE_NODES and (decision.node_complete or not decision.facts_update):
-        return True
-
-    return False
-
-
-def _structural_fallback_decision(
-    current_node: str,
-    decision: LlmTurnDecision,
-) -> LlmTurnDecision | None:
-    if not decision.node_complete or not decision.next_node:
-        return None
-
-    if decision.next_node not in DIALOGUE_GRAPH[current_node].allowed_next:
-        return None
-
-    current_ask_norm = _normalize_for_compare(DIALOGUE_GRAPH[current_node].ask)
-    reply_norm = _normalize_for_compare(decision.reply)
-    if reply_norm != current_ask_norm:
-        return None
-
-    next_ask = DIALOGUE_GRAPH[decision.next_node].ask
-    return decision.model_copy(
-        update={
-            "reply": next_ask,
-            "reply_asks_node": decision.next_node if "?" in next_ask else None,
-            "reason": (decision.reason + " | structural fallback to next node ask").strip(" |"),
-        }
-    )
 
 
 def choose_next_node(
@@ -275,6 +30,7 @@ def choose_next_node(
     node = DIALOGUE_GRAPH[current_node]
     if decision_next_node in node.allowed_next:
         return decision_next_node
+
     return current_node
 
 
@@ -309,18 +65,19 @@ class CallGraphRunner:
                 client_resistance=None,
                 should_end=False,
                 confidence=1.0,
-                repeat_note="Deterministic ready answer after call pickup.",
-                reason="Deterministic cold opening after answer.",
+                repeat_note="Ready answer after call pickup.",
+                reason="ready_answer_call_connected",
             )
-            self._metrics.record("cached_answer", 0)
-            self._metrics.record("first_answer_time", 0)
             trace = {
                 **state.get("trace", {}),
+                "source": "ready_answer",
                 "llm_latency_ms": 0,
-                "llm_initial_decision": decision.model_dump(),
+                "raw_llm_output": "",
+                "parse_error": "",
                 "llm_decision": decision.model_dump(),
-                "used_deterministic_call_connected": True,
             }
+            self._metrics.record("cached_answer", 0)
+            self._metrics.record("first_answer_time", 0)
             return {
                 **state,
                 "reply": decision.reply,
@@ -329,64 +86,100 @@ class CallGraphRunner:
                 "trace": trace,
             }
 
-        decision, latency_ms = await self._llm_client.call_turn_llm(
+        primary_result = await self._llm_client.call_turn_llm(
             current_node=current_node,
             user_text=state.get("user_text", ""),
             known_facts=known_facts,
             history=history,
             node_repeat_count=repeat_count,
         )
-        self._metrics.record("llm_answer", latency_ms)
+        self._metrics.record("llm_answer", primary_result.latency_ms)
 
-        final_decision = decision
-        repair_errors = _decision_errors(current_node, decision, known_facts)
-        repair_trace: dict[str, Any] = {
-            "triggered": False,
-            "errors": repair_errors,
-        }
-        total_latency_ms = latency_ms
+        total_latency_ms = primary_result.latency_ms
+        final_result = primary_result
+        json_repair_trace: dict[str, Any] | None = None
+        transition_repair_trace: dict[str, Any] | None = None
 
-        if _should_review_decision(current_node, decision, repair_errors):
-            repaired_decision, repair_latency_ms = await self._llm_client.repair_turn_llm(
+        if final_result.decision is None:
+            repaired_json = await self._llm_client.repair_json_llm(
                 current_node=current_node,
                 user_text=state.get("user_text", ""),
                 known_facts=known_facts,
                 history=history,
                 node_repeat_count=repeat_count,
-                bad_decision=decision.model_dump(),
-                errors=repair_errors or ["semantic review for trust-sensitive or fact-capture node"],
+                raw_output=final_result.raw_output,
+                parse_error=final_result.parse_error,
             )
-            total_latency_ms += repair_latency_ms
-            self._metrics.record("llm_repair", repair_latency_ms)
-            repair_trace["triggered"] = True
-            repair_trace["latency_ms"] = repair_latency_ms
-            repair_trace["repaired_decision"] = (
-                repaired_decision.model_dump() if repaired_decision is not None else None
+            total_latency_ms += repaired_json.latency_ms
+            self._metrics.record("llm_repair", repaired_json.latency_ms)
+            json_repair_trace = {
+                "source": repaired_json.source,
+                "raw_llm_output": repaired_json.raw_output,
+                "parse_error": repaired_json.parse_error,
+                "llm_decision": repaired_json.decision.model_dump() if repaired_json.decision else None,
+            }
+            if repaired_json.decision is not None:
+                final_result = repaired_json
+
+        if final_result.decision is not None and self._needs_transition_repair(
+            current_node=current_node,
+            decision=final_result.decision,
+        ):
+            repaired_transition = await self._llm_client.repair_transition_llm(
+                current_node=current_node,
+                user_text=state.get("user_text", ""),
+                known_facts=known_facts,
+                history=history,
+                node_repeat_count=repeat_count,
+                bad_decision=final_result.decision.model_dump(),
             )
-            if repaired_decision is not None:
-                final_decision = repaired_decision
+            total_latency_ms += repaired_transition.latency_ms
+            self._metrics.record("llm_repair", repaired_transition.latency_ms)
+            transition_repair_trace = {
+                "source": repaired_transition.source,
+                "raw_llm_output": repaired_transition.raw_output,
+                "parse_error": repaired_transition.parse_error,
+                "llm_decision": repaired_transition.decision.model_dump() if repaired_transition.decision else None,
+            }
+            if repaired_transition.decision is not None and not self._needs_transition_repair(
+                current_node=current_node,
+                decision=repaired_transition.decision,
+            ):
+                final_result = repaired_transition
+            else:
+                final_result = self._technical_fallback_result(
+                    parse_error="invalid_next_node_after_transition_repair",
+                    raw_output=repaired_transition.raw_output or final_result.raw_output,
+                )
 
-        final_errors = _decision_errors(current_node, final_decision, known_facts)
-        fallback_decision = _structural_fallback_decision(current_node, final_decision)
-        if fallback_decision is not None:
-            final_decision = fallback_decision
-            final_errors = _decision_errors(current_node, final_decision, known_facts)
-            repair_trace["structural_fallback_applied"] = True
-            repair_trace["post_fallback_decision"] = final_decision.model_dump()
-        else:
-            repair_trace["structural_fallback_applied"] = False
-
-        repair_trace["final_errors"] = final_errors
+        if final_result.decision is None:
+            final_result = self._technical_fallback_result(
+                parse_error=final_result.parse_error,
+                raw_output=final_result.raw_output,
+            )
 
         self._metrics.record("first_answer_time", total_latency_ms)
+        final_decision = final_result.decision
+        assert final_decision is not None
 
         trace = {
             **state.get("trace", {}),
+            "source": final_result.source,
             "llm_latency_ms": total_latency_ms,
-            "llm_initial_decision": decision.model_dump(),
+            "raw_llm_output": primary_result.raw_output,
+            "parse_error": primary_result.parse_error,
             "llm_decision": final_decision.model_dump(),
-            "repair": repair_trace,
+            "json_repair": json_repair_trace,
+            "transition_repair": transition_repair_trace,
         }
+
+        if final_result.source == "fallback":
+            trace["fallback"] = {
+                "source": "fallback",
+                "parse_error": final_result.parse_error,
+                "raw_llm_output": final_result.raw_output,
+            }
+
         return {
             **state,
             "reply": final_decision.reply,
@@ -421,10 +214,10 @@ class CallGraphRunner:
 
         trace = {
             **state.get("trace", {}),
+            "sanitized_facts_update": clean_facts_update,
             "facts_after_apply": facts,
             "next_node_after_apply": next_node,
             "repeat_count": repeat,
-            "sanitized_facts_update": clean_facts_update,
         }
 
         return {
@@ -450,11 +243,52 @@ class CallGraphRunner:
             "committed": True,
             "history_length": len(history[-12:]),
         }
+
         return {
             **state,
             "history": history[-12:],
             "trace": trace,
         }
+
+    def _needs_transition_repair(
+        self,
+        *,
+        current_node: str,
+        decision: LlmTurnDecision,
+    ) -> bool:
+        if decision.should_end or decision.temporary_exit or not decision.node_complete:
+            return False
+        return decision.next_node not in DIALOGUE_GRAPH[current_node].allowed_next
+
+    def _technical_fallback_result(
+        self,
+        *,
+        parse_error: str,
+        raw_output: str,
+    ) -> LlmCallResult:
+        decision = LlmTurnDecision(
+            reply="Секунду, повторите, пожалуйста, я не совсем корректно понял.",
+            heard_summary="",
+            facts_update={},
+            node_complete=False,
+            next_node=None,
+            reply_asks_node=None,
+            temporary_exit=False,
+            return_to_node=None,
+            client_question_answered=False,
+            client_resistance=None,
+            should_end=False,
+            confidence=0.0,
+            repeat_note=None,
+            reason="technical_fallback",
+        )
+        return LlmCallResult(
+            source="fallback",
+            decision=decision,
+            raw_output=raw_output,
+            parse_error=parse_error or "unknown_llm_failure",
+            latency_ms=0,
+        )
 
 
 def make_call_graph(*, llm_client: TurnLlmClient, metrics: MetricsCollector) -> CallGraphRunner:
