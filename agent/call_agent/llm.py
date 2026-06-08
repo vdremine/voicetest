@@ -70,7 +70,7 @@ class LlmSettings:
             base_url=os.getenv("LLM_BASE_URL", "http://127.0.0.1:8001/v1").strip() or "http://127.0.0.1:8001/v1",
             api_key=os.getenv("LLM_API_KEY", "local-token").strip() or "local-token",
             temperature=float(os.getenv("LLM_TEMPERATURE", "0.08")),
-            max_tokens=int(os.getenv("LLM_MAX_TOKENS", "260")),
+            max_tokens=int(os.getenv("LLM_MAX_TOKENS", "320")),
             timeout_seconds=float(os.getenv("LLM_TIMEOUT_SECONDS", "15")),
         )
 
