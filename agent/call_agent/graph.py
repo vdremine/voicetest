@@ -39,6 +39,27 @@ REQUIRED_FACT_EXEMPT_NEXT: dict[str, set[str]] = {
     "partner_format": {"callback_time", "finish"},
 }
 
+REVIEW_ALWAYS_NODES = {
+    "cold_opening",
+    "handoff_consent",
+    "callback_time",
+}
+
+FACT_CAPTURE_NODES = {
+    "collect_amount",
+    "collect_name",
+    "collect_property_type",
+    "collect_region",
+    "collect_encumbrance",
+    "collect_encumbrance_details",
+    "collect_owner",
+    "priority_choice",
+    "collect_vehicle_type",
+    "collect_vehicle_owner",
+    "collect_vehicle_encumbrance",
+    "partner_format",
+}
+
 
 def _clean_text(value: Any) -> str:
     return str(value or "").strip()
@@ -170,6 +191,23 @@ def _decision_errors(
     return errors
 
 
+def _should_review_decision(
+    current_node: str,
+    decision: LlmTurnDecision,
+    errors: list[str],
+) -> bool:
+    if errors:
+        return True
+
+    if current_node in REVIEW_ALWAYS_NODES:
+        return True
+
+    if current_node in FACT_CAPTURE_NODES and (decision.node_complete or not decision.facts_update):
+        return True
+
+    return False
+
+
 def choose_next_node(
     *,
     current_node: str,
@@ -261,7 +299,7 @@ class CallGraphRunner:
         }
         total_latency_ms = latency_ms
 
-        if repair_errors:
+        if _should_review_decision(current_node, decision, repair_errors):
             repaired_decision, repair_latency_ms = await self._llm_client.repair_turn_llm(
                 current_node=current_node,
                 user_text=state.get("user_text", ""),
@@ -269,7 +307,7 @@ class CallGraphRunner:
                 history=history,
                 node_repeat_count=repeat_count,
                 bad_decision=decision.model_dump(),
-                errors=repair_errors,
+                errors=repair_errors or ["semantic review for trust-sensitive or fact-capture node"],
             )
             total_latency_ms += repair_latency_ms
             self._metrics.record("llm_repair", repair_latency_ms)
