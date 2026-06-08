@@ -50,7 +50,7 @@ async def metrics() -> dict[str, object]:
 
 @app.post("/session/start")
 async def start_session(request: StartSessionRequest) -> dict[str, Any]:
-    known_facts = apply_facts({}, request.known_facts)
+    known_facts = apply_facts({}, request.known_facts, current_node="call_connected")
     known_facts["phone"] = request.phone
 
     state: CallState = {

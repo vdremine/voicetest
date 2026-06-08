@@ -11,7 +11,11 @@ def _clean_text(value: Any) -> str:
     return str(value or "").strip()
 
 
-def sanitize_facts_update(facts_update: dict[str, Any]) -> dict[str, Any]:
+def sanitize_facts_update(
+    facts_update: dict[str, Any],
+    *,
+    current_node: str = "",
+) -> dict[str, Any]:
     clean: dict[str, Any] = {}
 
     for key, value in facts_update.items():
@@ -23,6 +27,9 @@ def sanitize_facts_update(facts_update: dict[str, Any]) -> dict[str, Any]:
 
         if key == "client_name":
             lowered = _clean_text(value).lower().replace("ё", "е")
+            if current_node == "collect_name":
+                clean[key] = value
+                continue
             if "владимир" in lowered or "влад+имир" in lowered or "мосинвестфинанс" in lowered:
                 continue
 
@@ -31,10 +38,15 @@ def sanitize_facts_update(facts_update: dict[str, Any]) -> dict[str, Any]:
     return clean
 
 
-def apply_facts(known_facts: dict[str, Any], facts_update: dict[str, Any]) -> dict[str, Any]:
+def apply_facts(
+    known_facts: dict[str, Any],
+    facts_update: dict[str, Any],
+    *,
+    current_node: str = "",
+) -> dict[str, Any]:
     facts = dict(known_facts)
 
-    for key, value in sanitize_facts_update(facts_update).items():
+    for key, value in sanitize_facts_update(facts_update, current_node=current_node).items():
         facts[key] = value
 
         if key == "desired_amount":

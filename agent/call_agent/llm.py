@@ -151,6 +151,9 @@ class TurnLlmClient:
                     "Сохрани исходный смысл ответа максимально близко.\n"
                     "Верни только валидный JSON по схеме.\n"
                     "Сделай JSON компактным: опускай пустые optional-поля.\n"
+                    "Не придумывай новые узлы.\n"
+                    "Нельзя спрашивать район или адрес.\n"
+                    "Если город уже известен, следующий узел — collect_encumbrance.\n"
                     "Не придумывай новые факты от себя."
                 ),
             },
@@ -192,6 +195,7 @@ class TurnLlmClient:
         node_repeat_count: int,
         last_turn_note: str,
         bad_decision: dict[str, Any],
+        errors: list[str],
     ) -> LlmCallResult:
         node = DIALOGUE_GRAPH[current_node]
         allowed_next = ", ".join(node.allowed_next) if node.allowed_next else "нет"
@@ -204,6 +208,9 @@ class TurnLlmClient:
                     "Нельзя выбирать next_node вне allowed_next.\n"
                     "Если текущий узел не завершен, поставь node_complete=false и next_node=null.\n"
                     "Если узел завершен, выбери next_node только из allowed_next.\n"
+                    "Если reply спрашивает следующий узел, node_complete должен быть true.\n"
+                    "Не придумывай новые узлы.\n"
+                    "Если город уже известен, не спрашивай район: переходи к collect_encumbrance.\n"
                     "Верни компактный JSON без пустых optional-полей.\n"
                     "Смысл reply сохраняй максимально близко."
                 ),
@@ -225,6 +232,7 @@ class TurnLlmClient:
                 "content": (
                     f"Текущий узел: {current_node}\n"
                     f"allowed_next: {allowed_next}\n"
+                    f"Ошибки: {json.dumps(errors, ensure_ascii=False)}\n"
                     f"Текущий JSON: {json.dumps(bad_decision, ensure_ascii=False)}\n"
                     "Верни исправленный JSON. next_node должен быть только из allowed_next или null."
                 ),

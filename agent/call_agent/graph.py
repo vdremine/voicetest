@@ -34,6 +34,38 @@ def choose_next_node(
     return current_node
 
 
+def _decision_structure_errors(
+    *,
+    current_node: str,
+    decision: LlmTurnDecision,
+) -> list[str]:
+    errors: list[str] = []
+    allowed_next = DIALOGUE_GRAPH[current_node].allowed_next
+
+    if not decision.node_complete and decision.next_node is not None:
+        errors.append("next_node_set_but_node_complete_false")
+
+    if decision.next_node is not None and decision.next_node not in allowed_next:
+        errors.append("next_node_not_allowed")
+
+    if (
+        decision.reply_asks_node is not None
+        and decision.reply_asks_node != current_node
+        and not decision.node_complete
+    ):
+        errors.append("reply_asks_next_node_but_node_not_complete")
+
+    if (
+        decision.reply_asks_node is not None
+        and decision.next_node is not None
+        and decision.reply_asks_node != current_node
+        and decision.reply_asks_node != decision.next_node
+    ):
+        errors.append("reply_asks_node_mismatch_next_node")
+
+    return errors
+
+
 class CallGraphRunner:
     def __init__(self, *, llm_client: TurnLlmClient, metrics: MetricsCollector) -> None:
         self._llm_client = llm_client
@@ -126,7 +158,46 @@ class CallGraphRunner:
             if repaired_json.decision is not None:
                 final_result = repaired_json
 
-        if final_result.decision is not None and self._needs_transition_repair(
+        structure_errors = (
+            _decision_structure_errors(current_node=current_node, decision=final_result.decision)
+            if final_result.decision is not None
+            else []
+        )
+
+        if final_result.decision is not None and structure_errors:
+            repaired_transition = await self._llm_client.repair_transition_llm(
+                current_node=current_node,
+                user_text=state.get("user_text", ""),
+                known_facts=known_facts,
+                history=history,
+                node_repeat_count=repeat_count,
+                last_turn_note=last_turn_note,
+                bad_decision=final_result.decision.model_dump(),
+                errors=structure_errors,
+            )
+            total_latency_ms += repaired_transition.latency_ms
+            self._metrics.record("llm_repair", repaired_transition.latency_ms)
+            transition_repair_trace = {
+                "source": repaired_transition.source,
+                "raw_llm_output": repaired_transition.raw_output,
+                "parse_error": repaired_transition.parse_error,
+                "errors": structure_errors,
+                "llm_decision": repaired_transition.decision.model_dump() if repaired_transition.decision else None,
+            }
+            repaired_errors = (
+                _decision_structure_errors(current_node=current_node, decision=repaired_transition.decision)
+                if repaired_transition.decision is not None
+                else ["repair_returned_invalid_json"]
+            )
+            if repaired_transition.decision is not None and not repaired_errors:
+                final_result = repaired_transition
+            else:
+                final_result = self._technical_fallback_result(
+                    parse_error="; ".join(repaired_errors) or "invalid_decision_after_repair",
+                    raw_output=repaired_transition.raw_output or final_result.raw_output,
+                )
+
+        elif final_result.decision is not None and self._needs_transition_repair(
             current_node=current_node,
             decision=final_result.decision,
         ):
@@ -138,6 +209,7 @@ class CallGraphRunner:
                 node_repeat_count=repeat_count,
                 last_turn_note=last_turn_note,
                 bad_decision=final_result.decision.model_dump(),
+                errors=["next_node_not_allowed"],
             )
             total_latency_ms += repaired_transition.latency_ms
             self._metrics.record("llm_repair", repaired_transition.latency_ms)
@@ -200,10 +272,14 @@ class CallGraphRunner:
         current_node = state.get("current_node", "call_connected")
         decision = LlmTurnDecision.model_validate(state.get("llm_decision", {}))
 
-        clean_facts_update = sanitize_facts_update(decision.facts_update)
+        clean_facts_update = sanitize_facts_update(
+            decision.facts_update,
+            current_node=current_node,
+        )
         facts = apply_facts(
             state.get("known_facts", {}),
             clean_facts_update,
+            current_node=current_node,
         )
 
         next_node = choose_next_node(
