@@ -74,6 +74,12 @@ def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
     return any(marker in normalized for marker in markers)
 
 
+def _normalize_for_compare(text: str) -> str:
+    value = _clean_text(text).lower().replace("ё", "е")
+    value = "".join(char if char.isalnum() or char.isspace() else " " for char in value)
+    return " ".join(value.split())
+
+
 def _fact_present(key: str, facts_update: dict[str, Any], known_facts: dict[str, Any]) -> bool:
     aliases = FACT_ALIASES.get(key, (key,))
     for alias in aliases:
@@ -139,6 +145,22 @@ def _decision_errors(
 
     if _contains_cjk(decision.reply):
         errors.append("reply contains CJK characters")
+
+    if decision.reply_asks_node and "?" not in decision.reply:
+        errors.append("reply_asks_node is set but reply has no question mark")
+
+    if not decision.reply_asks_node and "?" in decision.reply:
+        errors.append("reply asks a question but reply_asks_node is null")
+
+    current_ask_norm = _normalize_for_compare(DIALOGUE_GRAPH[current_node].ask)
+    reply_norm = _normalize_for_compare(decision.reply)
+    if (
+        decision.node_complete
+        and decision.next_node
+        and decision.next_node != current_node
+        and reply_norm == current_ask_norm
+    ):
+        errors.append("reply repeats current node ask while claiming transition to next node")
 
     if decision.reply.count("?") > 1:
         errors.append("reply asks more than one question")
@@ -206,6 +228,31 @@ def _should_review_decision(
         return True
 
     return False
+
+
+def _structural_fallback_decision(
+    current_node: str,
+    decision: LlmTurnDecision,
+) -> LlmTurnDecision | None:
+    if not decision.node_complete or not decision.next_node:
+        return None
+
+    if decision.next_node not in DIALOGUE_GRAPH[current_node].allowed_next:
+        return None
+
+    current_ask_norm = _normalize_for_compare(DIALOGUE_GRAPH[current_node].ask)
+    reply_norm = _normalize_for_compare(decision.reply)
+    if reply_norm != current_ask_norm:
+        return None
+
+    next_ask = DIALOGUE_GRAPH[decision.next_node].ask
+    return decision.model_copy(
+        update={
+            "reply": next_ask,
+            "reply_asks_node": decision.next_node if "?" in next_ask else None,
+            "reason": (decision.reason + " | structural fallback to next node ask").strip(" |"),
+        }
+    )
 
 
 def choose_next_node(
@@ -318,6 +365,18 @@ class CallGraphRunner:
             )
             if repaired_decision is not None:
                 final_decision = repaired_decision
+
+        final_errors = _decision_errors(current_node, final_decision, known_facts)
+        fallback_decision = _structural_fallback_decision(current_node, final_decision)
+        if fallback_decision is not None:
+            final_decision = fallback_decision
+            final_errors = _decision_errors(current_node, final_decision, known_facts)
+            repair_trace["structural_fallback_applied"] = True
+            repair_trace["post_fallback_decision"] = final_decision.model_dump()
+        else:
+            repair_trace["structural_fallback_applied"] = False
+
+        repair_trace["final_errors"] = final_errors
 
         self._metrics.record("first_answer_time", total_latency_ms)
 

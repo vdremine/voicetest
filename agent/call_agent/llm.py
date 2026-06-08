@@ -147,6 +147,13 @@ class TurnLlmClient:
         errors: list[str],
     ) -> tuple[LlmTurnDecision | None, int]:
         node = DIALOGUE_GRAPH[current_node]
+        candidate_next_node_name = ""
+        candidate_next_examples = ""
+        raw_next = bad_decision.get("next_node")
+        if isinstance(raw_next, str) and raw_next in DIALOGUE_GRAPH:
+            candidate_node = DIALOGUE_GRAPH[raw_next]
+            candidate_next_node_name = raw_next
+            candidate_next_examples = "\n".join(f"- {item}" for item in candidate_node.examples[:3])
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {
@@ -156,6 +163,8 @@ class TurnLlmClient:
                     "Верни только исправленный JSON по той же схеме.\n"
                     "Не придумывай факты, которых клиент не говорил.\n"
                     "Если клиент явно дал новый факт, запиши его в facts_update.\n"
+                    "Если клиент уже согласился продолжать разговор, не повторяй cold opening.\n"
+                    "Если клиент просит пояснить, кто звонит, не переходи к сумме до короткого пояснения.\n"
                     "Если reply задаёт вопрос следующего узла, next_node и reply_asks_node должны совпадать.\n"
                     "Отвечай только по-русски, без китайского и без смешанного языка.\n"
                     "Не копируй жаргон клиента как свой стиль."
@@ -176,10 +185,15 @@ class TurnLlmClient:
                 "role": "user",
                 "content": (
                     f"Текущий узел: {current_node}\n"
+                    f"Текущий canonical ask: {node.ask}\n"
+                    f"Кандидат next_node из плохого решения: {candidate_next_node_name or 'нет'}\n"
+                    f"Примеры next_node:\n{candidate_next_examples or '- нет'}\n"
                     f"Реплика клиента: {user_text}\n"
                     f"Плохое решение: {json.dumps(bad_decision, ensure_ascii=False)}\n"
                     f"Ошибки: {json.dumps(errors, ensure_ascii=False)}\n"
-                    "Исправь JSON так, чтобы факты, переход и текст ответа были согласованы."
+                    "Исправь JSON так, чтобы факты, переход и текст ответа были согласованы.\n"
+                    "Если клиент сказал короткое согласие вроде 'да', 'удобно', 'ну я слушаю', обычно нужен следующий вопрос следующего узла, а не повтор представления.\n"
+                    "Если клиент сказал 'всмысле' или 'кто это', нужен короткий trust-repair внутри cold_opening."
                 ),
             },
         ]
@@ -190,7 +204,7 @@ class TurnLlmClient:
             completion = await self._client.chat.completions.create(
                 model=self._settings.model,
                 messages=messages,
-                temperature=0.05,
+                temperature=0.0,
                 max_tokens=self._settings.max_tokens,
                 response_format={"type": "json_object"},
             )
@@ -202,7 +216,7 @@ class TurnLlmClient:
                 completion = await self._client.chat.completions.create(
                     model=self._settings.model,
                     messages=messages,
-                    temperature=0.05,
+                    temperature=0.0,
                     max_tokens=self._settings.max_tokens,
                 )
                 raw_content = _coerce_message_content(completion.choices[0].message.content)
