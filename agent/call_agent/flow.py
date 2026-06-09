@@ -23,7 +23,10 @@ def _val(facts: dict, key: str) -> str:
     return str(facts.get(key, "")).strip().lower().replace("ё", "е")
 
 
-_NEGATIVE = ("нет", "без", "чист", "свободн", "не в залог", "не заложен", "отсутств", "никаких", "no")
+_NEGATIVE = (
+    "нет", "без", "чист", "свободн", "не в залог", "не заложен", "не заклад",
+    "вне обремен", "вне залог", "отсутств", "никаких", "no",
+)
 _REFUSAL = ("нет", "не надо", "не нужно", "не звоните", "откажусь", "не хочу", "не буду")
 _CALLBACK_OK = (
     "да", "хорошо", "удобно", "согласен", "давайте", "можно", "ок", "перезвон",
@@ -37,6 +40,28 @@ def _encumbrance_is_positive(facts: dict) -> bool:
     if not value:
         return False
     return not any(m in value for m in _NEGATIVE)
+
+
+_ENCUMBRANCE_SLOTS = {"collect_encumbrance", "collect_vehicle_encumbrance"}
+
+
+def is_yes_no_slot(node_id: str) -> bool:
+    """Yes/no slots where the client's first statement IS the answer — so the
+    runner captures it immediately rather than allowing even one clarifying re-ask."""
+    return node_id in _ENCUMBRANCE_SLOTS
+
+
+def infer_gate_value(node_id: str, text: str) -> str:
+    """Best-effort fact value when the model failed to extract it but the client
+    clearly responded — used by the runner's anti-loop guard so the same slot is
+    never asked a third time."""
+    t = (text or "").strip()
+    if node_id in _ENCUMBRANCE_SLOTS:
+        low = t.lower().replace("ё", "е")
+        if any(m in low for m in _NEGATIVE):
+            return "нет"
+        return t[:80] or "да"
+    return t[:80]
 
 
 def _wants_callback_time(facts: dict) -> bool:
@@ -129,6 +154,18 @@ STEPS: dict[str, Step] = {
     "collect_encumbrance": Step(
         "collect_encumbrance", "encumbrance",
         ["А объект сейчас в залоге где-то — ипотека, банк?"],
+    ),
+    # If the object IS encumbered: offer refinancing of that loan and ask whether
+    # there is another, unencumbered property to consider instead.
+    "offer_refi_or_other": Step(
+        "offer_refi_or_other", "other_property",
+        [
+            "Раз объект в залоге — можем рассмотреть рефинансирование этого кредита. "
+            "А есть ещё недвижимость без обременения, которую тоже можно рассмотреть?"
+        ],
+        # Only when the client hasn't already said they want to consolidate/refi
+        # (in that case we go straight to confirming the consolidation).
+        applies=lambda f: _encumbrance_is_positive(f) and not _has_consolidation(f),
     ),
     "collect_encumbrance_details": Step(
         "collect_encumbrance_details", "encumbrance_details",
@@ -228,7 +265,7 @@ _FLOWS: dict[str, list[str]] = {
     "real_estate": [
         "cold_opening", "collect_amount", "collect_name", "collect_property_type",
         "collect_region", "collect_encumbrance",
-        "collect_encumbrance_details", "collect_owner",
+        "offer_refi_or_other", "collect_encumbrance_details", "collect_owner",
         "collect_consolidation_summary", "offer_pts_fallback", "summary_before_pitch",
         "pitch_conditions", "priority_choice", "collect_name_late", "handoff_consent", "callback_time",
     ],
@@ -310,14 +347,14 @@ def gate_fact_for(node_id: str) -> str:
 # --- openings -------------------------------------------------------------
 
 OPENING_COLD = (
-    "Да, добрый день. Вы интересовались кредитом под залог недвижимости. "
-    "У вас хорошая кредитная история, можем одобрить условия хорошие. "
-    "Давайте рассчитаем, какие могут быть условия. Скажите, какую сумму рассматриваете?"
+    "Да, добрый день. Меня зовут Владимир, компания МосИнвестФинанс. "
+    "Вы интересовались кредитом под залог недвижимости — давайте подберём условия. "
+    "Скажите, какую сумму рассматриваете?"
 )
 OPENING_REFI = (
-    "Да, добрый день. Вы брали кредит у нас в МосИнвестФинанс. "
-    "У вас хорошая кредитная история, можем рефинансирование предложить, условия хорошие. "
-    "Давайте рассчитаем, какие могут быть условия. Скажите, сколько выплатить осталось?"
+    "Да, добрый день. Меня зовут Владимир, компания МосИнвестФинанс. "
+    "Вы брали у нас кредит — можем предложить рефинансирование на более выгодных условиях. "
+    "Скажите, сколько выплатить осталось?"
 )
 
 
@@ -329,7 +366,7 @@ def opening_for(facts: dict) -> str:
 
 _PITCH = (
     "Смотрите, по таким параметрам можно рассматривать кредит под залог. "
-    "Сумма — до семидесяти процентов от стоимости{calc}, срок от года до двадцати пяти лет, "
+    "Сумма — до семидесяти процентов от рыночной стоимости, срок от года до двадцати пяти лет, "
     "ставка от девятнадцати процентов, и официальное трудоустройство не требуется. "
     "Решение даём за один-два дня после документов, и весь процесс вас сопровождает персональный менеджер. "
     "Мы девять лет на рынке и в разных ситуациях находили решение. "
@@ -345,17 +382,9 @@ _SAFETY_VEHICLE = (
 
 
 def _pitch_text(facts: dict) -> str:
-    calc = ""
-    raw = str(facts.get("object_value", "")).strip()
-    digits = "".join(ch for ch in raw if ch.isdigit())
-    if digits:
-        try:
-            cap = int(int(digits) * 0.7)
-            calc = f" — по вашей оценке это порядка {cap:,}".replace(",", " ")
-        except ValueError:
-            calc = ""
+    # Any amount is considered calmly — no 70%-of-the-number cap spoken aloud.
     safety = _SAFETY_VEHICLE if _has(facts, "vehicle_type") else _SAFETY_PROPERTY
-    return _PITCH.format(calc=calc, safety=safety)
+    return _PITCH.format(safety=safety)
 
 
 def _summary_text(facts: dict) -> str:

@@ -86,12 +86,35 @@ def test_re_encumbrance_negative_skips_details():
     assert resolve_focus(facts, "real_estate") == "collect_owner"
 
 
-def test_re_encumbrance_positive_requires_details():
+def test_re_encumbrance_negative_phrasing_does_not_loop():
+    # "вне обременения" must be treated as no encumbrance -> advance, never re-ask.
+    for phrasing in ("нет", "не в залоге", "вне обременения", "нигде не заложен", "чистая"):
+        facts = _re(
+            desired_amount="1", client_name="Т", property_type="квартира", region="Саратов",
+            encumbrance=phrasing,
+        )
+        assert resolve_focus(facts, "real_estate") == "collect_owner", phrasing
+
+
+def test_re_encumbrance_positive_offers_refi_and_other_property():
     facts = _re(
         desired_amount="1", client_name="Т", property_type="квартира", region="Саратов",
-        encumbrance="в ипотеке",
+        encumbrance="да, в ипотеке",
     )
+    # under encumbrance -> first offer refinancing + ask about other property
+    assert resolve_focus(facts, "real_estate") == "offer_refi_or_other"
+    q = question_for("offer_refi_or_other", facts).lower()
+    assert "рефинансиров" in q
+    assert "недвижим" in q  # asks about another property
+    # then collect the remaining-debt detail
+    facts["other_property"] = "нет другой"
     assert resolve_focus(facts, "real_estate") == "collect_encumbrance_details"
+
+
+def test_infer_gate_value_maps_encumbrance_yes_no():
+    from call_agent.flow import infer_gate_value
+    assert infer_gate_value("collect_encumbrance", "нет, вне обременения") == "нет"
+    assert infer_gate_value("collect_encumbrance", "да, в ипотеке у Сбера") != "нет"
 
 
 def test_re_clean_client_reaches_owner_then_pitch_then_priority_then_handoff():
@@ -202,6 +225,18 @@ def test_opening_cold_goes_straight_to_amount():
     text = opening_for({})
     assert "сумму" in text.lower()
     assert "Дмитрий" not in text
+
+
+def test_opening_cold_introduces_company_and_name():
+    text = opening_for({})
+    assert "МосИнвестФинанс" in text
+    assert "Владимир" in text
+
+
+def test_pitch_does_not_cap_the_amount():
+    # Any sum is considered calmly — no "до X можем рассматривать" cap.
+    text = question_for("pitch_conditions", {"object_value": "6000000"})
+    assert "по вашей оценке это порядка" not in text.lower()
 
 
 def test_opening_refi_asks_remainder():

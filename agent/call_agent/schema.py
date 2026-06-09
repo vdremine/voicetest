@@ -19,6 +19,7 @@ NodeId = Literal[
     "collect_region",
     "collect_object_value",
     "collect_encumbrance",
+    "offer_refi_or_other",
     "collect_encumbrance_details",
     "collect_credit_history",
     "collect_owner",

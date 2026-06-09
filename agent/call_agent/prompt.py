@@ -57,6 +57,36 @@ _SERVICE_KEYS = {
 }
 
 
+# What fact the model MUST extract for each focus slot. The biggest reliability
+# lever for a weak model: name the exact key so the gate actually fills.
+EXTRACTION_HINTS: dict[str, str] = {
+    "collect_amount": "desired_amount — желаемую сумму (любую прими спокойно)",
+    "collect_name": "client_name — имя (без фамилии); если назвал и недвижимость — ещё property_type",
+    "collect_property_type": "property_type — тип недвижимости; если назвал и город — ещё region",
+    "collect_region": "region — город/регион объекта",
+    "collect_encumbrance": "encumbrance — есть ли залог: «нет/не в залоге/нигде/чисто»→encumbrance:\"нет\"; «в ипотеке/да»→encumbrance:\"да\"",
+    "offer_refi_or_other": "other_property — есть ли другая недвижимость без обременения (да/нет/что)",
+    "collect_encumbrance_details": "encumbrance_details — остаток долга/детали",
+    "collect_owner": "owner_status — кто собственник",
+    "collect_credit_history": "credit_history_issues — просрочки/исполнительные/состояние КИ",
+    "collect_current_payment": "current_payment — текущий ежемесячный платёж",
+    "collect_refi_term": "refi_term — срок; если назвал объект — ещё property_type",
+    "collect_vehicle_type": "vehicle_type — марка/модель авто",
+    "collect_vehicle_owner": "vehicle_owner — на кого оформлена машина",
+    "collect_vehicle_reregistration_date": "vehicle_reregistration_date — дата переоформления на клиента",
+    "collect_vehicle_encumbrance": "vehicle_encumbrance — в залоге/кредите: «нет/чистая»→\"нет\"",
+    "collect_vehicle_year": "vehicle_year — год выпуска",
+    "priority_choice": "priority — что важнее: скорость/ставка/платёж",
+    "handoff_consent": "callback_consent — согласен ли на звонок эксперта",
+    "callback_time": "callback_time — удобное время звонка",
+    "partner_format": "partner_format_desc — формат партнёрства/инвестиций",
+    "partner_experience": "partner_experience — опыт инвестора",
+    "collect_consolidation_summary": "consolidation_confirmed — подтверждение «свести в один кредит», верно",
+    "offer_pts_fallback": "vehicle_interest — есть ли авто для залога ПТС (да/нет)",
+    "collect_name_late": "client_name — имя клиента",
+}
+
+
 def _focus_hint(focus_node: str, focus_question: str, known_facts: dict[str, Any]) -> str:
     if focus_node == "pitch_conditions":
         return (
@@ -107,6 +137,8 @@ def build_turn_prompt(
     )
 
     note_text = _trim_text(last_turn_note, 140) or "—"
+    extraction = EXTRACTION_HINTS.get(focus_node, "")
+    extraction_block = f"СЕЙЧАС НУЖНО ИЗВЛЕЧЬ ФАКТ: {extraction}\n" if extraction else ""
 
     return f"""
 УЖЕ ИЗВЕСТНО:
@@ -120,8 +152,8 @@ def build_turn_prompt(
 РЕПЛИКА КЛИЕНТА СЕЙЧАС:
 {_trim_text(user_text, 240)}
 
-{_focus_hint(focus_node, focus_question, known_facts)}
+{extraction_block}{_focus_hint(focus_node, focus_question, known_facts)}
 
-Верни JSON: reflection (тёплое отражение БЕЗ вопроса), facts_update (ВСЕ факты из реплики),
-и при необходимости answer / branch_signal / should_end.
+Верни JSON: reflection (короткое тёплое отражение БЕЗ вопроса) + facts_update (ВСЕ факты из реплики,
+особенно факт выше). answer — только если клиент задал встречный вопрос; не дублируй reflection.
 """.strip()

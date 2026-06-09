@@ -8,7 +8,9 @@ from .flow import (
     DEFER_FLAGS,
     assemble_reply,
     gate_fact_for,
+    infer_gate_value,
     is_auto_complete,
+    is_yes_no_slot,
     opening_for,
     resolve_branch,
     resolve_focus,
@@ -16,8 +18,6 @@ from .flow import (
 from .llm import TurnLlmClient
 from .metrics import MetricsCollector
 from .state import CallState
-
-_DEFER_AFTER_REPEATS = 2
 
 
 def _apply_branch_signal(facts_update: dict[str, Any], signal: str, facts: dict[str, Any]) -> dict[str, Any]:
@@ -129,18 +129,32 @@ class CallGraphRunner:
         facts_update = _apply_branch_signal(understanding.facts_update, understanding.branch_signal, facts)
         new_facts = apply_facts(facts, facts_update, current_node=focus_before)
 
-        # Soft-slot deferral: if the client keeps dodging a soft slot, mark it
-        # deferred so the funnel moves on instead of deadlocking (gold Клиент 3).
-        if focus_before in SOFT_SLOTS:
-            gate = gate_fact_for(focus_before)
-            if not str(new_facts.get(gate, "")).strip() and prior_repeat >= _DEFER_AFTER_REPEATS:
-                new_facts = {**new_facts, DEFER_FLAGS[focus_before]: "yes"}
-
         # Name deferral: if the client goes into an objection/branch pivot instead
         # of giving a name, don't keep asking it mid-storm — defer to the handoff.
         objecting = bool(understanding.answer.strip()) or understanding.branch_signal != "none"
         if focus_before == "collect_name" and objecting and not str(new_facts.get("client_name", "")).strip():
             new_facts = {**new_facts, "name_deferred": "yes"}
+
+        # Anti-loop guard (the server bug): never re-ask a slot the client already
+        # answered. If the model failed to fill the gate but the client gave a
+        # statement (not a counter-question), infer/capture it and move on.
+        #  - yes/no slots (encumbrance): capture on the FIRST miss (no re-ask).
+        #  - other slots: allow one clarifying re-ask, then capture.
+        #  - soft slots (amount, ...): defer instead of capturing raw text.
+        gate = gate_fact_for(focus_before)
+        threshold = 0 if is_yes_no_slot(focus_before) else 1
+        if (
+            gate
+            and not is_auto_complete(focus_before)
+            and not str(new_facts.get(gate, "")).strip()
+            and not understanding.answer.strip()  # client answered, didn't ask back
+            and str(state.get("user_text", "")).strip()
+            and prior_repeat >= threshold
+        ):
+            if focus_before in SOFT_SLOTS:
+                new_facts = {**new_facts, DEFER_FLAGS[focus_before]: "yes"}
+            else:
+                new_facts = {**new_facts, gate: infer_gate_value(focus_before, state.get("user_text", ""))}
 
         branch_after = resolve_branch(new_facts)
         if understanding.should_end:

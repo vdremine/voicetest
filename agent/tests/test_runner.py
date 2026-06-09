@@ -109,6 +109,32 @@ def test_name_deferred_when_client_objects_instead_of_answering():
     assert out["current_node"] == "collect_property_type"  # moved past name
 
 
+def test_anti_loop_captures_encumbrance_on_first_miss():
+    # Reproduces the server bug: client says "не в залоге" but the model never
+    # emits the `encumbrance` fact. A yes/no slot must capture on the FIRST miss
+    # (no redundant re-ask) and advance.
+    u = TurnUnderstanding(reflection="понял вас.", facts_update={})  # never fills encumbrance
+    facts = {
+        "opening_done": "yes", "desired_amount": "1", "client_name": "Магомед",
+        "property_type": "дом", "region": "Чечня",
+    }
+    out = _run(_runner(u), _state(facts, "не в залоге"))
+    assert out["current_node"] != "collect_encumbrance"  # advanced immediately
+    assert out["known_facts"].get("encumbrance") == "нет"  # inferred from "не в залоге"
+
+
+def test_anti_loop_does_not_capture_when_client_asks_back():
+    # If the client asks a question instead of answering, don't force-capture.
+    u = TurnUnderstanding(reflection="понимаю.", answer="Залог — это когда объект уже заложен в банке.", facts_update={})
+    facts = {
+        "opening_done": "yes", "desired_amount": "1", "client_name": "Магомед",
+        "property_type": "дом", "region": "Чечня",
+    }
+    out = _run(_runner(u), _state(facts, "а что значит в залоге?"))
+    assert out["current_node"] == "collect_encumbrance"  # stays, re-asks after answering
+    assert not str(out["known_facts"].get("encumbrance", "")).strip()
+
+
 def test_should_end_finishes():
     u = TurnUnderstanding(reflection="", should_end=True)
     out = _run(_runner(u), _state({"opening_done": "yes", "desired_amount": "1"}, "не интересно, спасибо"))

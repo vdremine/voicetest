@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -18,6 +19,15 @@ def _clean_text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _repair_json(snippet: str) -> str:
+    """Fix the malformed JSON weak local models emit without guided decoding:
+    bareword (unquoted) keys and trailing commas. Observed on the server, e.g.
+    {"reflection":"...",answer:"",branch_signal:"none"}."""
+    fixed = re.sub(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)', r'\1"\2"\3', snippet)
+    fixed = re.sub(r',(\s*[}\]])', r'\1', fixed)
+    return fixed
+
+
 def _extract_json_object(text: str) -> dict[str, Any]:
     value = _clean_text(text)
     if not value:
@@ -29,8 +39,13 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     start = value.find("{")
     end = value.rfind("}")
     if start >= 0 and end > start:
+        snippet = value[start : end + 1]
         try:
-            return json.loads(value[start : end + 1])
+            return json.loads(snippet)
+        except json.JSONDecodeError:
+            pass
+        try:
+            return json.loads(_repair_json(snippet))
         except json.JSONDecodeError:
             return {}
     return {}
