@@ -10,9 +10,8 @@ import httpx
 from openai import AsyncOpenAI
 from pydantic import ValidationError
 
-from .graph_spec import DIALOGUE_GRAPH
-from .prompt import SYSTEM_PROMPT, build_node_prompt
-from .schema import LlmTurnDecision
+from .prompt import SYSTEM_PROMPT, build_turn_prompt
+from .schema import UNDERSTANDING_JSON_SCHEMA, TurnUnderstanding
 
 
 def _clean_text(value: Any) -> str:
@@ -23,12 +22,10 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     value = _clean_text(text)
     if not value:
         return {}
-
     try:
         return json.loads(value)
     except json.JSONDecodeError:
         pass
-
     start = value.find("{")
     end = value.rfind("}")
     if start >= 0 and end > start:
@@ -36,7 +33,6 @@ def _extract_json_object(text: str) -> dict[str, Any]:
             return json.loads(value[start : end + 1])
         except json.JSONDecodeError:
             return {}
-
     return {}
 
 
@@ -54,6 +50,13 @@ def _coerce_message_content(content: Any) -> str:
     return _clean_text(content)
 
 
+def _truthy_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True, slots=True)
 class LlmSettings:
     model: str
@@ -62,6 +65,7 @@ class LlmSettings:
     temperature: float
     max_tokens: int
     timeout_seconds: float
+    guided_json: bool
 
     @classmethod
     def from_env(cls) -> "LlmSettings":
@@ -69,16 +73,19 @@ class LlmSettings:
             model=os.getenv("LLM_MODEL", "Qwen/Qwen2.5-7B-Instruct").strip() or "Qwen/Qwen2.5-7B-Instruct",
             base_url=os.getenv("LLM_BASE_URL", "http://127.0.0.1:8001/v1").strip() or "http://127.0.0.1:8001/v1",
             api_key=os.getenv("LLM_API_KEY", "local-token").strip() or "local-token",
-            temperature=float(os.getenv("LLM_TEMPERATURE", "0.08")),
-            max_tokens=int(os.getenv("LLM_MAX_TOKENS", "420")),
+            temperature=float(os.getenv("LLM_TEMPERATURE", "0.1")),
+            max_tokens=int(os.getenv("LLM_MAX_TOKENS", "320")),
             timeout_seconds=float(os.getenv("LLM_TIMEOUT_SECONDS", "15")),
+            # vLLM supports guided decoding; on by default. Set 0 for backends
+            # that don't (the code then falls back to plain json_object mode).
+            guided_json=_truthy_env("LLM_GUIDED_JSON", True),
         )
 
 
 @dataclass(frozen=True, slots=True)
-class LlmCallResult:
+class UnderstandResult:
     source: str
-    decision: LlmTurnDecision | None
+    understanding: TurnUnderstanding | None
     raw_output: str
     parse_error: str
     latency_ms: int
@@ -87,6 +94,7 @@ class LlmCallResult:
 class TurnLlmClient:
     def __init__(self, settings: LlmSettings) -> None:
         self._settings = settings
+        self._guided_json = settings.guided_json
         self._client = AsyncOpenAI(
             base_url=settings.base_url,
             api_key=settings.api_key,
@@ -97,152 +105,29 @@ class TurnLlmClient:
     def model_name(self) -> str:
         return self._settings.model
 
-    async def call_turn_llm(
+    async def understand(
         self,
         *,
-        current_node: str,
-        user_text: str,
+        focus_node: str,
         known_facts: dict[str, Any],
         history: list[dict[str, str]],
-        node_repeat_count: int,
         last_turn_note: str,
-    ) -> LlmCallResult:
-        node = DIALOGUE_GRAPH[current_node]
+        user_text: str,
+    ) -> UnderstandResult:
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {
                 "role": "system",
-                "content": build_node_prompt(
-                    node=node,
-                    current_node_id=current_node,
-                    last_messages=history[-4:],
+                "content": build_turn_prompt(
+                    focus_node=focus_node,
                     known_facts=known_facts,
-                    node_repeat_count=node_repeat_count,
+                    history=history[-4:],
                     last_turn_note=last_turn_note,
                     user_text=user_text,
                 ),
             },
         ]
-        return await self._run_messages(
-            messages=messages,
-            temperature=self._settings.temperature,
-            source="main",
-        )
-
-    async def repair_json_llm(
-        self,
-        *,
-        current_node: str,
-        user_text: str,
-        known_facts: dict[str, Any],
-        history: list[dict[str, str]],
-        node_repeat_count: int,
-        last_turn_note: str,
-        raw_output: str,
-        parse_error: str,
-    ) -> LlmCallResult:
-        node = DIALOGUE_GRAPH[current_node]
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "system",
-                "content": (
-                    "Ты не ведешь новый разговор. Ты исправляешь невалидный JSON-ответ того же агента.\n"
-                    "Сохрани исходный смысл ответа максимально близко.\n"
-                    "Верни только валидный JSON по схеме.\n"
-                    "Сделай JSON компактным: опускай пустые optional-поля.\n"
-                    "Не придумывай новые узлы.\n"
-                    "Нельзя спрашивать район или адрес.\n"
-                    "Если город уже известен, следующий узел — collect_encumbrance.\n"
-                    "Не придумывай новые факты от себя."
-                ),
-            },
-            {
-                "role": "system",
-                "content": build_node_prompt(
-                    node=node,
-                    current_node_id=current_node,
-                    last_messages=history[-4:],
-                    known_facts=known_facts,
-                    node_repeat_count=node_repeat_count,
-                    last_turn_note=last_turn_note,
-                    user_text=user_text,
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Текущий узел: {current_node}\n"
-                    f"Ошибка парсинга/валидации: {parse_error}\n"
-                    f"Сырой вывод модели:\n{raw_output or '<empty>'}\n"
-                    "Преобразуй это в валидный JSON по схеме, не меняя смысл без необходимости."
-                ),
-            },
-        ]
-        return await self._run_messages(
-            messages=messages,
-            temperature=0.0,
-            source="json_repair",
-        )
-
-    async def repair_transition_llm(
-        self,
-        *,
-        current_node: str,
-        user_text: str,
-        known_facts: dict[str, Any],
-        history: list[dict[str, str]],
-        node_repeat_count: int,
-        last_turn_note: str,
-        bad_decision: dict[str, Any],
-        errors: list[str],
-    ) -> LlmCallResult:
-        node = DIALOGUE_GRAPH[current_node]
-        allowed_next = ", ".join(node.allowed_next) if node.allowed_next else "нет"
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "system",
-                "content": (
-                    "Ты исправляешь только структурную ошибку перехода.\n"
-                    "Нельзя выбирать next_node вне allowed_next.\n"
-                    "Если текущий узел не завершен, поставь node_complete=false и next_node=null.\n"
-                    "Если узел завершен, выбери next_node только из allowed_next.\n"
-                    "Если reply спрашивает следующий узел, node_complete должен быть true.\n"
-                    "Не придумывай новые узлы.\n"
-                    "Если город уже известен, не спрашивай район: переходи к collect_encumbrance.\n"
-                    "Верни компактный JSON без пустых optional-полей.\n"
-                    "Смысл reply сохраняй максимально близко."
-                ),
-            },
-            {
-                "role": "system",
-                "content": build_node_prompt(
-                    node=node,
-                    current_node_id=current_node,
-                    last_messages=history[-4:],
-                    known_facts=known_facts,
-                    node_repeat_count=node_repeat_count,
-                    last_turn_note=last_turn_note,
-                    user_text=user_text,
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Текущий узел: {current_node}\n"
-                    f"allowed_next: {allowed_next}\n"
-                    f"Ошибки: {json.dumps(errors, ensure_ascii=False)}\n"
-                    f"Текущий JSON: {json.dumps(bad_decision, ensure_ascii=False)}\n"
-                    "Верни исправленный JSON. next_node должен быть только из allowed_next или null."
-                ),
-            },
-        ]
-        return await self._run_messages(
-            messages=messages,
-            temperature=0.0,
-            source="transition_repair",
-        )
+        return await self._run_messages(messages=messages, source="main")
 
     async def call_json_prompt(self, *, system_prompt: str, user_prompt: str) -> dict[str, Any]:
         try:
@@ -261,66 +146,57 @@ class TurnLlmClient:
         except Exception:
             return {}
 
-    async def _run_messages(
-        self,
-        *,
-        messages: list[dict[str, str]],
-        temperature: float,
-        source: str,
-    ) -> LlmCallResult:
+    async def _create_completion(self, messages: list[dict[str, str]], *, guided: bool):
+        kwargs: dict[str, Any] = {
+            "model": self._settings.model,
+            "messages": messages,
+            "temperature": self._settings.temperature,
+            "max_tokens": self._settings.max_tokens,
+        }
+        if guided:
+            # vLLM guided decoding guarantees a schema-valid object.
+            kwargs["extra_body"] = {"guided_json": UNDERSTANDING_JSON_SCHEMA}
+        else:
+            kwargs["response_format"] = {"type": "json_object"}
+        return await self._client.chat.completions.create(**kwargs)
+
+    async def _run_messages(self, *, messages: list[dict[str, str]], source: str) -> UnderstandResult:
         started_at = time.perf_counter()
         raw_output = ""
         parse_error = ""
 
-        try:
-            completion = await self._client.chat.completions.create(
-                model=self._settings.model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=self._settings.max_tokens,
-                response_format={"type": "json_object"},
-            )
-            raw_output = _coerce_message_content(completion.choices[0].message.content)
-        except Exception as exc_json_mode:
-            parse_error = f"json_mode_request_failed: {exc_json_mode}"
+        # 1) guided JSON (if enabled), 2) plain json_object, 3) bare request.
+        attempts = [("guided", True), ("json_object", False)] if self._guided_json else [("json_object", False)]
+        for label, guided in attempts:
             try:
-                completion = await self._client.chat.completions.create(
-                    model=self._settings.model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=self._settings.max_tokens,
-                )
+                completion = await self._create_completion(messages, guided=guided)
                 raw_output = _coerce_message_content(completion.choices[0].message.content)
-            except Exception as exc_plain:
-                latency_ms = int((time.perf_counter() - started_at) * 1000)
-                combined = f"{parse_error}; plain_request_failed: {exc_plain}"
-                return LlmCallResult(
-                    source=source,
-                    decision=None,
-                    raw_output=raw_output,
-                    parse_error=combined,
-                    latency_ms=latency_ms,
-                )
+                parse_error = ""
+                break
+            except Exception as exc:
+                parse_error = f"{label}_request_failed: {exc}"
+                # If guided decoding is unsupported by the backend, stop trying it.
+                if guided:
+                    self._guided_json = False
+                raw_output = ""
 
-        decision, validation_error = self._parse_decision(raw_output)
+        understanding, validation_error = self._parse_understanding(raw_output)
         latency_ms = int((time.perf_counter() - started_at) * 1000)
-        return LlmCallResult(
+        return UnderstandResult(
             source=source,
-            decision=decision,
+            understanding=understanding,
             raw_output=raw_output,
             parse_error=parse_error or validation_error,
             latency_ms=latency_ms,
         )
 
-    def _parse_decision(self, raw_output: str) -> tuple[LlmTurnDecision | None, str]:
+    def _parse_understanding(self, raw_output: str) -> tuple[TurnUnderstanding | None, str]:
         if not _clean_text(raw_output):
             return None, "empty_llm_output"
-
         payload = _extract_json_object(raw_output)
         if not payload:
             return None, "json_not_found_in_output"
-
         try:
-            return LlmTurnDecision.model_validate(payload), ""
+            return TurnUnderstanding.model_validate(payload), ""
         except ValidationError as exc:
             return None, f"schema_validation_failed: {exc}"

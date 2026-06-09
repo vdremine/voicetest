@@ -26,11 +26,12 @@ def sanitize_facts_update(
             continue
 
         if key == "client_name":
+            # The agent introduces itself as "Влад+имир, МосИнвестФинанс". Only
+            # drop the name when it is clearly the agent's own self-identification
+            # (the company, or the bracketed TTS spelling of the agent name).
+            # A real client genuinely named Владимир must be accepted on any node.
             lowered = _clean_text(value).lower().replace("ё", "е")
-            if current_node == "collect_name":
-                clean[key] = value
-                continue
-            if "владимир" in lowered or "влад+имир" in lowered or "мосинвестфинанс" in lowered:
+            if "мосинвестфинанс" in lowered or "влад+имир" in lowered:
                 continue
 
         clean[key] = value

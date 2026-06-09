@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
-from .graph_spec import DialogueNode
+from .flow import question_for
+
+# Persona / style guide distilled from the 8 gold transcripts (see system_prompt.txt).
+SYSTEM_PROMPT = (Path(__file__).with_name("system_prompt.txt")).read_text(encoding="utf-8").strip()
 
 
 def _trim_text(value: Any, limit: int) -> str:
@@ -12,212 +16,112 @@ def _trim_text(value: Any, limit: int) -> str:
     return text[: max(0, limit - 1)].rstrip() + "…"
 
 
-SYSTEM_PROMPT = """
-Ты Влад+имир, голосовой оператор и кредитный брокер компании МосИнвестФинанс.
-Это исходящий холодный звонок, не входящая поддержка.
-Компания работает по залогу недвижимости, ПТС и партнёрским кейсам.
+_FACT_LABELS = {
+    "refi_mode": "режим рефинанса",
+    "desired_amount": "сумма/остаток",
+    "current_payment": "текущий платёж",
+    "refi_term": "срок",
+    "object_value": "оценка объекта",
+    "past_application_amount": "сумма прошлой заявки",
+    "prior_loan_note": "о прошлом займе",
+    "client_name": "имя",
+    "client_patronymic": "отчество",
+    "property_type": "недвижимость",
+    "region": "регион",
+    "encumbrance": "обременение",
+    "encumbrance_details": "детали обременения",
+    "credit_history_issues": "кредитная история",
+    "owner_status": "собственник",
+    "consolidation_intent": "хочет объединить кредиты",
+    "consolidation_targets": "что объединяет",
+    "money_purpose": "цель (назвал сам)",
+    "priority": "приоритет",
+    "vehicle_type": "авто",
+    "vehicle_owner": "собственник авто",
+    "vehicle_reregistration_date": "дата переоформления",
+    "vehicle_encumbrance": "залог авто",
+    "vehicle_year": "год авто",
+    "partner_format_desc": "формат партнёрства",
+    "partner_experience": "опыт инвестора",
+    "callback_consent": "согласие на звонок",
+    "callback_time": "время звонка",
+}
 
-Что делать:
-- дай короткую живую реплику клиенту;
-- верни строго JSON решения текущего узла.
-
-Правила:
-- сначала ответь по смыслу на последнюю реплику клиента;
-- максимум один вопрос за ход;
-- на cold_opening ответы "да", "да интересно", "интересно", "актуальна", "актуально", "слушаю", "говорите", "удобно" означают согласие продолжать: не повторяй представление, завершай узел и переходи к collect_amount;
-- если клиент одной фразой закрыл несколько узлов, не спрашивай уже полученные данные повторно;
-- пример: "да мне нужно [summa]" закрывает cold_opening и collect_amount, следующий вопрос — имя;
-- пример: "[obekt] в [gorod]" закрывает collect_property_type и collect_region, следующий вопрос — обременение;
-- пример: "нет, я собственник" может закрыть collect_encumbrance и collect_owner;
-- если клиент проверяет доверие ("кто вы", "какой банк", "что надо", "вы робот", "сколько стоит"), сначала ответь по сути;
-- если клиент задал дополнительный вопрос, temporary_exit=true и return_to_node=текущий узел;
-- если узел не завершён, node_complete=false и next_node=null;
-- если узел завершён, node_complete=true и next_node только из allowed_next;
-- facts_update: только новые факты из текущей реплики клиента;
-- если в reply ты говоришь, что понял новый факт, этот факт должен быть в facts_update;
-- turn_note обязателен: короткая служебная заметка для следующего хода;
-- возвращай компактный JSON; не печатай лишние поля со значениями null, false, пустая строка, если они не меняют смысл;
-- не придумывай факты;
-- не спрашивай цель денег;
-- не обещай одобрение;
-- не говори как входящая линия: нельзя "как я могу вам помочь", "чем могу помочь";
-- не говори "уточню пару вопросов", "уточню несколько моментов", "задам несколько вопросов";
-- не копируй жаргон и грубость клиента;
-- не придумывай новые узлы вне ALLOWED_NEXT;
-- нельзя спрашивать район или адрес; для первичной квалификации достаточно города или региона;
-- если город уже известен, следующий вопрос — про залог или обременение;
-- отвечай только по-русски.
-
-Стиль:
-- спокойно, по-человечески, коротко;
-- формула: отражение -> короткий ответ/объяснение -> один следующий шаг.
-
-Верни только JSON.
-""".strip()
+_SERVICE_KEYS = {
+    "phone", "session_id", "opening_done", "pitched", "summary_done",
+    "partner_handed", "consolidation_confirmed", "pts_fallback_offered",
+    "property_exists", "vehicle_interest", "partner_interest", "amount",
+    "нужная_сумма", "amount_deferred", "object_value_deferred",
+    "credit_history_deferred", "current_payment_deferred", "urgent",
+    "vehicle_handoff_note",
+}
 
 
-def build_node_prompt(
+def _focus_hint(focus_node: str, focus_question: str, known_facts: dict[str, Any]) -> str:
+    if focus_node == "pitch_conditions":
+        return (
+            "СЕЙЧАС МОМЕНТ ПИТЧА. Система сама произнесёт условия (до 70%, срок до 25 лет, "
+            "ставка от 19%, без офиц. трудоустройства, решение 1-2 дня, перс. менеджер, "
+            "остаётесь собственником). Тебе — только короткое тёплое отражение последней реплики."
+        )
+    if focus_node in {"refi_opening", "collect_current_payment", "collect_refi_term"} or str(
+        known_facts.get("refi_mode", "")
+    ).strip():
+        return (
+            f"Система дальше спросит: «{focus_question}». Это РЕФИНАНС: не новый кредит, а тот же долг "
+            "под меньший платёж/ставку. В reflection не задавай вопрос."
+        )
+    if focus_node == "summary_before_pitch":
+        return "Система сама зачитает резюме фактов. Тебе — только короткое отражение."
+    if focus_question:
+        return f"Система дальше сама задаст вопрос: «{focus_question}». Ты НЕ дублируй его — дай только reflection (+ answer при встречном вопросе)."
+    return "Тебе — только reflection и извлечение фактов."
+
+
+def build_turn_prompt(
     *,
-    node: DialogueNode,
-    current_node_id: str,
-    last_messages: list[dict[str, str]],
+    focus_node: str,
     known_facts: dict[str, Any],
-    node_repeat_count: int,
+    history: list[dict[str, str]],
     last_turn_note: str,
     user_text: str,
 ) -> str:
-    history_text = "\n".join(
-        f"{message['role']}: {_trim_text(message['content'], 160)}"
-        for message in last_messages[-3:]
-        if message.get("content")
-    ) or "Истории пока нет."
+    focus_question = question_for(focus_node, known_facts)
 
-    facts_text = "\n".join(
-        f"- {key}: {_trim_text(value, 80)}"
-        for key, value in list(known_facts.items())[:8]
-        if str(value).strip()
-    ) or "- фактов пока нет"
+    facts_text = (
+        "\n".join(
+            f"- {_FACT_LABELS.get(key, key)}: {_trim_text(value, 60)}"
+            for key, value in list(known_facts.items())[:12]
+            if str(value).strip() and key not in _SERVICE_KEYS
+        )
+        or "- пока ничего не известно"
+    )
 
-    examples_text = "\n".join(f"- {_trim_text(item, 180)}" for item in node.examples[:2]) or "- примеров нет"
-    fillers_text = ", ".join(node.filler_words[:4]) or "без специальных маркеров"
-    rules_text = "\n".join(f"- {_trim_text(item, 140)}" for item in node.rules[:4]) or "- специальных правил нет"
-    allowed_next = ", ".join(node.allowed_next) if node.allowed_next else "нет"
-    required_facts = ", ".join(node.required_fact_keys) if node.required_fact_keys else "нет обязательных"
-    turn_note_text = _trim_text(last_turn_note, 220) or "Служебной заметки с прошлого хода пока нет."
+    history_text = (
+        "\n".join(
+            f"{message['role']}: {_trim_text(message['content'], 140)}"
+            for message in history[-3:]
+            if message.get("content")
+        )
+        or "—"
+    )
+
+    note_text = _trim_text(last_turn_note, 140) or "—"
 
     return f"""
-ТЕКУЩИЙ УЗЕЛ:
-{current_node_id}
-
-ЗАДАЧА:
-{node.goal}
-
-СМЫСЛ ASK:
-{node.ask}
-
-КРИТЕРИЙ ЗАВЕРШЕНИЯ:
-{node.success_criteria}
-
-ALLOWED_NEXT:
-{allowed_next}
-
-ОБЯЗАТЕЛЬНЫЕ ФАКТЫ:
-{required_facts}
-
-ИЗВЕСТНЫЕ ФАКТЫ:
+УЖЕ ИЗВЕСТНО:
 {facts_text}
 
-СЛУЖЕБНАЯ ЗАМЕТКА С ПРОШЛОГО ХОДА:
-{turn_note_text}
+ЗАМЕТКА С ПРОШЛОГО ХОДА: {note_text}
 
-ПОСЛЕДНИЕ 4 СООБЩЕНИЯ:
+ПОСЛЕДНИЕ РЕПЛИКИ:
 {history_text}
 
-КОРОТКИЕ ПРИМЕРЫ:
-{examples_text}
+РЕПЛИКА КЛИЕНТА СЕЙЧАС:
+{_trim_text(user_text, 240)}
 
-МАРКЕРЫ:
-{fillers_text}
+{_focus_hint(focus_node, focus_question, known_facts)}
 
-ПОВТОР НА ЭТОМ УЗЛЕ:
-{node_repeat_count}
-
-ПРАВИЛА УЗЛА:
-{rules_text}
-
-РЕПЛИКА КЛИЕНТА:
-{_trim_text(user_text, 220)}
-
-ИНСТРУКЦИИ:
-- учитывай служебную заметку и не теряй уже объяснённый контекст;
-- если клиент уже ответил по смыслу, не повторяй тот же вопрос;
-- если клиент дал несколько фактов, запиши их все в facts_update;
-- если клиент задал допвопрос, temporary_exit=true и return_to_node="{current_node_id}";
-- если в reply нет вопроса, reply_asks_node=null;
-- если reply спрашивает текущий узел, reply_asks_node="{current_node_id}";
-- если reply уже спрашивает следующий узел, reply_asks_node должен совпадать с next_node;
-- если reply_asks_node отличается от текущего узла и не равен null, current node считается завершённым: node_complete=true;
-- если node_complete=false, next_node обязан быть null;
-- reply, heard_summary и turn_note обязательны всегда;
-- turn_note: 1-2 короткие фразы для следующего хода;
-- по умолчанию достаточно ключей: reply, heard_summary, turn_note, facts_update, node_complete, next_node, reply_asks_node;
-- temporary_exit, return_to_node, client_question_answered, should_end добавляй только если они реально нужны;
-- client_resistance, repeat_note, reason опускай, если они пустые;
-- если facts_update пустой, не пиши в reply, что понял новый факт.
-- в шаблонных примерах ниже [summa], [imya], [obekt] — это переменные, а не буквальный текст.
-
-ПРИМЕР JSON:
-{{
-  "reply": "Секунду, поясню. Это Влад+имир, МосИнвестФинанс, мы кредитный брокер по залогу недвижимости. Тема вам в целом актуальна?",
-  "heard_summary": "Клиент не понял, кто звонит.",
-  "turn_note": "Клиент переспросил, кто звонит. Агент коротко представился и остался на cold_opening.",
-  "facts_update": {{}},
-  "node_complete": false,
-  "next_node": null,
-  "reply_asks_node": "cold_opening",
-  "temporary_exit": true,
-  "return_to_node": "{current_node_id}",
-  "client_question_answered": true,
-  "confidence": 0.9
-}}
-
-ПРИМЕР JSON ДЛЯ СОГЛАСИЯ НА cold_opening:
-{{
-  "reply": "Да, понял вас. Тогда коротко: какую сумму примерно рассматриваете?",
-  "heard_summary": "Клиент подтвердил, что можно продолжать.",
-  "turn_note": "Клиент дал согласие продолжать. Узел cold_opening завершён.",
-  "facts_update": {{}},
-  "node_complete": true,
-  "next_node": "collect_amount",
-  "reply_asks_node": "collect_amount",
-  "confidence": 0.95
-}}
-
-ПРИМЕР JSON ДЛЯ cold_opening + сумма:
-{{
-  "reply": "[summa], понял. А как я могу к вам обращаться?",
-  "heard_summary": "Клиент подтвердил интерес и сразу назвал сумму [summa].",
-  "turn_note": "Клиент закрыл cold_opening и collect_amount одной фразой. Дальше нужно имя.",
-  "facts_update": {{"permission_to_continue": "yes", "desired_amount": "[summa]"}},
-  "node_complete": true,
-  "next_node": "collect_name",
-  "reply_asks_node": "collect_name",
-  "confidence": 0.95
-}}
-
-ПРИМЕР JSON ДЛЯ collect_amount:
-{{
-  "reply": "[summa], понял. А как я могу к вам обращаться?",
-  "heard_summary": "Клиент назвал сумму [summa].",
-  "turn_note": "Сумма [summa] зафиксирована. Узел collect_amount завершён.",
-  "facts_update": {{"desired_amount": "[summa]"}},
-  "node_complete": true,
-  "next_node": "collect_name",
-  "reply_asks_node": "collect_name",
-  "confidence": 0.95
-}}
-
-ПРИМЕР JSON ДЛЯ collect_name:
-{{
-  "reply": "[imya], понял. А какая недвижимость у вас в собственности?",
-  "heard_summary": "Клиент назвал имя [imya].",
-  "turn_note": "Имя [imya] зафиксировано. Узел collect_name завершён.",
-  "facts_update": {{"client_name": "[imya]"}},
-  "node_complete": true,
-  "next_node": "collect_property_type",
-  "reply_asks_node": "collect_property_type",
-  "confidence": 0.95
-}}
-
-ПРИМЕР JSON ДЛЯ collect_property_type + регион:
-{{
-  "reply": "[obekt] в [gorod], понял. Она сейчас в залоге где-то?",
-  "heard_summary": "Клиент назвал объект [obekt] и регион [gorod].",
-  "turn_note": "Объект и регион зафиксированы. Узлы collect_property_type и collect_region закрыты.",
-  "facts_update": {{"property_type": "[obekt]", "region": "[gorod]"}},
-  "node_complete": true,
-  "next_node": "collect_encumbrance",
-  "reply_asks_node": "collect_encumbrance",
-  "confidence": 0.95
-}}
+Верни JSON: reflection (тёплое отражение БЕЗ вопроса), facts_update (ВСЕ факты из реплики),
+и при необходимости answer / branch_signal / should_end.
 """.strip()
