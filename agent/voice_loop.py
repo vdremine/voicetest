@@ -3596,6 +3596,16 @@ class ParticipantAudioSession:
         known_facts = payload.get("known_facts", {}) if isinstance(payload.get("known_facts"), dict) else {}
         llm_decision = payload.get("llm_decision", {}) if isinstance(payload.get("llm_decision"), dict) else {}
         trace = payload.get("trace", {}) if isinstance(payload.get("trace"), dict) else {}
+        self._log(
+            "text_api turn "
+            f"participant={self._participant.identity} "
+            f"session_id={self._session_id} "
+            f"utterance_id={utterance_id} "
+            f"input_text={transcript_text!r} "
+            f"current_node={current_node!r} "
+            f"trace_source={str(trace.get('source', ''))!r} "
+            f"reply={reply_text!r}"
+        )
 
         search_values: list[str] = []
         if isinstance(llm_decision.get("search_index"), list):

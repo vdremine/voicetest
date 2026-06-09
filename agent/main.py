@@ -118,6 +118,11 @@ async def run() -> None:
     room = rtc.Room()
     pipeline_config = VoicePipelineConfig.from_env()
     event_bus = AgentEventBus(room, topic=pipeline_config.events_topic, log=log)
+    log(
+        "dialogue backend selected: "
+        f"{pipeline_config.dialogue_backend} "
+        f"(text_api_url={pipeline_config.text_api_url})"
+    )
     if pipeline_config.dialogue_backend == "text_api":
         llm_service = TextApiLlmService(pipeline_config, log)
     else:
