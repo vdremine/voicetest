@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import math
 import os
@@ -16,6 +17,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
+import httpx
 import numpy as np
 import torch
 import torchaudio.functional as torchaudio_f
@@ -78,6 +80,7 @@ class VoicePipelineConfig:
     stt_confidence_floor: float
     debug_save_wav: bool
     llm_enabled: bool
+    dialogue_backend: str
     llm_provider: str
     llm_model: str
     llm_reasoning_effort: str
@@ -87,6 +90,8 @@ class VoicePipelineConfig:
     llm_project: str
     llm_temperature: float
     llm_max_tokens: int
+    text_api_url: str
+    text_api_timeout_seconds: float
     adaptive_classifier_enabled: bool
     tts_enabled: bool
     tts_model_path: Path
@@ -116,6 +121,7 @@ class VoicePipelineConfig:
     @classmethod
     def from_env(cls) -> "VoicePipelineConfig":
         llm_provider = env_nonempty("LLM_PROVIDER", "openai").lower()
+        dialogue_backend = env_nonempty("DIALOGUE_BACKEND", "legacy").lower()
 
         tts_provider = env_nonempty("TTS_PROVIDER").lower()
         if not tts_provider:
@@ -160,6 +166,7 @@ class VoicePipelineConfig:
             stt_confidence_floor=float(os.getenv("STT_CONFIDENCE_FLOOR", "0.25")),
             debug_save_wav=env_bool("DEBUG_SAVE_WAV", True),
             llm_enabled=env_bool("LLM_ENABLED", True),
+            dialogue_backend=dialogue_backend,
             llm_provider=llm_provider,
             llm_model=env_nonempty("LLM_MODEL", default_llm_model),
             llm_reasoning_effort=os.getenv("LLM_REASONING_EFFORT", "low"),
@@ -169,6 +176,8 @@ class VoicePipelineConfig:
             llm_project=llm_project,
             llm_temperature=float(os.getenv("LLM_TEMPERATURE", "0.2")),
             llm_max_tokens=int(os.getenv("LLM_MAX_TOKENS", "180")),
+            text_api_url=env_nonempty("TEXT_API_URL", "http://127.0.0.1:8787"),
+            text_api_timeout_seconds=float(os.getenv("TEXT_API_TIMEOUT_SECONDS", "20")),
             adaptive_classifier_enabled=env_bool("ADAPTIVE_CLASSIFIER_ENABLED", False),
             tts_enabled=env_bool("TTS_ENABLED", True),
             tts_model_path=Path(os.getenv("TTS_MODEL_PATH", "/models/silero-tts/ru/v5_4_ru.pt")),
@@ -971,6 +980,84 @@ next_step: один короткий следующий шаг.
             self._log(f"llm warmup done latency_ms={latency_ms}")
         except Exception as exc:
             self._log(f"llm warmup skipped: {exc}")
+
+
+class TextApiLlmService:
+    def __init__(self, config: VoicePipelineConfig, log: Callable[[str], None]) -> None:
+        self._config = config
+        self._log = log
+        self._client: httpx.AsyncClient | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self._config.llm_enabled and bool(self._config.text_api_url)
+
+    @property
+    def uses_text_api_backend(self) -> bool:
+        return True
+
+    def _ensure_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            base_url = self._config.text_api_url.rstrip("/")
+            self._client = httpx.AsyncClient(
+                base_url=base_url,
+                timeout=self._config.text_api_timeout_seconds,
+            )
+        return self._client
+
+    async def warmup(self) -> None:
+        if not self.enabled:
+            return
+        started_at = time.perf_counter()
+        try:
+            response = await self._ensure_client().get("/healthz")
+            response.raise_for_status()
+            latency_ms = int((time.perf_counter() - started_at) * 1000)
+            self._log(f"text_api warmup done latency_ms={latency_ms}")
+        except Exception as exc:
+            self._log(f"text_api warmup skipped: {exc}")
+
+    async def start_session(
+        self,
+        *,
+        session_id: str,
+        phone: str,
+        known_facts: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        response = await self._ensure_client().post(
+            "/session/start",
+            json={
+                "session_id": session_id,
+                "phone": phone,
+                "known_facts": known_facts or {},
+            },
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def message(self, *, session_id: str, text: str) -> tuple[dict[str, Any], int]:
+        started_at = time.perf_counter()
+        response = await self._ensure_client().post(
+            "/session/message",
+            json={"session_id": session_id, "text": text},
+        )
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        response.raise_for_status()
+        return response.json(), latency_ms
+
+    async def reset_session(self, *, session_id: str) -> None:
+        if not self.enabled:
+            return
+        try:
+            await self._ensure_client().post("/session/reset", json={"session_id": session_id})
+        except Exception as exc:
+            self._log(f"text_api reset skipped session_id={session_id}: {exc}")
+
+    async def aclose(self) -> None:
+        if self._client is None:
+            return
+        await self._client.aclose()
+        self._client = None
 
 
 def sanitize_voice_response(text: str, *, fallback: str) -> str:
@@ -2292,7 +2379,7 @@ class ParticipantAudioSession:
         config: VoicePipelineConfig,
         event_bus: AgentEventBus,
         stt_service: WhisperSttService,
-        llm_service: OpenAiLlmService,
+        llm_service: OpenAiLlmService | TextApiLlmService,
         tts_service: SileroTtsService,
         audio_publisher: LiveKitAudioPublisher,
         log: Callable[[str], None],
@@ -2340,6 +2427,12 @@ class ParticipantAudioSession:
 
         self._session_id = f"{participant.identity}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
         self._session_logger = SessionLogger(config.session_log_dir / f"{self._session_id}.jsonl")
+        self._text_api_mode = bool(getattr(llm_service, "uses_text_api_backend", False))
+        self._text_api_started = False
+        self._text_api_phone = participant.identity
+        self._text_api_current_node = "call_connected"
+        self._text_api_last_turn_note = ""
+        self._text_api_known_facts: dict[str, Any] = {}
 
         self._audio_task: asyncio.Task[None] | None = None
         self._active_track_sid: str | None = None
@@ -2388,6 +2481,67 @@ class ParticipantAudioSession:
     def participant_identity(self) -> str:
         return self._participant.identity
 
+    def _uses_text_api_backend(self) -> bool:
+        return self._text_api_mode
+
+    @staticmethod
+    def _jsonable_known_facts(values: dict[str, Any]) -> dict[str, Any]:
+        clean: dict[str, Any] = {}
+        for key, value in values.items():
+            if value is None:
+                continue
+            if isinstance(value, (str, int, float, bool)):
+                clean[key] = value
+                continue
+            if isinstance(value, list) and all(isinstance(item, (str, int, float, bool)) for item in value):
+                clean[key] = value
+        return clean
+
+    def _text_api_start_payload(self) -> dict[str, Any]:
+        snapshot = self._dialogue_state.snapshot()
+        known_facts = self._jsonable_known_facts(snapshot.get("known_facts", {}))
+        if self._text_api_known_facts:
+            known_facts.update(self._jsonable_known_facts(self._text_api_known_facts))
+        return known_facts
+
+    def _sync_text_api_shadow_state(
+        self,
+        *,
+        current_node: str,
+        known_facts: dict[str, Any],
+        last_turn_note: str,
+        reply_text: str,
+    ) -> None:
+        self._text_api_current_node = current_node or self._text_api_current_node
+        self._text_api_last_turn_note = last_turn_note
+        self._text_api_known_facts = dict(known_facts or {})
+        if isinstance(getattr(self._dialogue_state, "known_facts", None), dict):
+            self._dialogue_state.known_facts.update(self._text_api_known_facts)
+        if hasattr(self._dialogue_state, "current_node"):
+            self._dialogue_state.current_node = self._text_api_current_node
+        if hasattr(self._dialogue_state, "last_agent_text"):
+            self._dialogue_state.last_agent_text = reply_text
+        client_name = str(self._text_api_known_facts.get("client_name", "")).strip()
+        if client_name and hasattr(self._dialogue_state, "name"):
+            self._dialogue_state.name = client_name
+
+    async def _ensure_text_api_session_started(self) -> None:
+        if not self._uses_text_api_backend() or self._text_api_started:
+            return
+        start_payload = self._text_api_start_payload()
+        response = await self._llm_service.start_session(
+            session_id=self._session_id,
+            phone=self._text_api_phone,
+            known_facts=start_payload,
+        )
+        self._text_api_started = True
+        self._sync_text_api_shadow_state(
+            current_node=str(response.get("current_node", "call_connected")).strip() or "call_connected",
+            known_facts=response.get("known_facts", {}) or {},
+            last_turn_note=str(response.get("last_turn_note", "")).strip(),
+            reply_text=str(response.get("reply", "")).strip(),
+        )
+
     async def ensure_started(self, track: rtc.Track, *, track_sid: str | None = None) -> None:
         if self._audio_task and not self._audio_task.done():
             if track_sid and self._active_track_sid == track_sid:
@@ -2422,6 +2576,9 @@ class ParticipantAudioSession:
             except asyncio.CancelledError:
                 pass
         self._active_track_sid = None
+        if self._uses_text_api_backend():
+            with contextlib.suppress(Exception):
+                await self._llm_service.reset_session(session_id=self._session_id)
         self._vad.reset_states()
 
     async def _publish_status(self, state: str) -> None:
@@ -2744,6 +2901,14 @@ class ParticipantAudioSession:
     def apply_lead_profile(self, profile: dict[str, Any]) -> None:
         updated = self._dialogue_state.bootstrap_lead_profile(profile, kb=self._kb)
         snapshot = self._dialogue_state.snapshot()
+        for key in ("phone", "phone_number", "client_phone", "tel"):
+            value = str(profile.get(key, "")).strip()
+            if value:
+                self._text_api_phone = value
+                break
+        self._text_api_known_facts.update(
+            self._jsonable_known_facts(snapshot.get("known_facts", {}))
+        )
         self._session_memory.sync_from_dialogue_state(snapshot, last_question=self._last_question_text)
         self._log(
             f"lead profile applied participant={self._participant.identity} "
@@ -3354,6 +3519,214 @@ class ParticipantAudioSession:
             self._log(f"stalled-slot rescue fallback for {self._participant.identity}: {exc}")
             return f"Да, возможно, я неточно понял. {resume_question}", None, 0
 
+    async def _run_text_api_turn(
+        self,
+        *,
+        utterance_id: str,
+        transcript_text: str,
+        normalized_text: str,
+        speech_end_time_ms: int,
+        turn_revision: int,
+    ) -> dict[str, Any]:
+        if not transcript_text.strip():
+            intent = IntentResult(Intent.CLARIFY.value, 0.0, False, Action.ASK_REPEAT.value)
+            return {
+                "intent": intent,
+                "llm_reply": None,
+                "response_text": "",
+                "raw_response_text": "",
+                "response_published": False,
+                "suppress_response": True,
+                "router_latency_ms": 0,
+                "intent_ready_time_ms": 0,
+                "response_ready_time_ms": 0,
+                "llm_latency_ms": 0,
+                "tts_latency_ms": 0,
+                "tts_prepared_text": "",
+                "tts_segments": [],
+                "filler_added": False,
+                "filler_type": "",
+                "tts_synth_start_time_ms": 0,
+                "tts_synth_done_time_ms": 0,
+                "tts_publish_start_time_ms": 0,
+                "tts_publish_done_time_ms": 0,
+                "current_node": self._text_api_current_node,
+                "known_facts": dict(self._text_api_known_facts),
+                "last_turn_note": self._text_api_last_turn_note,
+                "trace": {},
+                "speech_end_time_ms": speech_end_time_ms,
+            }
+
+        if transcript_text.strip():
+            self._session_memory.add_user(normalized_text or transcript_text)
+
+        await self._publish_status("complex_request_detected")
+        await self._ensure_text_api_session_started()
+
+        intent_started_at = time.perf_counter()
+        intent = IntentResult("text_api", 1.0, True, Action.CALL_LLM.value)
+        router_latency_ms = int((time.perf_counter() - intent_started_at) * 1000)
+        intent_ready_time_ms = int(time.time() * 1000)
+        await self._event_bus.publish_json(
+            {
+                "type": "intent",
+                "utterance_id": utterance_id,
+                "participant_identity": self._participant.identity,
+                "intent": intent.intent,
+                "confidence": intent.confidence,
+                "use_llm": intent.use_llm,
+                "action": intent.action,
+                "ts_ms": intent_ready_time_ms,
+            },
+            destination_identities=[self._participant.identity],
+        )
+
+        payload, llm_latency_ms = await self._llm_service.message(
+            session_id=self._session_id,
+            text=transcript_text,
+        )
+        response_ready_time_ms = int(time.time() * 1000)
+
+        reply_text = str(payload.get("reply", "")).strip()
+        if not reply_text:
+            raise RuntimeError("text_api returned empty reply")
+
+        current_node = str(payload.get("current_node", "")).strip() or self._text_api_current_node
+        last_turn_note = str(payload.get("last_turn_note", "")).strip()
+        known_facts = payload.get("known_facts", {}) if isinstance(payload.get("known_facts"), dict) else {}
+        llm_decision = payload.get("llm_decision", {}) if isinstance(payload.get("llm_decision"), dict) else {}
+        trace = payload.get("trace", {}) if isinstance(payload.get("trace"), dict) else {}
+
+        search_values: list[str] = []
+        if isinstance(llm_decision.get("search_index"), list):
+            search_values.extend(
+                item for item in llm_decision.get("search_index", []) if isinstance(item, str)
+            )
+        if current_node:
+            search_values.append(current_node)
+        search_index = dedupe_compact_strings(search_values, limit=5) or ["text_api"]
+
+        llm_reply = LlmReply(
+            reply_tts=reply_text,
+            search_index=search_index,
+            intent=current_node or "text_api",
+            next_step=last_turn_note or current_node or "text_api_turn",
+        )
+
+        self._sync_text_api_shadow_state(
+            current_node=current_node,
+            known_facts=known_facts,
+            last_turn_note=last_turn_note,
+            reply_text=reply_text,
+        )
+        self._last_semantic_agent_message = reply_text
+        self._last_agent_message = reply_text
+        self._remember_agent_question(reply_text)
+        self._session_memory.add_assistant(reply_text)
+        self._needs_rescue_prompt = False
+
+        await self._event_bus.publish_json(
+            {
+                "type": "agent_response_text",
+                "utterance_id": utterance_id,
+                "participant_identity": self._participant.identity,
+                "text": reply_text,
+                "use_llm": True,
+                "llm_intent": llm_reply.intent,
+                "search_index": llm_reply.search_index,
+                "next_step": llm_reply.next_step,
+                "text_api_trace": trace,
+            },
+            destination_identities=[self._participant.identity],
+        )
+
+        tts_prepared_text = ""
+        tts_segments: list[str] = []
+        filler_added = False
+        filler_type = ""
+        tts_latency_ms = 0
+        tts_synth_start_time_ms = 0
+        tts_synth_done_time_ms = 0
+        tts_publish_start_time_ms = 0
+        tts_publish_done_time_ms = 0
+        spoken_text = reply_text
+
+        if self._config.tts_enabled:
+            if self._is_stale_turn(turn_revision):
+                return {
+                    "intent": intent,
+                    "llm_reply": llm_reply,
+                    "response_text": reply_text,
+                    "raw_response_text": reply_text,
+                    "response_published": True,
+                    "suppress_response": True,
+                    "router_latency_ms": router_latency_ms,
+                    "intent_ready_time_ms": intent_ready_time_ms,
+                    "response_ready_time_ms": response_ready_time_ms,
+                    "llm_latency_ms": llm_latency_ms,
+                    "tts_latency_ms": 0,
+                    "tts_prepared_text": "",
+                    "tts_segments": [],
+                    "filler_added": False,
+                    "filler_type": "",
+                    "tts_synth_start_time_ms": 0,
+                    "tts_synth_done_time_ms": 0,
+                    "tts_publish_start_time_ms": 0,
+                    "tts_publish_done_time_ms": 0,
+                    "current_node": current_node,
+                    "known_facts": known_facts,
+                    "last_turn_note": last_turn_note,
+                    "trace": trace,
+                    "speech_end_time_ms": speech_end_time_ms,
+                }
+            await self._publish_status("speaking")
+            self._is_speaking = True
+            tts_synth_start_time_ms = int(time.time() * 1000)
+            (
+                spoken_text,
+                tts_prepared_text,
+                tts_segments,
+                tts_latency_ms,
+                _playback_completed,
+                filler_added,
+                filler_type,
+            ) = await self._speak_response(
+                utterance_id=utterance_id,
+                response_text=reply_text,
+                intent_value="text_api",
+                tts_speed=1.0,
+            )
+            tts_synth_done_time_ms = int(time.time() * 1000)
+            tts_publish_start_time_ms = tts_synth_done_time_ms
+            tts_publish_done_time_ms = int(time.time() * 1000)
+
+        return {
+            "intent": intent,
+            "llm_reply": llm_reply,
+            "response_text": spoken_text,
+            "raw_response_text": reply_text,
+            "response_published": True,
+            "suppress_response": False,
+            "router_latency_ms": router_latency_ms,
+            "intent_ready_time_ms": intent_ready_time_ms,
+            "response_ready_time_ms": response_ready_time_ms,
+            "llm_latency_ms": llm_latency_ms,
+            "tts_latency_ms": tts_latency_ms,
+            "tts_prepared_text": tts_prepared_text,
+            "tts_segments": tts_segments,
+            "filler_added": filler_added,
+            "filler_type": filler_type,
+            "tts_synth_start_time_ms": tts_synth_start_time_ms,
+            "tts_synth_done_time_ms": tts_synth_done_time_ms,
+            "tts_publish_start_time_ms": tts_publish_start_time_ms,
+            "tts_publish_done_time_ms": tts_publish_done_time_ms,
+            "current_node": current_node,
+            "known_facts": known_facts,
+            "last_turn_note": last_turn_note,
+            "trace": trace,
+            "speech_end_time_ms": speech_end_time_ms,
+        }
+
     async def _process_utterance(
         self,
         *,
@@ -3420,6 +3793,37 @@ class ParticipantAudioSession:
                 },
                 destination_identities=[self._participant.identity],
             )
+
+            if self._uses_text_api_backend():
+                error_stage = "text_api"
+                text_api_result = await self._run_text_api_turn(
+                    utterance_id=utterance_id,
+                    transcript_text=transcript.text,
+                    normalized_text=normalized_text,
+                    speech_end_time_ms=speech_end_time_ms,
+                    turn_revision=turn_revision,
+                )
+                intent = text_api_result["intent"]
+                llm_reply = text_api_result["llm_reply"]
+                response_text = text_api_result["response_text"]
+                raw_response_text = text_api_result["raw_response_text"]
+                response_published = bool(text_api_result["response_published"])
+                suppress_response = bool(text_api_result.get("suppress_response", False))
+                router_latency_ms = int(text_api_result["router_latency_ms"])
+                intent_ready_time_ms = int(text_api_result["intent_ready_time_ms"])
+                response_ready_time_ms = int(text_api_result["response_ready_time_ms"])
+                llm_latency_ms = int(text_api_result["llm_latency_ms"])
+                tts_latency_ms = int(text_api_result["tts_latency_ms"])
+                tts_prepared_text = str(text_api_result["tts_prepared_text"])
+                tts_segments = list(text_api_result["tts_segments"])
+                filler_added = bool(text_api_result["filler_added"])
+                filler_type = str(text_api_result["filler_type"])
+                tts_synth_start_time_ms = int(text_api_result["tts_synth_start_time_ms"])
+                tts_synth_done_time_ms = int(text_api_result["tts_synth_done_time_ms"])
+                tts_publish_start_time_ms = int(text_api_result["tts_publish_start_time_ms"])
+                tts_publish_done_time_ms = int(text_api_result["tts_publish_done_time_ms"])
+                next_graph_node = str(text_api_result["current_node"])
+                return
 
             error_stage = "routing"
             updated_fields = self._dialogue_state.update_from_user(
@@ -3817,20 +4221,26 @@ class ParticipantAudioSession:
                 destination_identities=[self._participant.identity],
                 utterance_id=utterance_id,
             )
-            await self._event_bus.publish_json(
-                {
-                    "type": "agent_response_text",
-                    "utterance_id": utterance_id,
-                    "participant_identity": self._participant.identity,
-                    "text": response_text,
-                    "use_llm": False,
-                    "llm_intent": "",
-                    "search_index": [],
-                    "next_step": "",
-                },
-                destination_identities=[self._participant.identity],
-            )
-            response_published = True
+            if self._uses_text_api_backend():
+                response_text = ""
+                raw_response_text = ""
+                suppress_response = True
+            else:
+                response_text = self._config.fallback_low_confidence_text
+                await self._event_bus.publish_json(
+                    {
+                        "type": "agent_response_text",
+                        "utterance_id": utterance_id,
+                        "participant_identity": self._participant.identity,
+                        "text": response_text,
+                        "use_llm": False,
+                        "llm_intent": "",
+                        "search_index": [],
+                        "next_step": "",
+                    },
+                    destination_identities=[self._participant.identity],
+                )
+                response_published = True
         finally:
             total_latency_ms = int((time.perf_counter() - started_at) * 1000)
             finalized_to_intent_ms = max(0, intent_ready_time_ms - speech_end_time_ms) if intent_ready_time_ms else 0
@@ -3964,7 +4374,7 @@ class VoiceSessionManager:
         room: rtc.Room,
         config: VoicePipelineConfig,
         event_bus: AgentEventBus,
-        llm_service: OpenAiLlmService,
+        llm_service: OpenAiLlmService | TextApiLlmService,
         tts_service: SileroTtsService,
         audio_publisher: LiveKitAudioPublisher,
         log: Callable[[str], None],
@@ -4019,3 +4429,7 @@ class VoiceSessionManager:
         sessions = list(self._sessions.values())
         self._sessions.clear()
         await asyncio.gather(*(session.aclose() for session in sessions), return_exceptions=True)
+        llm_close = getattr(self._llm_service, "aclose", None)
+        if callable(llm_close):
+            with contextlib.suppress(Exception):
+                await llm_close()

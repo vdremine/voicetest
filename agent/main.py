@@ -12,6 +12,7 @@ from voice_loop import (
     AgentEventBus,
     LiveKitAudioPublisher,
     OpenAiLlmService,
+    TextApiLlmService,
     VoicePipelineConfig,
     VoiceSessionManager,
     build_tts_service,
@@ -117,7 +118,10 @@ async def run() -> None:
     room = rtc.Room()
     pipeline_config = VoicePipelineConfig.from_env()
     event_bus = AgentEventBus(room, topic=pipeline_config.events_topic, log=log)
-    llm_service = OpenAiLlmService(pipeline_config, log)
+    if pipeline_config.dialogue_backend == "text_api":
+        llm_service = TextApiLlmService(pipeline_config, log)
+    else:
+        llm_service = OpenAiLlmService(pipeline_config, log)
     tts_service = build_tts_service(pipeline_config, log)
     audio_publisher = LiveKitAudioPublisher(room, pipeline_config, log)
     voice_sessions = VoiceSessionManager(
