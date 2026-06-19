@@ -105,6 +105,12 @@ class VoicePipelineConfig:
     tts_segment_pause_ms: int
     tts_normalize_peak: float
     tts_fade_ms: int
+    omnivoice_model: str
+    omnivoice_device: str
+    omnivoice_dtype: str
+    omnivoice_num_step: int
+    omnivoice_instruct: str
+    omnivoice_ref_audio: str
     half_duplex: bool
     barge_in_enabled: bool
     voice_fillers_enabled: bool
@@ -195,6 +201,15 @@ class VoicePipelineConfig:
             tts_segment_pause_ms=int(os.getenv("TTS_SEGMENT_PAUSE_MS", "120")),
             tts_normalize_peak=float(os.getenv("TTS_NORMALIZE_PEAK", "0.8")),
             tts_fade_ms=int(os.getenv("TTS_FADE_MS", "8")),
+            omnivoice_model=os.getenv("OMNIVOICE_MODEL", "k2-fsa/OmniVoice").strip() or "k2-fsa/OmniVoice",
+            omnivoice_device=os.getenv("OMNIVOICE_DEVICE", "cuda:0").strip() or "cuda:0",
+            omnivoice_dtype=os.getenv("OMNIVOICE_DTYPE", "float16").strip() or "float16",
+            omnivoice_num_step=int(os.getenv("OMNIVOICE_NUM_STEP", "32")),
+            omnivoice_instruct=os.getenv(
+                "OMNIVOICE_INSTRUCT",
+                "Спокойный, уверенный мужской голос русского кредитного брокера, дружелюбно и по делу.",
+            ).strip(),
+            omnivoice_ref_audio=os.getenv("OMNIVOICE_REF_AUDIO", "").strip(),
             half_duplex=env_bool("HALF_DUPLEX", True),
             barge_in_enabled=env_bool("BARGE_IN_ENABLED", False),
             voice_fillers_enabled=env_bool("VOICE_FILLERS_ENABLED", False),
@@ -1869,7 +1884,106 @@ class SileroTtsService:
         return pcm16, self._config.tts_sample_rate, latency_ms
 
 
-def build_tts_service(config: VoicePipelineConfig, log: Callable[[str], None]) -> SileroTtsService:
+class OmniVoiceTtsService:
+    """TTS via k2-fsa/OmniVoice (zero-shot multilingual, Russian supported).
+
+    Same interface as SileroTtsService: synthesize_segment/synthesize_segments ->
+    (pcm16 int16, sample_rate, latency_ms). Language is implicit in the (Russian)
+    text. Voice is set once via `instruct` (voice design) or `ref_audio` (clone);
+    with neither, OmniVoice picks an auto voice.
+    """
+
+    SAMPLE_RATE = 24000
+
+    def __init__(self, config: VoicePipelineConfig, log: Callable[[str], None]) -> None:
+        self._config = config
+        self._log = log
+        self._lock = threading.Lock()
+        self._model: Any | None = None
+
+    def _ensure_model(self) -> Any:
+        if self._model is not None:
+            return self._model
+        import torch  # local import: heavy, only when this provider is used
+        from omnivoice import OmniVoice
+
+        dtype = getattr(torch, self._config.omnivoice_dtype, torch.float16)
+        self._log(f"loading omnivoice model={self._config.omnivoice_model} device={self._config.omnivoice_device}")
+        self._model = OmniVoice.from_pretrained(
+            self._config.omnivoice_model,
+            device_map=self._config.omnivoice_device,
+            dtype=dtype,
+        )
+        self._log("omnivoice model ready")
+        return self._model
+
+    def _render_segment_pcm(self, model: Any, request: TtsRequest, segment: str) -> np.ndarray:
+        speed = request.speed if (request.speed and abs(request.speed - 1.0) > 1e-3) else self._config.tts_speed
+        kwargs: dict[str, Any] = {
+            "text": segment,
+            "num_step": self._config.omnivoice_num_step,
+            "speed": float(speed),
+        }
+        if self._config.omnivoice_ref_audio:
+            kwargs["ref_audio"] = self._config.omnivoice_ref_audio
+        elif self._config.omnivoice_instruct:
+            kwargs["instruct"] = self._config.omnivoice_instruct
+
+        audio = model.generate(**kwargs)
+        if isinstance(audio, list):
+            audio = np.concatenate([np.asarray(a).reshape(-1) for a in audio]) if audio else np.zeros(0)
+        audio_np = np.asarray(audio, dtype=np.float32).reshape(-1)
+        audio_np = np.clip(audio_np, -1.0, 1.0)
+        pcm16 = (audio_np * 32767.0).astype(np.int16)
+        pcm16 = trim_silence(pcm16)
+        pcm16 = apply_fade(pcm16, sample_rate=self.SAMPLE_RATE, fade_ms=self._config.tts_fade_ms)
+        return pcm16
+
+    def synthesize_segment(
+        self,
+        request: TtsRequest,
+        segment: str,
+        *,
+        trailing_pause_ms: int = 0,
+    ) -> tuple[np.ndarray, int, int]:
+        started_at = time.perf_counter()
+        with self._lock:
+            model = self._ensure_model()
+            pcm16 = self._render_segment_pcm(model, request, segment)
+        if trailing_pause_ms > 0:
+            pcm16 = np.concatenate([pcm16, silence_ms(trailing_pause_ms, self.SAMPLE_RATE)])
+        pcm16 = normalize_peak(pcm16, target_peak=self._config.tts_normalize_peak)
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        return pcm16, self.SAMPLE_RATE, latency_ms
+
+    def synthesize_segments(self, request: TtsRequest, segments: list[str]) -> tuple[np.ndarray, int, int]:
+        started_at = time.perf_counter()
+        with self._lock:
+            model = self._ensure_model()
+            rendered: list[np.ndarray] = []
+            for index, segment in enumerate(segments):
+                rendered.append(self._render_segment_pcm(model, request, segment))
+                if index < len(segments) - 1:
+                    pause_ms = pause_after_segment_ms(segment, self._config.tts_segment_pause_ms)
+                    if pause_ms > 0:
+                        rendered.append(silence_ms(pause_ms, self.SAMPLE_RATE))
+        pcm16 = np.concatenate(rendered) if rendered else np.zeros(0, dtype=np.int16)
+        pcm16 = normalize_peak(pcm16, target_peak=self._config.tts_normalize_peak)
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        return pcm16, self.SAMPLE_RATE, latency_ms
+
+
+def build_tts_service(config: VoicePipelineConfig, log: Callable[[str], None]):
+    if config.tts_provider == "omnivoice":
+        try:
+            import importlib.util
+
+            if importlib.util.find_spec("omnivoice") is None:
+                raise ImportError("omnivoice package not installed")
+            log("tts provider: omnivoice")
+            return OmniVoiceTtsService(config, log)
+        except Exception as exc:  # never go mute — fall back to Silero
+            log(f"omnivoice unavailable ({exc}); falling back to silero TTS")
     return SileroTtsService(config, log)
 
 

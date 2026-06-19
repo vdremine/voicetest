@@ -1,0 +1,6 @@
+# Optional TTS provider — installed as a NON-FATAL Docker layer.
+# Activated at runtime with TTS_PROVIDER=omnivoice. If install fails (e.g. a
+# torch version conflict), the image still builds and the agent falls back to
+# Silero TTS automatically (see build_tts_service in voice_loop.py).
+omnivoice
+soundfile
