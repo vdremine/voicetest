@@ -1895,11 +1895,18 @@ class OmniVoiceTtsService:
 
     SAMPLE_RATE = 24000
 
+    # Seed line used to lock a single voice for the whole process when no ref
+    # audio is provided. We know its text, so it can serve as the clone reference.
+    _SEED_TEXT = "Добрый день. Меня зовут Владимир, компания МосИнвестФинанс."
+
     def __init__(self, config: VoicePipelineConfig, log: Callable[[str], None]) -> None:
         self._config = config
         self._log = log
         self._lock = threading.Lock()
         self._model: Any | None = None
+        # voice lock: fixed reference so every utterance uses the SAME voice
+        self._ref_audio: str = config.omnivoice_ref_audio
+        self._ref_text: str = ""
 
     def _ensure_model(self) -> Any:
         if self._model is not None:
@@ -1917,32 +1924,64 @@ class OmniVoiceTtsService:
         self._log("omnivoice model ready")
         return self._model
 
-    def _render_segment_pcm(self, model: Any, request: TtsRequest, segment: str) -> np.ndarray:
-        speed = request.speed if (request.speed and abs(request.speed - 1.0) > 1e-3) else self._config.tts_speed
+    def _raw_generate(self, model: Any, text: str, *, speed: float, **extra: Any) -> np.ndarray:
         kwargs: dict[str, Any] = {
-            "text": segment,
+            "text": text,
             "num_step": self._config.omnivoice_num_step,
             "speed": float(speed),
+            **extra,
         }
-        if self._config.omnivoice_ref_audio:
-            kwargs["ref_audio"] = self._config.omnivoice_ref_audio
-        elif self._config.omnivoice_instruct:
-            kwargs["instruct"] = self._config.omnivoice_instruct
-
         try:
             audio = model.generate(**kwargs)
         except Exception as exc:
-            # instruct/ref invalid -> retry as auto-voice so we never go mute
             if "instruct" in kwargs or "ref_audio" in kwargs:
                 self._log(f"omnivoice generate failed ({exc}); retrying auto-voice")
                 kwargs.pop("instruct", None)
                 kwargs.pop("ref_audio", None)
+                kwargs.pop("ref_text", None)
                 audio = model.generate(**kwargs)
             else:
                 raise
         if isinstance(audio, list):
             audio = np.concatenate([np.asarray(a).reshape(-1) for a in audio]) if audio else np.zeros(0)
-        audio_np = np.asarray(audio, dtype=np.float32).reshape(-1)
+        return np.asarray(audio, dtype=np.float32).reshape(-1)
+
+    def _ensure_voice_lock(self, model: Any) -> None:
+        """Lock one voice for the whole process: synthesize a seed line once and
+        reuse it as the clone reference so the voice never changes per call."""
+        if self._ref_audio:
+            return
+        try:
+            import soundfile as sf
+
+            seed_kwargs: dict[str, Any] = {}
+            if self._config.omnivoice_instruct:
+                seed_kwargs["instruct"] = self._config.omnivoice_instruct
+            else:
+                seed_kwargs["instruct"] = "male, low pitch"  # bias the locked voice to male
+            seed = self._raw_generate(model, self._SEED_TEXT, speed=1.0, **seed_kwargs)
+            ref_dir = Path("/tmp/voice-agent")
+            ref_dir.mkdir(parents=True, exist_ok=True)
+            ref_path = ref_dir / "omnivoice_ref.wav"
+            sf.write(str(ref_path), seed.astype(np.float32), self.SAMPLE_RATE)
+            self._ref_audio = str(ref_path)
+            self._ref_text = self._SEED_TEXT
+            self._log(f"omnivoice voice locked -> {ref_path}")
+        except Exception as exc:
+            # If locking fails, leave ref empty; auto-voice still produces sound.
+            self._log(f"omnivoice voice lock failed ({exc}); using auto-voice")
+
+    def _render_segment_pcm(self, model: Any, request: TtsRequest, segment: str) -> np.ndarray:
+        speed = request.speed if (request.speed and abs(request.speed - 1.0) > 1e-3) else self._config.tts_speed
+        self._ensure_voice_lock(model)
+        extra: dict[str, Any] = {}
+        if self._ref_audio:
+            extra["ref_audio"] = self._ref_audio
+            if self._ref_text:
+                extra["ref_text"] = self._ref_text
+        elif self._config.omnivoice_instruct:
+            extra["instruct"] = self._config.omnivoice_instruct
+        audio_np = self._raw_generate(model, segment, speed=speed, **extra)
         audio_np = np.clip(audio_np, -1.0, 1.0)
         pcm16 = (audio_np * 32767.0).astype(np.int16)
         pcm16 = trim_silence(pcm16)
