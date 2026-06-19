@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .apply import apply_facts
+from .apply import apply_facts, sanitize_facts_update
 from .flow import (
     SOFT_SLOTS,
     DEFER_FLAGS,
@@ -348,6 +348,14 @@ class CallGraphRunner:
         )
         # Vary the acknowledgement word so it isn't "…, понял" every single turn.
         clean_reflection, ack_now = _vary_ack(clean_reflection, str(state.get("last_ack", "")))
+
+        # Reflection must be JUSTIFIED: only echo when a REAL fact was extracted or
+        # we're answering a question. Otherwise it's echoing garbage ("Добро
+        # пожаловать, рад помочь") — drop it, just ask the question.
+        meaningful = sanitize_facts_update(dict(raw_update), current_node=focus_before)
+        has_new_fact = any(str(v).strip() for v in meaningful.values())
+        if not has_new_fact and not understanding.answer.strip():
+            clean_reflection = ""
 
         repeat_count = dict(state.get("node_repeat_count", {}))
         repeat = repeat_count.get(focus_after, 0) if focus_after == focus_before else 0

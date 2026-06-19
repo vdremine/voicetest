@@ -366,6 +366,29 @@ def test_finale_strips_trailing_question():
     assert "эксперт" in reply.lower()
 
 
+def test_no_echo_without_a_real_fact():
+    # Garbage misheard input with NO extracted fact -> don't echo it, just ask.
+    u = TurnUnderstanding(reflection="Добро пожаловать, рад помочь.", facts_update={})
+    facts = {"opening_done": "yes", "desired_amount": "1", "client_name": "Иван"}
+    out = _run(_runner(u), _state(facts, "добро пожаловать"))
+    assert "добро пожаловать" not in out["reply"].lower()
+    assert "рад помочь" not in out["reply"].lower()
+    assert out["reply"].rstrip().endswith("?")  # just the question
+
+
+def test_real_fact_is_still_mirrored():
+    u = TurnUnderstanding(reflection="Двести тысяч, понял.", facts_update={"desired_amount": "200000"})
+    out = _run(_runner(u), _state({"opening_done": "yes"}, "двести тысяч"))
+    assert out["reply"].startswith("Двести тысяч")
+
+
+def test_objection_answer_kept_without_fact():
+    # No fact, but a real answer to a question -> keep the answer.
+    u = TurnUnderstanding(reflection="", answer="Мы не банк, а брокер.", facts_update={})
+    out = _run(_runner(u), _state({"opening_done": "yes", "desired_amount": "1"}, "вы банк?"))
+    assert "брокер" in out["reply"].lower()
+
+
 def test_should_end_finishes():
     u = TurnUnderstanding(reflection="", should_end=True)
     out = _run(_runner(u), _state({"opening_done": "yes", "desired_amount": "1"}, "не интересно, спасибо"))
