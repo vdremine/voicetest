@@ -461,6 +461,23 @@ def _summary_text(facts: dict) -> str:
     return f"Если позволите, коротко зарезюмирую: {body}. Всё верно?"
 
 
+# Soft re-ask prefixes — when a slot is asked again, vary the wording so it isn't
+# a verbatim repeat ("повторения это зло").
+_REASK_PREFIXES = ("Подскажите, ", "Если можно, уточните: ", "Давайте ещё раз — ", "Всё-таки, ")
+
+
+def _vary_reask(question: str, repeat_count: int) -> str:
+    if repeat_count <= 0 or not question:
+        return question
+    pre = _REASK_PREFIXES[(repeat_count - 1) % len(_REASK_PREFIXES)]
+    body = question.lstrip()
+    # drop a leading "А " so "Подскажите, а в каком…" reads naturally
+    low = body.lower()
+    if low.startswith("а "):
+        body = body[2:]
+    return pre + body[0].lower() + body[1:]
+
+
 def question_for(node_id: str, facts: dict | None = None, repeat_count: int = 0) -> str:
     facts = facts or {}
     if node_id == "finish":
@@ -481,13 +498,14 @@ def question_for(node_id: str, facts: dict | None = None, repeat_count: int = 0)
         and not _has(facts, "property_type")
         and resolve_branch(facts) == "real_estate"
     ):
-        return "А как вас зовут? И какая недвижимость у вас в собственности?"
+        return _vary_reask("А как вас зовут? И какая недвижимость у вас в собственности?", repeat_count)
     if node_id == "collect_refi_term" and not _has(facts, "property_type"):
-        return "А на какой срок брали и что в залоге — квартира или что-то другое?"
+        return _vary_reask("А на какой срок брали и что в залоге — квартира или что-то другое?", repeat_count)
     step = STEPS.get(node_id)
     if step is None or not step.questions:
         return ""
-    return step.questions[repeat_count % len(step.questions)]
+    base = step.questions[repeat_count % len(step.questions)]
+    return _vary_reask(base, repeat_count)
 
 
 # --- reply assembly -------------------------------------------------------
