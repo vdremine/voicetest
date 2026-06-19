@@ -2491,14 +2491,12 @@ class GigaAmSttService:
         import onnx_asr  # local import: only when this backend is used
 
         name = self._config.stt_gigaam_model
-        want_gpu = self._config.stt_device != "cpu"
-        try:
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if want_gpu else None
-            self._model = onnx_asr.load_model(name, providers=providers)
-            self._log(f"initialized gigaam stt model={name} providers={providers}")
-        except Exception as exc:
-            self._log(f"gigaam gpu load failed ({exc}); loading on CPU")
-            self._model = onnx_asr.load_model(name)
+        # CPU onnxruntime (already in the image, used by VAD) — avoids the
+        # onnxruntime-gpu/CUDA-version mismatch (libcudart.so.13 vs container cu12).
+        # GigaAM is a small 0.6B RNN-T; CPU is workable. To try GPU later, install a
+        # CUDA-matched onnxruntime-gpu and set providers=["CUDAExecutionProvider"].
+        self._model = onnx_asr.load_model(name)
+        self._log(f"initialized gigaam stt model={name} (cpu onnxruntime)")
         return self._model
 
     def transcribe(self, audio_samples: np.ndarray, duration_ms: int) -> TranscriptResult:
@@ -2525,10 +2523,8 @@ class GigaAmSttService:
 def build_stt_service(config: VoicePipelineConfig, log: Callable[[str], None]):
     if config.stt_backend == "gigaam":
         try:
-            import importlib.util
-
-            if importlib.util.find_spec("onnx_asr") is None:
-                raise ImportError("onnx-asr not installed")
+            import onnx_asr  # REAL import — catches onnxruntime/libcudart load errors
+            _ = onnx_asr  # touch
             log(f"stt backend: gigaam ({config.stt_gigaam_model})")
             return GigaAmSttService(config, log)
         except Exception as exc:  # never lose STT — fall back to whisper

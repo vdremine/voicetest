@@ -1,7 +1,8 @@
 # Optional GigaAM STT backend (Sber, MIT) — installed as a NON-FATAL Docker layer.
-# Activated at runtime with STT_BACKEND=gigaam. If install fails (e.g. an
-# onnxruntime-gpu conflict), the image still builds and STT falls back to
-# faster-whisper automatically (see build_stt_service in voice_loop.py).
-# NB: onnx-asr[gpu] pulls onnxruntime-gpu — verify VAD (Silero/onnxruntime) still
-# works on the server after enabling.
-onnx-asr[gpu,hub]
+# Activated at runtime with STT_BACKEND=gigaam. Falls back to faster-whisper if
+# unavailable (see build_stt_service).
+# CPU onnxruntime (NOT [gpu]): the container ships CUDA 12 libs, while a recent
+# onnxruntime-gpu wants CUDA 13 (libcudart.so.13) -> import fails. CPU avoids the
+# mismatch and reuses the onnxruntime already present (used by Silero VAD).
+# GigaAM is a small 0.6B RNN-T; CPU is workable for telephony.
+onnx-asr[cpu,hub]
