@@ -97,6 +97,7 @@ class VoicePipelineConfig:
     tts_model_path: Path
     tts_model_url: str
     tts_speaker: str
+    tts_speed: float
     tts_sample_rate: int
     tts_publish_sample_rate: int
     tts_frame_ms: int
@@ -121,7 +122,7 @@ class VoicePipelineConfig:
     @classmethod
     def from_env(cls) -> "VoicePipelineConfig":
         llm_provider = env_nonempty("LLM_PROVIDER", "openai").lower()
-        dialogue_backend = env_nonempty("DIALOGUE_BACKEND", "legacy").lower()
+        dialogue_backend = env_nonempty("DIALOGUE_BACKEND", "text_api").lower()
 
         tts_provider = env_nonempty("TTS_PROVIDER").lower()
         if not tts_provider:
@@ -185,7 +186,8 @@ class VoicePipelineConfig:
                 "TTS_MODEL_URL",
                 "https://models.silero.ai/models/tts/ru/v5_4_ru.pt",
             ),
-            tts_speaker=os.getenv("TTS_SPEAKER", "aidar"),
+            tts_speaker=os.getenv("TTS_SPEAKER", "eugene"),
+            tts_speed=float(os.getenv("TTS_SPEED", "1.12")),
             tts_sample_rate=int(os.getenv("TTS_SAMPLE_RATE", "24000")),
             tts_publish_sample_rate=int(os.getenv("TTS_PUBLISH_SAMPLE_RATE", "24000")),
             tts_frame_ms=int(os.getenv("TTS_FRAME_MS", "20")),
@@ -1446,6 +1448,10 @@ def apply_fade(pcm: np.ndarray, *, sample_rate: int, fade_ms: int) -> np.ndarray
     return np.clip(out, -32768.0, 32767.0).astype(np.int16)
 
 
+def _ssml_escape(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 class TtsMarkupService:
     def __init__(self) -> None:
         self._pronunciation = {
@@ -1771,11 +1777,29 @@ class SileroTtsService:
         return self._model
 
     def _render_segment_pcm(self, model: Any, request: TtsRequest, segment: str) -> np.ndarray:
-        audio = model.apply_tts(
-            text=segment,
-            speaker=request.speaker or self._config.tts_speaker,
-            sample_rate=self._config.tts_sample_rate,
-        )
+        speaker = request.speaker or self._config.tts_speaker
+        sr = self._config.tts_sample_rate
+        # base speech rate (faster on average) unless the request overrides it
+        speed = request.speed if (request.speed and abs(request.speed - 1.0) > 1e-3) else self._config.tts_speed
+
+        audio = None
+        if abs(speed - 1.0) > 1e-3:
+            # Silero supports SSML prosody rate; pitch-preserving speed change.
+            rate = max(50, min(200, int(round(speed * 100))))
+            ssml = f'<speak><prosody rate="{rate}%">{_ssml_escape(segment)}</prosody></speak>'
+            try:
+                audio = model.apply_tts(
+                    ssml_text=ssml, speaker=speaker, sample_rate=sr, put_accent=True, put_yo=True
+                )
+            except Exception as exc:  # SSML unsupported -> fall back to plain (no crash)
+                self._log(f"tts ssml rate failed, fallback to plain: {exc}")
+                audio = None
+        if audio is None:
+            # put_accent/put_yo = автоматические ударения и «ё» по всему тексту
+            audio = model.apply_tts(
+                text=segment, speaker=speaker, sample_rate=sr, put_accent=True, put_yo=True
+            )
+
         if isinstance(audio, torch.Tensor):
             audio_np = audio.detach().cpu().numpy()
         else:
@@ -1788,15 +1812,6 @@ class SileroTtsService:
             sample_rate=self._config.tts_sample_rate,
             fade_ms=self._config.tts_fade_ms,
         )
-        pcm16 = self._apply_speed(
-            pcm16,
-            sample_rate=self._config.tts_sample_rate,
-            speed=request.speed,
-        )
-        return pcm16
-
-    @staticmethod
-    def _apply_speed(pcm16: np.ndarray, *, sample_rate: int, speed: float) -> np.ndarray:
         return pcm16
 
     def synthesize_segment(
