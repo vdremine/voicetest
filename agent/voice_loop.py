@@ -216,7 +216,7 @@ class VoicePipelineConfig:
             omnivoice_model=os.getenv("OMNIVOICE_MODEL", "k2-fsa/OmniVoice").strip() or "k2-fsa/OmniVoice",
             omnivoice_device=os.getenv("OMNIVOICE_DEVICE", "cuda:0").strip() or "cuda:0",
             omnivoice_dtype=os.getenv("OMNIVOICE_DTYPE", "float16").strip() or "float16",
-            omnivoice_num_step=int(os.getenv("OMNIVOICE_NUM_STEP", "8")),
+            omnivoice_num_step=int(os.getenv("OMNIVOICE_NUM_STEP", "6")),
             # instruct = английские атрибуты через запятую ("male, low pitch"); voice-design
             # обучен на ZH/EN, для русского даёт акцент. По умолчанию пусто -> auto-voice
             # (модель берёт родной русский голос). Для стабильного голоса — OMNIVOICE_REF_AUDIO.
@@ -3755,35 +3755,50 @@ class ParticipantAudioSession:
                 if remaining_segments
                 else 0,
             )
-            rest_task: asyncio.Task[tuple[np.ndarray, int, int]] | None = None
-            if remaining_segments:
-                rest_task = asyncio.create_task(
-                    asyncio.to_thread(
-                        self._tts_service.synthesize_segments,
-                        request,
-                        remaining_segments,
-                    )
+            # Pipeline the tail PER SEGMENT: while segment i plays, segment i+1 is
+            # already synthesizing. Perceived gap = one segment, not the whole tail
+            # (critical for slow diffusion TTS like OmniVoice: was 5-12s for the rest).
+            def _synth(seg: str, *, last: bool) -> "asyncio.Task[tuple[np.ndarray, int, int]]":
+                pause = 0 if last else pause_after_segment_ms(seg, self._config.tts_segment_pause_ms)
+                return asyncio.create_task(
+                    asyncio.to_thread(self._tts_service.synthesize_segment, request, seg, trailing_pause_ms=pause)
                 )
+
+            next_task = (
+                _synth(remaining_segments[0], last=len(remaining_segments) == 1)
+                if remaining_segments
+                else None
+            )
             first_completed = await self._audio_publisher.speak_pcm(first_pcm16, tts_sample_rate)
             playback_completed = first_completed
             tts_latency_ms = first_latency_ms
             if first_completed:
                 self._mark_playback_segment_completed(0)
-            if first_completed and rest_task is not None:
+            if first_completed and next_task is not None:
                 try:
-                    rest_pcm16, rest_sample_rate, _rest_latency_ms = await rest_task
-                    if len(rest_pcm16) > 0:
-                        playback_completed = await self._audio_publisher.speak_pcm(rest_pcm16, rest_sample_rate)
-                        if playback_completed:
-                            self._mark_playback_segment_completed(len(segments) - 1)
+                    for idx in range(len(remaining_segments)):
+                        seg_pcm16, seg_sr, _seg_lat = await next_task
+                        # kick off the next segment's synthesis BEFORE playing this one
+                        if idx + 1 < len(remaining_segments):
+                            next_task = _synth(remaining_segments[idx + 1], last=idx + 2 == len(remaining_segments))
+                        else:
+                            next_task = None
+                        if len(seg_pcm16) > 0:
+                            playback_completed = await self._audio_publisher.speak_pcm(seg_pcm16, seg_sr)
+                            if playback_completed:
+                                self._mark_playback_segment_completed(1 + idx)
+                        if not playback_completed:  # interrupted/barge-in
+                            if next_task is not None:
+                                next_task.cancel()
+                            break
                 except Exception as exc:
                     self._log(
                         f"tts tail synthesis failed participant={self._participant.identity} "
                         f"utterance_id={utterance_id} error={str(exc) or repr(exc)}"
                     )
                     playback_completed = first_completed
-            elif rest_task is not None:
-                rest_task.cancel()
+            elif next_task is not None:
+                next_task.cancel()
         if playback_completed:
             self._complete_playback_state()
         else:
