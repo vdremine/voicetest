@@ -23,6 +23,7 @@ class StartSessionRequest(BaseModel):
 class ChatRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
     text: str = Field(..., min_length=1)
+    stt_confidence: float = Field(default=1.0)
 
 
 class ResetRequest(BaseModel):
@@ -96,6 +97,7 @@ async def message(request: ChatRequest) -> dict[str, Any]:
         **state,
         "raw_text": request.text,
         "user_text": request.text.strip(),
+        "stt_confidence": request.stt_confidence,
         "trace": {
             "input_node": state.get("current_node"),
             "input_text": request.text,

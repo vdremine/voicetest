@@ -13,6 +13,7 @@ class CallState(TypedDict, total=False):
 
     raw_text: str
     user_text: str
+    stt_confidence: float
 
     known_facts: dict[str, Any]
     history: list[dict[str, str]]

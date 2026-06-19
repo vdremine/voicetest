@@ -98,7 +98,21 @@ _BLOCKING_QUALITY = {"noise", "low_confidence"}
 _HOLD_ACTIONS = {"stay", "ignore", "repair"}
 # Bare fillers that must NOT be read as agreement/answer (rule #3).
 _BARE_FILLERS = {"", "ну", "ну…", "ну...", "угу", "мм", "ммм", "а", "э", "эээ", "так", "ааа"}
+# Short non-answers / junk that should HOLD (not advance the graph), independent
+# of the model — these slipped through and moved the funnel on garbage.
+_NOISE_PHRASES = {
+    "чего", "что", "чё", "ну что", "ну и все", "ну и всё", "не то все", "не то всё",
+    "как-то не дело", "удачи", "да ну", "ну да ладно", "всё забыл", "все забыл",
+    "что-то плохо", "ну ладно", "ага ну", "это самое",
+}
 _FAREWELLS = {"всего доброго", "до свидания", "пока", "досвидания", "до встречи", "ага пока"}
+# STT confidence below this: don't trust soft signals (branch switch, a name) —
+# garbage like "то киа"/"Коротиро" must not switch branch or become a name.
+_LOW_CONF = 0.55
+
+
+def _norm(text: str) -> str:
+    return (text or "").strip().lower().replace("ё", "е").strip(" .,…?!-")
 
 
 def clean_reply(text: str) -> str:
@@ -141,9 +155,10 @@ class CallGraphRunner:
         user_text = str(state.get("user_text", "")).strip()
         already_finished = bool(state.get("call_finished")) or focus_before == "finish"
 
-        # Rule #3: a bare filler ("ну", "угу", "мм", "а", or empty) is NOT an answer
-        # — hold the slot, no LLM, no graph move. (After finish, just stay silent.)
-        if user_text.lower().replace("ё", "е").strip(" .…?!") in _BARE_FILLERS:
+        # Rule #3: a bare filler / short junk ("ну", "угу", "чего", "удачи", "ну и
+        # все") is NOT an answer — hold the slot, no LLM, no graph move.
+        norm = _norm(user_text)
+        if norm in _BARE_FILLERS or norm in _NOISE_PHRASES:
             return self._silent(state) if already_finished else self._hold_node(
                 state, focus_before, None, None
             )
@@ -232,7 +247,16 @@ class CallGraphRunner:
         if action in _HOLD_ACTIONS or str(getattr(understanding, "quality_signal", "normal")) in _BLOCKING_QUALITY:
             return self._hold_node(state, focus_before, understanding, result)
 
-        facts_update = _apply_branch_signal(understanding.facts_update, understanding.branch_signal, facts)
+        # Low STT confidence: don't trust soft signals built from possibly-misheard
+        # words — drop a name and ignore a branch switch (garbage "то киа"/"Коротиро").
+        conf = float(state.get("stt_confidence", 1.0) or 1.0)
+        branch_signal = understanding.branch_signal
+        raw_update = dict(understanding.facts_update)
+        if conf < _LOW_CONF:
+            raw_update.pop("client_name", None)
+            branch_signal = "none"
+
+        facts_update = _apply_branch_signal(raw_update, branch_signal, facts)
         new_facts = apply_facts(facts, facts_update, current_node=focus_before)
 
         # Tail capture: if the client gives the callback time together with the

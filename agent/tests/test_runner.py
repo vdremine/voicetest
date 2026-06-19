@@ -303,6 +303,45 @@ def test_graph_action_end_finishes():
     assert out["current_node"] == "finish"
 
 
+def _state_conf(facts, user_text, conf):
+    st = _state(facts, user_text)
+    st["stt_confidence"] = conf
+    return st
+
+
+def test_low_confidence_blocks_branch_switch():
+    # "то киа" misheard with low confidence must NOT switch to the vehicle branch.
+    u = TurnUnderstanding(reflection="Киа, понял.", facts_update={}, branch_signal="vehicle")
+    facts = {"opening_done": "yes", "desired_amount": "1", "client_name": "Иван",
+             "property_type": "квартира", "region": "Москва", "encumbrance": "нет"}
+    out = _run(_runner(u), _state_conf(facts, "ммм то киа", 0.42))
+    assert out["trace"]["branch"] == "real_estate"  # stayed, no vehicle switch
+
+
+def test_low_confidence_drops_garbage_name():
+    # "Коротиро" (misheard) must not become the client's name on low confidence.
+    u = TurnUnderstanding(reflection="Коротиро, зафиксировал.", facts_update={"client_name": "Коротиро"})
+    facts = {"opening_done": "yes", "desired_amount": "1"}
+    out = _run(_runner(u), _state_conf(facts, "коротиро", 0.40))
+    assert out["known_facts"].get("client_name", "") != "Коротиро"
+
+
+def test_noise_phrase_holds_without_advancing():
+    # "удачи" / "ну и все" are short junk -> hold the slot, no advance.
+    u = TurnUnderstanding(reflection="ИГНОР")
+    facts = {"opening_done": "yes", "desired_amount": "1", "client_name": "Иван", "property_type": "квартира"}
+    out = _run(_runner(u), _state(facts, "Удачи!"))
+    assert out["current_node"] == "collect_region"  # stayed
+
+
+def test_high_confidence_allows_branch_and_name():
+    # With good confidence, branch switch and name still work.
+    u = TurnUnderstanding(reflection="под ПТС, понял.", facts_update={"branch": "ПТС"}, branch_signal="vehicle")
+    facts = {"opening_done": "yes", "desired_amount": "1", "client_name": "Иван"}
+    out = _run(_runner(u), _state_conf(facts, "мне под птс машина", 0.85))
+    assert out["current_node"].startswith("collect_vehicle")
+
+
 def test_should_end_finishes():
     u = TurnUnderstanding(reflection="", should_end=True)
     out = _run(_runner(u), _state({"opening_done": "yes", "desired_amount": "1"}, "не интересно, спасибо"))

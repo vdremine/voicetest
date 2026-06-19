@@ -1066,11 +1066,13 @@ class TextApiLlmService:
         response.raise_for_status()
         return response.json()
 
-    async def message(self, *, session_id: str, text: str) -> tuple[dict[str, Any], int]:
+    async def message(
+        self, *, session_id: str, text: str, stt_confidence: float = 1.0
+    ) -> tuple[dict[str, Any], int]:
         started_at = time.perf_counter()
         response = await self._ensure_client().post(
             "/session/message",
-            json={"session_id": session_id, "text": text},
+            json={"session_id": session_id, "text": text, "stt_confidence": stt_confidence},
         )
         latency_ms = int((time.perf_counter() - started_at) * 1000)
         response.raise_for_status()
@@ -3956,6 +3958,7 @@ class ParticipantAudioSession:
         normalized_text: str,
         speech_end_time_ms: int,
         turn_revision: int,
+        stt_confidence: float = 1.0,
     ) -> dict[str, Any]:
         if not transcript_text.strip():
             intent = IntentResult(Intent.CLARIFY.value, 0.0, False, Action.ASK_REPEAT.value)
@@ -4013,6 +4016,7 @@ class ParticipantAudioSession:
         payload, llm_latency_ms = await self._llm_service.message(
             session_id=self._session_id,
             text=transcript_text,
+            stt_confidence=stt_confidence,
         )
         response_ready_time_ms = int(time.time() * 1000)
 
@@ -4273,6 +4277,7 @@ class ParticipantAudioSession:
                     normalized_text=normalized_text,
                     speech_end_time_ms=speech_end_time_ms,
                     turn_revision=turn_revision,
+                    stt_confidence=float(getattr(transcript, "confidence", 1.0) or 1.0),
                 )
                 intent = text_api_result["intent"]
                 llm_reply = text_api_result["llm_reply"]
