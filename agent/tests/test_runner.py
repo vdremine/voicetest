@@ -135,6 +135,33 @@ def test_anti_loop_does_not_capture_when_client_asks_back():
     assert not str(out["known_facts"].get("encumbrance", "")).strip()
 
 
+def _tail_facts():
+    return {
+        "opening_done": "yes", "desired_amount": "1", "client_name": "Иван",
+        "property_type": "квартира", "region": "Москва", "encumbrance": "нет",
+        "owner_status": "я", "pitched": "yes", "priority": "ставка",
+    }
+
+
+def test_callback_time_captured_at_consent_step_no_reask():
+    # "да, набирайте завтра" = consent + time together. Must NOT re-ask the time.
+    u = TurnUnderstanding(reflection="завтра, хорошо.", facts_update={"callback_consent": "да"})
+    out = _run(_runner(u), _state(_tail_facts(), "да, набирайте завтра"))
+    assert str(out["known_facts"].get("callback_time", "")).strip()  # time captured
+    assert out["current_node"] == "finish"
+    low = out["reply"].lower()
+    assert "когда удобнее" not in low and "сегодня, завтра" not in low  # not re-asked
+
+
+def test_finish_reply_keeps_reflection():
+    u = TurnUnderstanding(reflection="завтра после обеда, зафиксировал.", facts_update={"callback_time": "завтра после обеда"})
+    facts = {**_tail_facts(), "callback_consent": "да"}
+    out = _run(_runner(u), _state(facts, "завтра после обеда"))
+    assert out["current_node"] == "finish"
+    assert "зафиксировал" in out["reply"].lower()  # reflection not dropped
+    assert "доброго" in out["reply"].lower()        # plus a clean close
+
+
 def test_should_end_finishes():
     u = TurnUnderstanding(reflection="", should_end=True)
     out = _run(_runner(u), _state({"opening_done": "yes", "desired_amount": "1"}, "не интересно, спасибо"))

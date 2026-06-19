@@ -45,6 +45,20 @@ def _encumbrance_is_positive(facts: dict) -> bool:
 _ENCUMBRANCE_SLOTS = {"collect_encumbrance", "collect_vehicle_encumbrance"}
 
 
+_TIME_MARKERS = (
+    "сегодня", "завтра", "послезавтра", "вечер", "утро", "утром", "обед",
+    "в любое", "любое время", "после обеда", "до обеда", "ближайш",
+    "понедельн", "вторник", "сред", "четверг", "пятниц", "суббот", "воскрес",
+    "выходн", "на следующей", "час дня", "часов", "сейчас", "прямо",
+)
+
+
+def looks_like_time(text: str) -> bool:
+    """True if the utterance names a callback time (so we don't re-ask it)."""
+    low = (text or "").lower().replace("ё", "е")
+    return any(m in low for m in _TIME_MARKERS)
+
+
 def is_yes_no_slot(node_id: str) -> bool:
     """Yes/no slots where the client's first statement IS the answer — so the
     runner captures it immediately rather than allowing even one clarifying re-ask."""
@@ -464,7 +478,9 @@ def assemble_reply(
     state cannot disagree."""
     facts = facts or {}
     if should_end or focus_node == "finish":
-        return FINISH_SUCCESS if ended_kind == "success" else FINISH_REFUSAL
+        finish = FINISH_SUCCESS if ended_kind == "success" else FINISH_REFUSAL
+        # Keep the warm acknowledgement ("завтра, зафиксировал.") before closing.
+        return _join([reflection, answer, finish])
 
     question = question_for(focus_node, facts, repeat_count)
     return _join([reflection, answer, question])

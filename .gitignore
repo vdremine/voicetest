@@ -8,3 +8,6 @@ __pycache__/
 voice_agent_graph_v0_1/request_sanitized2.txt
 logs_learn.txt
 logs_learn_sasha.txt
+# dev venv для тестов call_agent
+agent/.venv-dev/
+.venv-dev/

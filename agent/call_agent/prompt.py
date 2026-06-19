@@ -77,7 +77,7 @@ EXTRACTION_HINTS: dict[str, str] = {
     "collect_vehicle_encumbrance": "vehicle_encumbrance — в залоге/кредите: «нет/чистая»→\"нет\"",
     "collect_vehicle_year": "vehicle_year — год выпуска",
     "priority_choice": "priority — что важнее: скорость/ставка/платёж",
-    "handoff_consent": "callback_consent — согласен ли на звонок эксперта",
+    "handoff_consent": "callback_consent — согласен ли на звонок эксперта; ЕСЛИ назвал время (завтра/сегодня/после обеда) — ещё callback_time",
     "callback_time": "callback_time — удобное время звонка",
     "partner_format": "partner_format_desc — формат партнёрства/инвестиций",
     "partner_experience": "partner_experience — опыт инвестора",

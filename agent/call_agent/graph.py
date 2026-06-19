@@ -11,6 +11,7 @@ from .flow import (
     infer_gate_value,
     is_auto_complete,
     is_yes_no_slot,
+    looks_like_time,
     opening_for,
     resolve_branch,
     resolve_focus,
@@ -128,6 +129,19 @@ class CallGraphRunner:
 
         facts_update = _apply_branch_signal(understanding.facts_update, understanding.branch_signal, facts)
         new_facts = apply_facts(facts, facts_update, current_node=focus_before)
+
+        # Tail capture: if the client gives the callback time together with the
+        # consent ("да, набирайте завтра"), grab the time too so we never re-ask
+        # it. Scheduling implies consent.
+        user_text = str(state.get("user_text", "")).strip()
+        if (
+            focus_before in ("handoff_consent", "partner_experience", "callback_time")
+            and not str(new_facts.get("callback_time", "")).strip()
+            and looks_like_time(user_text)
+        ):
+            new_facts = dict(new_facts)
+            new_facts["callback_time"] = user_text[:80]
+            new_facts.setdefault("callback_consent", "да")
 
         # Name deferral: if the client goes into an objection/branch pivot instead
         # of giving a name, don't keep asking it mid-storm — defer to the handoff.
