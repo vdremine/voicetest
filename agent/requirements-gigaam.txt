@@ -1,0 +1,7 @@
+# Optional GigaAM STT backend (Sber, MIT) — installed as a NON-FATAL Docker layer.
+# Activated at runtime with STT_BACKEND=gigaam. If install fails (e.g. an
+# onnxruntime-gpu conflict), the image still builds and STT falls back to
+# faster-whisper automatically (see build_stt_service in voice_loop.py).
+# NB: onnx-asr[gpu] pulls onnxruntime-gpu — verify VAD (Silero/onnxruntime) still
+# works on the server after enabling.
+onnx-asr[gpu,hub]

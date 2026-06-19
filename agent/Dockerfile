@@ -13,6 +13,12 @@ COPY requirements-omnivoice.txt .
 RUN pip install --no-cache-dir -r requirements-omnivoice.txt || \
     echo "WARN: omnivoice optional install failed; agent will use Silero TTS"
 
+# Optional GigaAM STT (Sber). Non-fatal: failure (e.g. onnxruntime-gpu conflict)
+# must not break the image — STT falls back to faster-whisper at runtime.
+COPY requirements-gigaam.txt .
+RUN pip install --no-cache-dir -r requirements-gigaam.txt || \
+    echo "WARN: gigaam optional install failed; agent will use faster-whisper STT"
+
 COPY . .
 
 CMD ["python", "main.py"]

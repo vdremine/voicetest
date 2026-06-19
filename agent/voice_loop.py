@@ -71,7 +71,9 @@ class VoicePipelineConfig:
     vad_use_onnx: bool
     torch_num_threads: int
     stt_enabled: bool
+    stt_backend: str
     stt_model: str
+    stt_gigaam_model: str
     stt_device: str
     stt_compute_type_cpu: str
     stt_compute_type_gpu: str
@@ -171,7 +173,9 @@ class VoicePipelineConfig:
             vad_use_onnx=env_bool("VAD_USE_ONNX", False),
             torch_num_threads=int(os.getenv("TORCH_NUM_THREADS", "1")),
             stt_enabled=env_bool("STT_ENABLED", True),
+            stt_backend=env_nonempty("STT_BACKEND", "whisper").lower(),
             stt_model=os.getenv("STT_MODEL", "Systran/faster-whisper-medium"),
+            stt_gigaam_model=env_nonempty("STT_GIGAAM_MODEL", "gigaam-v3-rnnt"),
             stt_device=os.getenv("STT_DEVICE", "auto"),
             stt_compute_type_cpu=os.getenv("STT_COMPUTE_TYPE_CPU", "int8"),
             stt_compute_type_gpu=os.getenv("STT_COMPUTE_TYPE_GPU", "float16"),
@@ -2469,6 +2473,69 @@ class WhisperSttService:
         )
 
 
+class GigaAmSttService:
+    """Local Russian STT via GigaAM (Sber, MIT) through onnx-asr. Same interface
+    as WhisperSttService. RNN-T architecture has no autoregressive LM decoder, so
+    it doesn't hallucinate "Спасибо за просмотр" on silence, and the e2e variants
+    normalise numbers (fixes '120 тысяч'->'две тысячи'). Fully local, no cloud."""
+
+    def __init__(self, config: VoicePipelineConfig, log: Callable[[str], None]) -> None:
+        self._config = config
+        self._log = log
+        self._model: Any | None = None
+        self._lock = threading.Lock()
+
+    def _ensure_model(self) -> Any:
+        if self._model is not None:
+            return self._model
+        import onnx_asr  # local import: only when this backend is used
+
+        name = self._config.stt_gigaam_model
+        want_gpu = self._config.stt_device != "cpu"
+        try:
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if want_gpu else None
+            self._model = onnx_asr.load_model(name, providers=providers)
+            self._log(f"initialized gigaam stt model={name} providers={providers}")
+        except Exception as exc:
+            self._log(f"gigaam gpu load failed ({exc}); loading on CPU")
+            self._model = onnx_asr.load_model(name)
+        return self._model
+
+    def transcribe(self, audio_samples: np.ndarray, duration_ms: int) -> TranscriptResult:
+        started_at = time.perf_counter()
+        audio_f32 = audio_samples.astype(np.float32) / 32768.0
+        with self._lock:
+            model = self._ensure_model()
+            result = model.recognize(audio_f32, sample_rate=self._config.sample_rate)
+        text = (result if isinstance(result, str) else getattr(result, "text", str(result))).strip()
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        # GigaAM is accurate and doesn't hallucinate — give a stable confidence
+        # for non-empty output, 0 for empty. (Token-logprob confidence via
+        # with_timestamps() can be added later if needed for the gates.)
+        confidence = 0.9 if text else 0.0
+        return TranscriptResult(
+            text=text,
+            language=self._config.stt_language,
+            confidence=confidence,
+            duration_ms=duration_ms,
+            stt_latency_ms=latency_ms,
+        )
+
+
+def build_stt_service(config: VoicePipelineConfig, log: Callable[[str], None]):
+    if config.stt_backend == "gigaam":
+        try:
+            import importlib.util
+
+            if importlib.util.find_spec("onnx_asr") is None:
+                raise ImportError("onnx-asr not installed")
+            log(f"stt backend: gigaam ({config.stt_gigaam_model})")
+            return GigaAmSttService(config, log)
+        except Exception as exc:  # never lose STT — fall back to whisper
+            log(f"gigaam unavailable ({exc}); falling back to faster-whisper")
+    return WhisperSttService(config, log)
+
+
 class TranscriptNormalizer:
     _punct_re = re.compile(r"[^\w\s]+", flags=re.UNICODE)
     _space_re = re.compile(r"\s+")
@@ -2808,7 +2875,7 @@ class ParticipantAudioSession:
         participant: rtc.RemoteParticipant,
         config: VoicePipelineConfig,
         event_bus: AgentEventBus,
-        stt_service: WhisperSttService,
+        stt_service: "WhisperSttService | GigaAmSttService",
         llm_service: OpenAiLlmService | TextApiLlmService,
         tts_service: SileroTtsService,
         audio_publisher: LiveKitAudioPublisher,
@@ -4862,7 +4929,7 @@ class VoiceSessionManager:
         self._tts_service = tts_service
         self._audio_publisher = audio_publisher
         self._log = log
-        self._stt = WhisperSttService(config, log)
+        self._stt = build_stt_service(config, log)
         self._sessions: dict[str, ParticipantAudioSession] = {}
 
     def _ensure_session(self, participant: rtc.RemoteParticipant) -> ParticipantAudioSession:
