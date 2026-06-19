@@ -247,6 +247,62 @@ def test_clean_reply_strips_bad_start():
     assert clean_reply("Двести тысяч, понял.") == "Двести тысяч, понял."
 
 
+def _finished_state(user_text):
+    facts = {"opening_done": "yes", "desired_amount": "1", "client_name": "Иван",
+             "property_type": "квартира", "region": "Москва", "encumbrance": "нет",
+             "owner_status": "я", "pitched": "yes", "priority": "ставка",
+             "callback_consent": "да", "callback_time": "завтра"}
+    st = _state(facts, user_text)
+    st["current_node"] = "finish"
+    st["call_finished"] = True
+    return st
+
+
+def test_post_finish_farewell_is_silent():
+    # Repeated "Всего доброго" after finish must NOT replay the finale.
+    u = TurnUnderstanding(reflection="", graph_action="ignore", quality_signal="already_finished")
+    out = _run(_runner(u), _finished_state("всего доброго"))
+    assert out["reply"] == ""  # silent
+
+
+def test_post_finish_noise_is_silent_without_llm():
+    # "кайфово делать" after finish — bare/noise -> silent.
+    u = TurnUnderstanding(reflection="", graph_action="ignore", quality_signal="noise")
+    out = _run(_runner(u), _finished_state("и на корену так кайфово делать"))
+    assert out["reply"] == ""
+
+
+def test_post_finish_real_question_is_answered():
+    # Client comes back with a real question after finish -> answer, no finale.
+    u = TurnUnderstanding(reflection="", answer="Эксперт перезвонит завтра.", graph_action="stay")
+    out = _run(_runner(u), _finished_state("а когда перезвонят?"))
+    assert "эксперт" in out["reply"].lower()
+    assert "всего доброго" not in out["reply"].lower()
+
+
+def test_bare_filler_holds_without_advancing():
+    # "ну" is not agreement — hold the slot, no LLM call needed.
+    u = TurnUnderstanding(reflection="ДОЛЖНО БЫТЬ ПРОИГНОРИРОВАНО")  # LLM result ignored for bare filler
+    facts = {"opening_done": "yes", "desired_amount": "1", "client_name": "Иван", "property_type": "квартира"}
+    out = _run(_runner(u), _state(facts, "ну"))
+    assert out["current_node"] == "collect_region"  # stayed on focus, no advance
+    assert out["reply"].rstrip().endswith("?")
+
+
+def test_graph_action_stay_does_not_advance():
+    u = TurnUnderstanding(reflection="секунду.", facts_update={"region": "Москва"}, graph_action="stay")
+    facts = {"opening_done": "yes", "desired_amount": "1", "client_name": "Иван", "property_type": "квартира"}
+    out = _run(_runner(u), _state(facts, "что-то непонятное"))
+    assert out["current_node"] == "collect_region"   # stayed
+    assert "region" not in out["known_facts"]         # fact not applied
+
+
+def test_graph_action_end_finishes():
+    u = TurnUnderstanding(reflection="понял, больше не отвлекаю.", graph_action="end")
+    out = _run(_runner(u), _state({"opening_done": "yes", "desired_amount": "1"}, "не звоните больше"))
+    assert out["current_node"] == "finish"
+
+
 def test_should_end_finishes():
     u = TurnUnderstanding(reflection="", should_end=True)
     out = _run(_runner(u), _state({"opening_done": "yes", "desired_amount": "1"}, "не интересно, спасибо"))

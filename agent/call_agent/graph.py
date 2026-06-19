@@ -95,6 +95,10 @@ def _process_reflection(
 # and cap length, in case the 14B slips through.
 _BAD_STARTS = ("угу, понял вас", "угу понял вас", "понял вас,", "хорошо, понял", "да, понял вас")
 _BLOCKING_QUALITY = {"noise", "low_confidence"}
+_HOLD_ACTIONS = {"stay", "ignore", "repair"}
+# Bare fillers that must NOT be read as agreement/answer (rule #3).
+_BARE_FILLERS = {"", "ну", "ну…", "ну...", "угу", "мм", "ммм", "а", "э", "эээ", "так", "ааа"}
+_FAREWELLS = {"всего доброго", "до свидания", "пока", "досвидания", "до встречи", "ага пока"}
 
 
 def clean_reply(text: str) -> str:
@@ -134,6 +138,19 @@ class CallGraphRunner:
         facts = state.get("known_facts", {})
         branch = resolve_branch(facts)
         focus_before = resolve_focus(facts, branch)
+        user_text = str(state.get("user_text", "")).strip()
+        already_finished = bool(state.get("call_finished")) or focus_before == "finish"
+
+        # Rule #3: a bare filler ("ну", "угу", "мм", "а", or empty) is NOT an answer
+        # — hold the slot, no LLM, no graph move. (After finish, just stay silent.)
+        if user_text.lower().replace("ё", "е").strip(" .…?!") in _BARE_FILLERS:
+            return self._silent(state) if already_finished else self._hold_node(
+                state, focus_before, None, None
+            )
+
+        # Rule #1/#4: after finish, never re-speak the finale; ignore farewells/noise.
+        if already_finished and user_text.lower().strip(" .…?!") in _FAREWELLS:
+            return self._silent(state)
 
         result = await self._llm_client.understand(
             focus_node=focus_before,
@@ -146,7 +163,12 @@ class CallGraphRunner:
         self._metrics.record("first_answer_time", result.latency_ms)
 
         if result.understanding is None:
-            return self._graceful_reask(state, focus_before, branch, result)
+            return self._silent(state) if already_finished else self._graceful_reask(
+                state, focus_before, branch, result
+            )
+
+        if already_finished:
+            return self._post_finish(state, result)
 
         return self._commit(state, focus_before, branch, result)
 
@@ -204,9 +226,10 @@ class CallGraphRunner:
         facts = state.get("known_facts", {})
         prior_repeat = state.get("node_repeat_count", {}).get(focus_before, 0)
 
-        # Quality gate: on noise / low-confidence, DON'T advance the graph or apply
-        # facts — just acknowledge and re-ask the same slot (keep current node).
-        if str(getattr(understanding, "quality_signal", "normal")) in _BLOCKING_QUALITY:
+        # Hold gate: graph_action stay/ignore/repair OR noise/low-confidence quality
+        # -> don't advance or apply facts, just re-ask the same slot.
+        action = str(getattr(understanding, "graph_action", "continue")).lower()
+        if action in _HOLD_ACTIONS or str(getattr(understanding, "quality_signal", "normal")) in _BLOCKING_QUALITY:
             return self._hold_node(state, focus_before, understanding, result)
 
         facts_update = _apply_branch_signal(understanding.facts_update, understanding.branch_signal, facts)
@@ -257,7 +280,7 @@ class CallGraphRunner:
                 new_facts = {**new_facts, gate: infer_gate_value(focus_before, user_text)}
 
         branch_after = resolve_branch(new_facts)
-        if understanding.should_end:
+        if understanding.should_end or action == "end":
             focus_after = "finish"
         else:
             focus_after = resolve_focus(new_facts, branch_after)
@@ -298,6 +321,7 @@ class CallGraphRunner:
             "reply": reply,
             "known_facts": new_facts,
             "current_node": focus_after,
+            "call_finished": focus_after == "finish",
             "node_repeat_count": repeat_count,
             "recent_acks": recent_acks,
             "last_named": named_now,
@@ -318,29 +342,64 @@ class CallGraphRunner:
         }
 
     def _hold_node(self, state: CallState, focus_before: str, understanding, result) -> CallState:
-        """Noise / low-confidence: acknowledge, re-ask the SAME slot, advance nothing."""
+        """Noise / low-confidence / stay: re-ask the SAME slot, advance nothing.
+        For a bare filler there is no model output — just re-ask the question."""
         facts = state.get("known_facts", {})
         repeat = state.get("node_repeat_count", {}).get(focus_before, 0)
-        reflection = (understanding.reflection or "").strip() or "кажется, я плохо расслышал"
+        if understanding is None:
+            reflection, answer = "", ""
+        else:
+            reflection = (understanding.reflection or "").strip()
+            answer = understanding.answer.strip()
         reply = clean_reply(assemble_reply(
-            reflection=reflection, answer=understanding.answer.strip(),
+            reflection=reflection, answer=answer,
             focus_node=focus_before, facts=facts, repeat_count=repeat, should_end=False,
         ))
         return {
             **state,
             "reply": reply,
             "current_node": focus_before,
-            "last_turn_note": reflection,
+            "last_turn_note": reflection or state.get("last_turn_note", ""),
             "history": self._append_history(state, reply),
-            "llm_decision": understanding.model_dump(),
+            "llm_decision": understanding.model_dump() if understanding else {},
             "trace": {
                 **state.get("trace", {}),
-                "source": result.source,
-                "quality_hold": str(getattr(understanding, "quality_signal", "")),
+                "source": result.source if result else "hold",
                 "focus_before": focus_before,
                 "focus_after": focus_before,
             },
         }
+
+    def _silent(self, state: CallState) -> CallState:
+        """Say nothing this turn (post-finish noise/farewell, bare filler after
+        finish). Empty reply — voice_loop suppresses it."""
+        return {
+            **state,
+            "reply": "",
+            "current_node": state.get("current_node", "finish"),
+            "trace": {**state.get("trace", {}), "source": "silent"},
+        }
+
+    def _post_finish(self, state: CallState, result) -> CallState:
+        """Call already finished. Stay silent on noise/farewell/ignore, but if the
+        client genuinely comes back with a question, answer it once (no finale)."""
+        u = result.understanding
+        action = str(getattr(u, "graph_action", "")).lower()
+        quality = str(getattr(u, "quality_signal", "")).lower()
+        if action == "ignore" or quality in {"already_finished", "noise", "farewell", "duplicate"}:
+            return self._silent(state)
+        answer = (u.answer or "").strip()
+        if answer:  # real re-engagement — answer briefly, do NOT replay the finale
+            reply = clean_reply(answer)
+            return {
+                **state,
+                "reply": reply,
+                "current_node": "finish",
+                "history": self._append_history(state, reply),
+                "llm_decision": u.model_dump(),
+                "trace": {**state.get("trace", {}), "source": "post_finish_answer"},
+            }
+        return self._silent(state)
 
     def _append_history(self, state: CallState, reply: str) -> list[dict[str, str]]:
         history = list(state.get("history", []))

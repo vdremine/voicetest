@@ -4018,7 +4018,31 @@ class ParticipantAudioSession:
 
         reply_text = str(payload.get("reply", "")).strip()
         if not reply_text:
-            raise RuntimeError("text_api returned empty reply")
+            # Empty reply = call_agent decided to stay silent (post-finish noise /
+            # bare filler / ignore). Sync state, say nothing — don't crash.
+            self._sync_text_api_shadow_state(
+                current_node=str(payload.get("current_node", "")).strip() or self._text_api_current_node,
+                known_facts=payload.get("known_facts", {}) if isinstance(payload.get("known_facts"), dict) else {},
+                last_turn_note=str(payload.get("last_turn_note", "")).strip(),
+                reply_text="",
+            )
+            self._log(f"text_api silent participant={self._participant.identity} input_text={transcript_text!r}")
+            return {
+                "intent": IntentResult("text_api_silent", 1.0, False, Action.ASK_REPEAT.value),
+                "llm_reply": None, "response_text": "", "raw_response_text": "",
+                "response_published": False, "suppress_response": True,
+                "router_latency_ms": 0, "intent_ready_time_ms": int(time.time() * 1000),
+                "response_ready_time_ms": int(time.time() * 1000), "llm_latency_ms": llm_latency_ms,
+                "tts_latency_ms": 0, "tts_prepared_text": "", "tts_segments": [],
+                "filler_added": False, "filler_type": "",
+                "tts_synth_start_time_ms": 0, "tts_synth_done_time_ms": 0,
+                "tts_publish_start_time_ms": 0, "tts_publish_done_time_ms": 0,
+                "current_node": self._text_api_current_node,
+                "known_facts": dict(self._text_api_known_facts),
+                "last_turn_note": self._text_api_last_turn_note,
+                "trace": payload.get("trace", {}) if isinstance(payload.get("trace"), dict) else {},
+                "speech_end_time_ms": speech_end_time_ms,
+            }
 
         current_node = str(payload.get("current_node", "")).strip() or self._text_api_current_node
         last_turn_note = str(payload.get("last_turn_note", "")).strip()

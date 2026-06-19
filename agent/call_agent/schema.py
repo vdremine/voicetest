@@ -78,7 +78,11 @@ class TurnUnderstanding(BaseModel):
     )
     quality_signal: str = Field(
         default="normal",
-        description="normal | noise | low_confidence | angry | duplicate | offtopic | end",
+        description="normal | noise | low_confidence | angry | offtopic | farewell | hard_refusal | duplicate | already_finished",
+    )
+    graph_action: str = Field(
+        default="continue",
+        description="continue | stay | repair | end | ignore — что делать графу",
     )
 
 
@@ -96,7 +100,14 @@ UNDERSTANDING_JSON_SCHEMA: dict[str, Any] = {
         "should_end": {"type": "boolean"},
         "quality_signal": {
             "type": "string",
-            "enum": ["normal", "noise", "low_confidence", "angry", "duplicate", "offtopic", "end"],
+            "enum": [
+                "normal", "noise", "low_confidence", "angry", "offtopic",
+                "farewell", "hard_refusal", "duplicate", "already_finished",
+            ],
+        },
+        "graph_action": {
+            "type": "string",
+            "enum": ["continue", "stay", "repair", "end", "ignore"],
         },
     },
     "required": ["reflection", "facts_update"],
