@@ -111,6 +111,10 @@ class VoicePipelineConfig:
     omnivoice_num_step: int
     omnivoice_instruct: str
     omnivoice_ref_audio: str
+    piper_model: str
+    piper_model_dir: str
+    piper_use_cuda: bool
+    piper_length_scale: float
     half_duplex: bool
     barge_in_enabled: bool
     voice_fillers_enabled: bool
@@ -204,12 +208,16 @@ class VoicePipelineConfig:
             omnivoice_model=os.getenv("OMNIVOICE_MODEL", "k2-fsa/OmniVoice").strip() or "k2-fsa/OmniVoice",
             omnivoice_device=os.getenv("OMNIVOICE_DEVICE", "cuda:0").strip() or "cuda:0",
             omnivoice_dtype=os.getenv("OMNIVOICE_DTYPE", "float16").strip() or "float16",
-            omnivoice_num_step=int(os.getenv("OMNIVOICE_NUM_STEP", "32")),
+            omnivoice_num_step=int(os.getenv("OMNIVOICE_NUM_STEP", "8")),
             # instruct = английские атрибуты через запятую ("male, low pitch"); voice-design
             # обучен на ZH/EN, для русского даёт акцент. По умолчанию пусто -> auto-voice
             # (модель берёт родной русский голос). Для стабильного голоса — OMNIVOICE_REF_AUDIO.
             omnivoice_instruct=os.getenv("OMNIVOICE_INSTRUCT", "").strip(),
             omnivoice_ref_audio=os.getenv("OMNIVOICE_REF_AUDIO", "").strip(),
+            piper_model=os.getenv("PIPER_MODEL", "ru_RU-dmitri-medium").strip() or "ru_RU-dmitri-medium",
+            piper_model_dir=os.getenv("PIPER_MODEL_DIR", "/models/piper").strip() or "/models/piper",
+            piper_use_cuda=env_bool("PIPER_USE_CUDA", True),
+            piper_length_scale=float(os.getenv("PIPER_LENGTH_SCALE", "0.95")),
             half_duplex=env_bool("HALF_DUPLEX", True),
             barge_in_enabled=env_bool("BARGE_IN_ENABLED", False),
             voice_fillers_enabled=env_bool("VOICE_FILLERS_ENABLED", False),
@@ -2006,24 +2014,144 @@ class OmniVoiceTtsService:
         return pcm16, self.SAMPLE_RATE, latency_ms
 
     def synthesize_segments(self, request: TtsRequest, segments: list[str]) -> tuple[np.ndarray, int, int]:
+        # Diffusion synthesis is expensive per call — render the WHOLE reply in a
+        # single generate() (faster than per-segment, and one consistent voice).
         started_at = time.perf_counter()
+        text = " ".join(s.strip() for s in segments if s and s.strip())
         with self._lock:
             model = self._ensure_model()
-            rendered: list[np.ndarray] = []
-            for index, segment in enumerate(segments):
-                rendered.append(self._render_segment_pcm(model, request, segment))
-                if index < len(segments) - 1:
-                    pause_ms = pause_after_segment_ms(segment, self._config.tts_segment_pause_ms)
-                    if pause_ms > 0:
-                        rendered.append(silence_ms(pause_ms, self.SAMPLE_RATE))
-        pcm16 = np.concatenate(rendered) if rendered else np.zeros(0, dtype=np.int16)
+            pcm16 = self._render_segment_pcm(model, request, text) if text else np.zeros(0, dtype=np.int16)
         pcm16 = normalize_peak(pcm16, target_peak=self._config.tts_normalize_peak)
         latency_ms = int((time.perf_counter() - started_at) * 1000)
         return pcm16, self.SAMPLE_RATE, latency_ms
 
+    def warmup(self) -> None:
+        """Load the model and lock the voice BEFORE taking calls, so the first
+        turn isn't slowed by model load + voice-lock."""
+        try:
+            with self._lock:
+                model = self._ensure_model()
+                self._ensure_voice_lock(model)
+        except Exception as exc:
+            self._log(f"omnivoice warmup skipped: {exc}")
+
+
+class PiperTtsService:
+    """Fast local neural TTS (Piper, ONNX). Near real-time, native Russian voices,
+    no cloud. Same interface as Silero: synthesize_segment/_segments -> pcm16/sr/ms.
+    Voice is a single fixed ONNX model, so it never changes between turns."""
+
+    _HF_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main"
+
+    def __init__(self, config: VoicePipelineConfig, log: Callable[[str], None]) -> None:
+        self._config = config
+        self._log = log
+        self._lock = threading.Lock()
+        self._voice: Any | None = None
+        self._sample_rate = 22050
+
+    def _voice_paths(self) -> tuple[Path, Path]:
+        # ru_RU-dmitri-medium -> ru/ru_RU/dmitri/medium/ru_RU-dmitri-medium.onnx
+        name = self._config.piper_model
+        lang_full = name.split("-")[0]              # ru_RU
+        lang = lang_full.split("_")[0]              # ru
+        speaker = name.split("-")[1] if "-" in name else "dmitri"
+        quality = name.split("-")[2] if name.count("-") >= 2 else "medium"
+        rel = f"{lang}/{lang_full}/{speaker}/{quality}/{name}.onnx"
+        base = Path(self._config.piper_model_dir)
+        return base / f"{name}.onnx", base / rel
+
+    def _ensure_voice(self) -> Any:
+        if self._voice is not None:
+            return self._voice
+        from piper import PiperVoice
+
+        base = Path(self._config.piper_model_dir)
+        base.mkdir(parents=True, exist_ok=True)
+        onnx = base / f"{self._config.piper_model}.onnx"
+        cfg = base / f"{self._config.piper_model}.onnx.json"
+        if not onnx.is_file() or not cfg.is_file():
+            _, rel = self._voice_paths()
+            url_onnx = f"{self._HF_BASE}/{rel.relative_to(base).as_posix()}"
+            self._log(f"downloading piper voice {self._config.piper_model} from {url_onnx}")
+            import torch
+
+            torch.hub.download_url_to_file(url_onnx, str(onnx))
+            torch.hub.download_url_to_file(url_onnx + ".json", str(cfg))
+        self._log(f"loading piper voice={onnx} cuda={self._config.piper_use_cuda}")
+        try:
+            self._voice = PiperVoice.load(str(onnx), use_cuda=self._config.piper_use_cuda)
+        except Exception as exc:
+            self._log(f"piper cuda load failed ({exc}); loading on CPU")
+            self._voice = PiperVoice.load(str(onnx), use_cuda=False)
+        sr = getattr(getattr(self._voice, "config", None), "sample_rate", None)
+        if isinstance(sr, int) and sr > 0:
+            self._sample_rate = sr
+        self._log(f"piper voice ready sample_rate={self._sample_rate}")
+        return self._voice
+
+    def _syn_config(self, request: TtsRequest) -> Any:
+        from piper import SynthesisConfig
+
+        # length_scale < 1.0 => faster speech. Map request.speed/config to it.
+        speed = request.speed if (request.speed and abs(request.speed - 1.0) > 1e-3) else self._config.tts_speed
+        length_scale = self._config.piper_length_scale
+        if speed and speed > 0:
+            length_scale = max(0.5, min(2.0, self._config.piper_length_scale / speed))
+        return SynthesisConfig(length_scale=length_scale, normalize_audio=False)
+
+    def _render_pcm(self, voice: Any, request: TtsRequest, text: str) -> np.ndarray:
+        syn = self._syn_config(request)
+        chunks: list[np.ndarray] = []
+        for chunk in voice.synthesize(text, syn_config=syn):
+            pcm = np.frombuffer(chunk.audio_int16_bytes, dtype=np.int16)
+            chunks.append(pcm)
+            sr = getattr(chunk, "sample_rate", None)
+            if isinstance(sr, int) and sr > 0:
+                self._sample_rate = sr
+        pcm16 = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.int16)
+        return apply_fade(pcm16, sample_rate=self._sample_rate, fade_ms=self._config.tts_fade_ms)
+
+    def synthesize_segment(
+        self, request: TtsRequest, segment: str, *, trailing_pause_ms: int = 0
+    ) -> tuple[np.ndarray, int, int]:
+        started_at = time.perf_counter()
+        with self._lock:
+            voice = self._ensure_voice()
+            pcm16 = self._render_pcm(voice, request, segment)
+        if trailing_pause_ms > 0:
+            pcm16 = np.concatenate([pcm16, silence_ms(trailing_pause_ms, self._sample_rate)])
+        pcm16 = normalize_peak(pcm16, target_peak=self._config.tts_normalize_peak)
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        return pcm16, self._sample_rate, latency_ms
+
+    def synthesize_segments(self, request: TtsRequest, segments: list[str]) -> tuple[np.ndarray, int, int]:
+        started_at = time.perf_counter()
+        with self._lock:
+            voice = self._ensure_voice()
+            rendered: list[np.ndarray] = []
+            for index, segment in enumerate(segments):
+                rendered.append(self._render_pcm(voice, request, segment))
+                if index < len(segments) - 1:
+                    pause_ms = pause_after_segment_ms(segment, self._config.tts_segment_pause_ms)
+                    if pause_ms > 0:
+                        rendered.append(silence_ms(pause_ms, self._sample_rate))
+        pcm16 = np.concatenate(rendered) if rendered else np.zeros(0, dtype=np.int16)
+        pcm16 = normalize_peak(pcm16, target_peak=self._config.tts_normalize_peak)
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        return pcm16, self._sample_rate, latency_ms
+
+    def warmup(self) -> None:
+        try:
+            with self._lock:
+                self._ensure_voice()
+        except Exception as exc:
+            self._log(f"piper warmup skipped: {exc}")
+
 
 def build_tts_service(config: VoicePipelineConfig, log: Callable[[str], None]):
-    if config.tts_provider == "omnivoice":
+    provider = config.tts_provider
+    if provider == "omnivoice":
         try:
             import importlib.util
 
@@ -2031,8 +2159,18 @@ def build_tts_service(config: VoicePipelineConfig, log: Callable[[str], None]):
                 raise ImportError("omnivoice package not installed")
             log("tts provider: omnivoice")
             return OmniVoiceTtsService(config, log)
-        except Exception as exc:  # never go mute — fall back to Silero
+        except Exception as exc:
             log(f"omnivoice unavailable ({exc}); falling back to silero TTS")
+    elif provider == "piper":
+        try:
+            import importlib.util
+
+            if importlib.util.find_spec("piper") is None:
+                raise ImportError("piper-tts package not installed")
+            log("tts provider: piper")
+            return PiperTtsService(config, log)
+        except Exception as exc:
+            log(f"piper unavailable ({exc}); falling back to silero TTS")
     return SileroTtsService(config, log)
 
 

@@ -274,6 +274,15 @@ async def run() -> None:
 
     await llm_service.warmup()
 
+    # Warm up TTS (load model / lock voice / download voice) before taking calls,
+    # so the first turn isn't slowed by it. No-op for providers without warmup.
+    tts_warmup = getattr(tts_service, "warmup", None)
+    if callable(tts_warmup):
+        try:
+            await asyncio.to_thread(tts_warmup)
+        except Exception as exc:  # never block startup on TTS warmup
+            log(f"tts warmup skipped: {exc}")
+
     while True:
         try:
             token_payload = await fetch_token()
