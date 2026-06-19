@@ -391,8 +391,35 @@ OPENING_REFI = (
 )
 
 
+def is_warm_lead(facts: dict) -> bool:
+    """Warm callback: a lead with pre-loaded data (name + amount/object). Set as a
+    stable flag at session start so it doesn't flip mid-call."""
+    if _val(facts, "refi_mode") in ("yes", "true", "1"):
+        return False
+    if _val(facts, "lead_mode") == "warm":
+        return True
+    return _has(facts, "client_name") and (_has(facts, "desired_amount") or _has(facts, "property_type"))
+
+
+def _greeting_name(facts: dict) -> str:
+    name = str(facts.get("client_name", "")).strip()
+    patr = str(facts.get("client_patronymic", "")).strip()
+    if name and patr and patr.lower() not in name.lower():
+        return f"{name} {patr}"
+    return name
+
+
 def opening_for(facts: dict) -> str:
-    return OPENING_REFI if _val(facts, "refi_mode") in ("yes", "true", "1") else OPENING_COLD
+    if _val(facts, "refi_mode") in ("yes", "true", "1"):
+        return OPENING_REFI
+    if is_warm_lead(facts):
+        g = _greeting_name(facts)
+        prefix = f"{g}, добрый день." if g else "Добрый день."
+        return (
+            f"{prefix} Это Владимир, МосИнвестФинанс. Мы вчера общались по кредиту "
+            "под залог недвижимости, связь прервалась. Удобно сейчас быстро продолжить?"
+        )
+    return OPENING_COLD
 
 
 # --- pitch ----------------------------------------------------------------
