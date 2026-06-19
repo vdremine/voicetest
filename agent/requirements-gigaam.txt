@@ -1,8 +1,14 @@
 # Optional GigaAM STT backend (Sber, MIT) — installed as a NON-FATAL Docker layer.
-# Activated at runtime with STT_BACKEND=gigaam. Falls back to faster-whisper if
-# unavailable (see build_stt_service).
-# CPU onnxruntime (NOT [gpu]): the container ships CUDA 12 libs, while a recent
-# onnxruntime-gpu wants CUDA 13 (libcudart.so.13) -> import fails. CPU avoids the
-# mismatch and reuses the onnxruntime already present (used by Silero VAD).
-# GigaAM is a small 0.6B RNN-T; CPU is workable for telephony.
-onnx-asr[cpu,hub]
+# Activated at runtime with STT_BACKEND=gigaam. Falls back to faster-whisper if the
+# onnx_asr import fails (see build_stt_service).
+#
+# GPU build: pin onnxruntime-gpu to a CUDA-12 release (1.20.1 -> CUDA 12.4 + cuDNN 9),
+# matching the cu12/cudnn9 libs already in the image (from torch). A bare
+# `onnx-asr[gpu]` pulls the latest onnxruntime-gpu which targets CUDA 13
+# (libcudart.so.13) and fails on this CUDA-12 image.
+# NB: onnxruntime-gpu REPLACES the plain onnxruntime used by Silero VAD — if the GPU
+# libs don't load, VAD breaks too. Rollback: switch this file back to `onnx-asr[cpu,hub]`
+# and rebuild. CPU GigaAM was already fast (~0.2s/utt).
+nvidia-cuda-runtime-cu12
+onnxruntime-gpu==1.20.1
+onnx-asr[hub]

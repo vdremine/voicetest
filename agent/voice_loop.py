@@ -2491,12 +2491,20 @@ class GigaAmSttService:
         import onnx_asr  # local import: only when this backend is used
 
         name = self._config.stt_gigaam_model
-        # CPU onnxruntime (already in the image, used by VAD) — avoids the
-        # onnxruntime-gpu/CUDA-version mismatch (libcudart.so.13 vs container cu12).
-        # GigaAM is a small 0.6B RNN-T; CPU is workable. To try GPU later, install a
-        # CUDA-matched onnxruntime-gpu and set providers=["CUDAExecutionProvider"].
+        # Try GPU (CUDAExecutionProvider) first; fall back to CPU if the CUDA
+        # provider/libs aren't available. onnxruntime-gpu must be CUDA-12-matched
+        # (see requirements-gigaam.txt) or the import itself fails earlier.
+        if self._config.stt_device != "cpu":
+            try:
+                self._model = onnx_asr.load_model(
+                    name, providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+                )
+                self._log(f"initialized gigaam stt model={name} (cuda)")
+                return self._model
+            except Exception as exc:
+                self._log(f"gigaam cuda load failed ({exc}); loading on CPU")
         self._model = onnx_asr.load_model(name)
-        self._log(f"initialized gigaam stt model={name} (cpu onnxruntime)")
+        self._log(f"initialized gigaam stt model={name} (cpu)")
         return self._model
 
     def transcribe(self, audio_samples: np.ndarray, duration_ms: int) -> TranscriptResult:
