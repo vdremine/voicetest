@@ -12,7 +12,7 @@
 - **Архитектура:** навигация детерминирована (код выбирает следующий вопрос из накопленных фактов), LLM пишет только тёплую `reflection` + извлекает факты. Это даёт стабильность даже на слабой модели (Qwen2.5-7B) и человеческий тон.
 - Исправлены баги с прод-сервера (зацикливание на вопросе про залог, «живой оператор», битый JSON, странный расчёт 70%).
 - **59 тестов, все зелёные.** Тестируется детерминированное ядро без обращения к LLM.
-- **ГЛАВНЫЙ TODO:** `agent/voice_loop.py` НЕ использует `call_agent` (у него свой движок `agent_core`). Чтобы голос (STT→TTS) работал на новой логике, надо завернуть voice_loop на текстовый API `call_agent` (порт 8787). План — в разделе 7.
+- **ГОЛОС:** обёртка voice_loop → call_agent (8787) УЖЕ написана (`TextApiLlmService`, `_run_text_api_turn`), включается флагом `DIALOGUE_BACKEND=text_api` (раздел 7). Остаётся инфра: LiveKit-ключи и способ подачи аудио (браузер/SIP).
 - Открытый вопрос: смена TTS (раздел 8).
 
 ---
@@ -158,25 +158,25 @@ docker compose -f docker-compose.prod.yml -f docker-compose.llm.yml up --build -
 
 ---
 
-## 7. ГЛАВНЫЙ TODO: завернуть voice_loop на call_agent
+## 7. Обёртка voice_loop → call_agent — УЖЕ ГОТОВА, включается флагом
 
-**Проблема:** `agent/voice_loop.py` генерит ответы через `agent_core` (`OpenAiLlmService` + `ToolGraphRuntime`), напрямую в vLLM. В `call_agent`/8787 НЕ ходит (проверено grep'ом). → реальные звонки STT→TTS используют СТАРЫЙ движок, мои правки их не касаются.
+**Важно (исправление прошлой записи):** интеграция голоса с текстовым API `call_agent` (8787) **уже написана и закоммичена** на ветке `local-orchestrator-1llm`. НЕ надо ничего строить — надо включить флаг.
 
-**Что менять (минимально, STT/TTS/VAD не трогаем — меняем только «мозг»):**
-- `voice_loop.py`, класс `ParticipantAudioSession` (~стр. 2295): сейчас держит `self._llm_service` и `self._tool_graph`; ответ генерится в `_generate_*` (напр. `generate_response`, ~стр. 3269) с `graph_context` от `_tool_graph`.
-- `main.py` (~стр. 120): инстанцирует `OpenAiLlmService` и передаёт в сессию.
+Что есть в коде:
+- `voice_loop.py::TextApiLlmService` (~стр. 985) — httpx-клиент к 8787: `start_session` / `message` / `reset_session` / `warmup`.
+- `voice_loop.py::ParticipantAudioSession._run_text_api_turn` (~стр. 3522) — STT-транскрипт → `POST /session/message` → `reply` → `LlmReply(reply_tts=...)` → TTS; синк теневого состояния (`_text_api_*`).
+- Диспетч (~стр. 3807): `if self._uses_text_api_backend(): _run_text_api_turn(...)`.
+- `main.py:126`: `if dialogue_backend == "text_api": llm_service = TextApiLlmService(...)` иначе `OpenAiLlmService` (legacy).
+- Конфиг: `DIALOGUE_BACKEND` (дефолт `legacy`), `TEXT_API_URL` (дефолт `http://127.0.0.1:8787`).
 
-**План:**
-1. Новый клиент `CallAgentHttpClient` (httpx, base `http://127.0.0.1:8787`):
-   - на старте звонка → `POST /session/start {session_id, phone[, known_facts:{refi_mode}]}` (session_id = room/participant id).
-   - на каждый ФИНАЛЬНЫЙ STT-транскрипт → `POST /session/message {session_id, text}` → берём `reply` → в TTS.
-   - (опц.) в конце → `GET /session/post_call` для CRM.
-2. В `ParticipantAudioSession` заменить ветку генерации ответа на вызов этого клиента; убрать зависимость от `_tool_graph`/`_llm_service` для основного диалога (intent-router/VAD оставить).
-3. Первое приветствие: call_agent отдаёт «Алло.» на /start, затем открытие приходит первым /message — согласовать с тем, кто инициирует первую фразу в звонке (сейчас voice_loop сам говорит первым).
-4. Латентность: call_agent делает 1 LLM-вызов (~1–1.5с в логе). Приемлемо; для barge-in убедиться, что STT-финал не шлётся на каждое слово.
-5. Тест: поднять `text_llm` локально, прогнать `curl`-сценарий, затем реальный звонок.
+**Как включить голос на новом движке:**
+1. В `.env`: `DIALOGUE_BACKEND=text_api` (уже дефолт в `.env.prod.example`), `TEXT_API_URL=http://127.0.0.1:8787`.
+2. Поднять стек: `llm` + `text_llm` (мозг) + `agent` (STT/TTS/LiveKit) + `livekit` + `token_server`. `agent` host-network → дотягивается до 8787.
+3. Вписать реальные `LIVEKIT_API_KEY/SECRET/DOMAIN` — без них `agent` не зайдёт в комнату.
 
-Состояние сессии call_agent хранится в памяти (`api.py::_sessions`), так что voice_loop просто гоняет `session_id`+`text`. При рестарте контейнера сессии теряются (для звонков ок, т.к. короткие).
+Состояние сессии call_agent — в памяти (`api.py::_sessions`); voice_loop гоняет `session_id`+`text`. Рестарт `text_llm` теряет сессии (для коротких звонков ок).
+
+**Остаётся для реальных звонков:** как подаётся аудио в LiveKit-комнату — браузер (frontend + домен + Caddy TLS) или телефон (SIP-транк → LiveKit, в текущем compose НЕТ). Это инфра-вопрос, не код движка.
 
 ---
 
