@@ -59,6 +59,25 @@ def looks_like_time(text: str) -> bool:
     return any(m in low for m in _TIME_MARKERS)
 
 
+_QUESTION_WORDS = (
+    "кто", "что", "чем", "чего", "как", "почему", "зачем", "сколько", "какой",
+    "какая", "какие", "когда", "где", "куда", "откуда", "а вы", "вы что",
+    "что за", "о чем", "вы кто", "это что", "а что",
+)
+
+
+def looks_like_question(text: str) -> bool:
+    """The client asked something instead of answering — must NOT be captured as
+    a slot value (e.g. 'вы кто?' is not a name)."""
+    t = (text or "").strip().lower().replace("ё", "е")
+    if not t:
+        return False
+    if t.endswith("?"):
+        return True
+    padded = f" {t} "
+    return any(t.startswith(w) or f" {w} " in padded or f" {w}" == padded[: len(w) + 1] for w in _QUESTION_WORDS)
+
+
 def is_yes_no_slot(node_id: str) -> bool:
     """Yes/no slots where the client's first statement IS the answer — so the
     runner captures it immediately rather than allowing even one clarifying re-ask."""

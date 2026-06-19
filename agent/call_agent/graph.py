@@ -11,6 +11,7 @@ from .flow import (
     infer_gate_value,
     is_auto_complete,
     is_yes_no_slot,
+    looks_like_question,
     looks_like_time,
     opening_for,
     resolve_branch,
@@ -162,13 +163,17 @@ class CallGraphRunner:
             and not is_auto_complete(focus_before)
             and not str(new_facts.get(gate, "")).strip()
             and not understanding.answer.strip()  # client answered, didn't ask back
-            and str(state.get("user_text", "")).strip()
+            and user_text
+            and not looks_like_question(user_text)  # don't capture a question as a fact
             and prior_repeat >= threshold
         ):
             if focus_before in SOFT_SLOTS:
                 new_facts = {**new_facts, DEFER_FLAGS[focus_before]: "yes"}
+            elif focus_before == "collect_name":
+                # never store a non-name as the name — defer and re-ask before handoff
+                new_facts = {**new_facts, "name_deferred": "yes"}
             else:
-                new_facts = {**new_facts, gate: infer_gate_value(focus_before, state.get("user_text", ""))}
+                new_facts = {**new_facts, gate: infer_gate_value(focus_before, user_text)}
 
         branch_after = resolve_branch(new_facts)
         if understanding.should_end:

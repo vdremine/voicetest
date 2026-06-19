@@ -162,6 +162,17 @@ def test_finish_reply_keeps_reflection():
     assert "доброго" in out["reply"].lower()        # plus a clean close
 
 
+def test_question_is_not_captured_as_name():
+    # Server bug: "вы кто?" got stored as client_name. A question must never be
+    # captured as a slot value.
+    u = TurnUnderstanding(reflection="Владимир, компания МосИнвестФинанс.", facts_update={})
+    state = _state({"opening_done": "yes", "amount_deferred": "yes"}, "вы кто?")
+    state["node_repeat_count"] = {"collect_name": 1}  # already asked once -> anti-loop armed
+    out = _run(_runner(u), state)
+    assert out["known_facts"].get("client_name", "") != "вы кто?"
+    assert not str(out["known_facts"].get("client_name", "")).strip()
+
+
 def test_should_end_finishes():
     u = TurnUnderstanding(reflection="", should_end=True)
     out = _run(_runner(u), _state({"opening_done": "yes", "desired_amount": "1"}, "не интересно, спасибо"))
