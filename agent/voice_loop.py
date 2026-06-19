@@ -205,10 +205,10 @@ class VoicePipelineConfig:
             omnivoice_device=os.getenv("OMNIVOICE_DEVICE", "cuda:0").strip() or "cuda:0",
             omnivoice_dtype=os.getenv("OMNIVOICE_DTYPE", "float16").strip() or "float16",
             omnivoice_num_step=int(os.getenv("OMNIVOICE_NUM_STEP", "32")),
-            omnivoice_instruct=os.getenv(
-                "OMNIVOICE_INSTRUCT",
-                "Спокойный, уверенный мужской голос русского кредитного брокера, дружелюбно и по делу.",
-            ).strip(),
+            # instruct = английские атрибуты через запятую ("male, low pitch"); voice-design
+            # обучен на ZH/EN, для русского даёт акцент. По умолчанию пусто -> auto-voice
+            # (модель берёт родной русский голос). Для стабильного голоса — OMNIVOICE_REF_AUDIO.
+            omnivoice_instruct=os.getenv("OMNIVOICE_INSTRUCT", "").strip(),
             omnivoice_ref_audio=os.getenv("OMNIVOICE_REF_AUDIO", "").strip(),
             half_duplex=env_bool("HALF_DUPLEX", True),
             barge_in_enabled=env_bool("BARGE_IN_ENABLED", False),
@@ -1929,7 +1929,17 @@ class OmniVoiceTtsService:
         elif self._config.omnivoice_instruct:
             kwargs["instruct"] = self._config.omnivoice_instruct
 
-        audio = model.generate(**kwargs)
+        try:
+            audio = model.generate(**kwargs)
+        except Exception as exc:
+            # instruct/ref invalid -> retry as auto-voice so we never go mute
+            if "instruct" in kwargs or "ref_audio" in kwargs:
+                self._log(f"omnivoice generate failed ({exc}); retrying auto-voice")
+                kwargs.pop("instruct", None)
+                kwargs.pop("ref_audio", None)
+                audio = model.generate(**kwargs)
+            else:
+                raise
         if isinstance(audio, list):
             audio = np.concatenate([np.asarray(a).reshape(-1) for a in audio]) if audio else np.zeros(0)
         audio_np = np.asarray(audio, dtype=np.float32).reshape(-1)
