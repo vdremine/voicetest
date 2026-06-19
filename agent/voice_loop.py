@@ -117,6 +117,9 @@ class VoicePipelineConfig:
     piper_length_scale: float
     half_duplex: bool
     barge_in_enabled: bool
+    barge_in_cue: str
+    barge_in_cue_ms: int
+    barge_in_cue_volume: float
     voice_fillers_enabled: bool
     voice_fillers_level: str
     voice_fillers_probability: float
@@ -220,6 +223,9 @@ class VoicePipelineConfig:
             piper_length_scale=float(os.getenv("PIPER_LENGTH_SCALE", "0.95")),
             half_duplex=env_bool("HALF_DUPLEX", True),
             barge_in_enabled=env_bool("BARGE_IN_ENABLED", False),
+            barge_in_cue=os.getenv("BARGE_IN_CUE", "click").strip().lower() or "click",
+            barge_in_cue_ms=int(os.getenv("BARGE_IN_CUE_MS", "45")),
+            barge_in_cue_volume=float(os.getenv("BARGE_IN_CUE_VOLUME", "0.18")),
             voice_fillers_enabled=env_bool("VOICE_FILLERS_ENABLED", False),
             voice_fillers_level=os.getenv("VOICE_FILLERS_LEVEL", "light").strip().lower() or "light",
             voice_fillers_probability=float(os.getenv("VOICE_FILLERS_PROBABILITY", "0.35")),
@@ -2262,6 +2268,50 @@ class LiveKitAudioPublisher:
             self._source.clear_queue()
         self._log("interrupted current agent audio playback")
 
+    def _build_cue(self) -> np.ndarray:
+        """A short, soft phone-like cue played on barge-in so the agent voice
+        doesn't cut abruptly. 'click' = gentle blip, 'beep' = soft tone."""
+        kind = self._config.barge_in_cue
+        if kind in ("", "none", "off"):
+            return np.zeros(0, dtype=np.int16)
+        sr = self._config.tts_publish_sample_rate
+        n = max(1, int(sr * self._config.barge_in_cue_ms / 1000))
+        t = np.arange(n, dtype=np.float32) / sr
+        freq = 1500.0 if kind == "beep" else 900.0
+        wave = np.sin(2 * np.pi * freq * t).astype(np.float32)
+        if kind != "beep":
+            # short two-tone "tk" click — quick decay
+            wave = wave * np.exp(-t * 60.0).astype(np.float32)
+        # smooth fade in/out to avoid pops
+        fade = max(1, int(sr * 0.006))
+        if 2 * fade < n:
+            wave[:fade] *= np.linspace(0.0, 1.0, fade, dtype=np.float32)
+            wave[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
+        wave *= max(0.0, min(1.0, self._config.barge_in_cue_volume))
+        return np.clip(wave * 32767.0, -32768.0, 32767.0).astype(np.int16)
+
+    async def interrupt_with_cue(self) -> None:
+        """Stop current playback and play the barge-in cue (phone-like switch)."""
+        self.interrupt_playback()
+        cue = self._build_cue()
+        if len(cue) == 0 or self._source is None:
+            return
+        spc = int(self._config.tts_publish_sample_rate * self._config.tts_frame_ms / 1000) or 480
+        try:
+            for cursor in range(0, len(cue), spc):
+                chunk = cue[cursor : cursor + spc]
+                if len(chunk) < spc:
+                    chunk = np.pad(chunk, (0, spc - len(chunk)))
+                frame = rtc.AudioFrame(
+                    data=memoryview(chunk.tobytes()),
+                    sample_rate=self._config.tts_publish_sample_rate,
+                    num_channels=self._config.num_channels,
+                    samples_per_channel=spc,
+                )
+                await self._source.capture_frame(frame)
+        except Exception as exc:
+            self._log(f"barge-in cue skipped: {exc}")
+
     async def speak_pcm(self, pcm16: np.ndarray, sample_rate: int) -> bool:
         await self.ensure_published()
         assert self._source is not None
@@ -3103,7 +3153,7 @@ class ParticipantAudioSession:
                     f"barge-in detected participant={self._participant.identity} "
                     f"vad_probability={probability:.3f}"
                 )
-                self._audio_publisher.interrupt_playback()
+                await self._audio_publisher.interrupt_with_cue()
                 self._mark_playback_interrupted()
                 self._is_speaking = False
             else:
