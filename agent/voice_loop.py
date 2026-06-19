@@ -1477,7 +1477,7 @@ def _ssml_escape(text: str) -> str:
 
 # Filler words that sound bad at the START of a spoken reply — stripped there,
 # kept only mid-sentence (where they read as natural hesitation).
-_LEADING_FILLERS = ("ну смотрите", "ну вот", "ну", "вот", "так вот", "э", "эм", "ааа", "аа")
+_LEADING_FILLERS = ("ну смотрите", "ну вот", "ну", "вот", "так вот", "угу", "ага", "э", "эм", "ааа", "аа")
 # Emphasis / transition words that get an accent pause before them mid-sentence.
 _ACCENT_WORDS = (
     "хорошо", "понятно", "понял", "поняла", "ясно", "отлично", "конечно",

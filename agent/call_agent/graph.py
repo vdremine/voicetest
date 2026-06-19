@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .apply import apply_facts
@@ -33,6 +34,40 @@ def _apply_branch_signal(facts_update: dict[str, Any], signal: str, facts: dict[
     elif signal == "consolidation":
         merged.setdefault("consolidation_intent", "yes")
     return merged
+
+
+# Generic acknowledgements that add nothing. The model loves to open every turn
+# with one ("угу, понял вас") — which sounds awful repeated. We keep them rare:
+# a generic ack is dropped if one was used in either of the last 2 turns, so the
+# reply carries a SPECIFIC mirror ("двести тысяч") or just the next question.
+_GENERIC_ACKS = {
+    "угу", "угу понял вас", "угу понял", "понял вас", "понял", "поняла", "понятно",
+    "ясно", "да", "да понял", "да понял вас", "да да понял", "да-да понял",
+    "хорошо", "ага", "так", "конечно", "отлично", "принял", "все понятно",
+    "понял вас спасибо", "угу понятно", "ну понял", "ну понял вас",
+}
+
+
+def _ack_core(reflection: str) -> str:
+    core = (reflection or "").lower().replace("ё", "е")
+    core = re.sub(r"[.!?…,]+", " ", core)
+    return re.sub(r"\s+", " ", core).strip()
+
+
+def _is_generic_ack(reflection: str) -> bool:
+    return _ack_core(reflection) in _GENERIC_ACKS
+
+
+def _dedupe_reflection(reflection: str, recent_acks: list[str]) -> tuple[str, list[str]]:
+    """Drop a generic ack if we used one in the last 2 turns. Returns the cleaned
+    reflection and the updated recent-acks history."""
+    generic = _is_generic_ack(reflection)
+    if generic and any(recent_acks[-2:]):
+        reflection = ""
+        kept = ""
+    else:
+        kept = _ack_core(reflection) if generic else ""
+    return reflection, (recent_acks + [kept])[-3:]
 
 
 def _ended_kind(facts: dict[str, Any]) -> str:
@@ -185,10 +220,17 @@ class CallGraphRunner:
                 if gate:
                     new_facts = {**new_facts, gate: "yes"}
 
+        # Kill repetitive generic acks ("угу, понял вас") — keep a specific mirror
+        # or just go to the question. Empty answer means the ack carried no content.
+        clean_reflection, recent_acks = _dedupe_reflection(
+            understanding.reflection,
+            list(state.get("recent_acks", [])),
+        )
+
         repeat_count = dict(state.get("node_repeat_count", {}))
         repeat = repeat_count.get(focus_after, 0) if focus_after == focus_before else 0
         reply = assemble_reply(
-            reflection=understanding.reflection,
+            reflection=clean_reflection,
             answer=understanding.answer,
             focus_node=focus_after,
             facts=new_facts,
@@ -209,6 +251,7 @@ class CallGraphRunner:
             "known_facts": new_facts,
             "current_node": focus_after,
             "node_repeat_count": repeat_count,
+            "recent_acks": recent_acks,
             "last_turn_note": note,
             "history": self._append_history(state, reply),
             "llm_decision": understanding.model_dump(),

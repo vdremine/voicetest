@@ -18,6 +18,7 @@ class CallState(TypedDict, total=False):
     history: list[dict[str, str]]
 
     node_repeat_count: dict[str, int]
+    recent_acks: list[str]
 
     reply: str
     llm_decision: dict[str, Any]

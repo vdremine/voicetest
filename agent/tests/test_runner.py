@@ -173,6 +173,29 @@ def test_question_is_not_captured_as_name():
     assert not str(out["known_facts"].get("client_name", "")).strip()
 
 
+def test_generic_ack_not_repeated_across_turns():
+    # "угу, понял вас" every turn sounds awful — must not repeat consecutively.
+    u = TurnUnderstanding(reflection="угу, понял вас.", facts_update={})
+    runner = _runner(u)
+    facts = {"opening_done": "yes", "desired_amount": "1", "client_name": "Иван",
+             "property_type": "квартира", "region": "Москва"}
+    state = _state(facts, "ага")
+    out1 = _run(runner, state)
+    # first generic ack may pass through
+    state2 = {**out1, "user_text": "ну да", "raw_text": "ну да"}
+    out2 = _run(runner, state2)
+    # second consecutive generic ack must be dropped from the reply
+    assert "понял вас" not in out2["reply"].lower()
+    assert out2["reply"].rstrip().endswith("?")  # still asks the question
+
+
+def test_specific_reflection_is_kept():
+    # A specific mirror (carries content) is NOT treated as a generic ack.
+    u = TurnUnderstanding(reflection="Двести тысяч, понял.", facts_update={"desired_amount": "200000"})
+    out = _run(_runner(u), _state({"opening_done": "yes"}, "двести тысяч"))
+    assert out["reply"].startswith("Двести тысяч")
+
+
 def test_should_end_finishes():
     u = TurnUnderstanding(reflection="", should_end=True)
     out = _run(_runner(u), _state({"opening_done": "yes", "desired_amount": "1"}, "не интересно, спасибо"))
