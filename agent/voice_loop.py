@@ -202,7 +202,7 @@ class VoicePipelineConfig:
             tts_publish_sample_rate=int(os.getenv("TTS_PUBLISH_SAMPLE_RATE", "24000")),
             tts_frame_ms=int(os.getenv("TTS_FRAME_MS", "20")),
             tts_provider=tts_provider,
-            tts_segment_pause_ms=int(os.getenv("TTS_SEGMENT_PAUSE_MS", "120")),
+            tts_segment_pause_ms=int(os.getenv("TTS_SEGMENT_PAUSE_MS", "240")),
             tts_normalize_peak=float(os.getenv("TTS_NORMALIZE_PEAK", "0.8")),
             tts_fade_ms=int(os.getenv("TTS_FADE_MS", "8")),
             omnivoice_model=os.getenv("OMNIVOICE_MODEL", "k2-fsa/OmniVoice").strip() or "k2-fsa/OmniVoice",
@@ -1475,8 +1475,19 @@ def _ssml_escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+# Filler words that sound bad at the START of a spoken reply — stripped there,
+# kept only mid-sentence (where they read as natural hesitation).
+_LEADING_FILLERS = ("ну смотрите", "ну вот", "ну", "вот", "так вот", "э", "эм", "ааа", "аа")
+# Emphasis / transition words that get an accent pause before them mid-sentence.
+_ACCENT_WORDS = (
+    "хорошо", "понятно", "понял", "поняла", "ясно", "отлично", "конечно",
+    "смотрите", "значит", "итак", "так вот", "договорились", "замечательно",
+)
+
+
 class TtsMarkupService:
-    def __init__(self) -> None:
+    def __init__(self, provider: str = "silero") -> None:
+        self._provider = (provider or "silero").lower()
         self._pronunciation = {
             "владимир": "Влад+имир",
             "мосинвестфинанс": "Мос Инвест Фин+анс",
@@ -1495,9 +1506,14 @@ class TtsMarkupService:
     def prepare(self, request: TtsRequest) -> str:
         text = self._clean(request.text)
         text = self._normalize_numbers(text)
+        text = self._strip_leading_filler(text)
+        text = self._accent_pauses(text)
         text = self._apply_pronunciation(text)
         text = self._apply_stress(text)
         text = self._split_for_speech(text)
+        # Stress marks ("+") are Silero syntax; other engines read them literally.
+        if self._provider != "silero":
+            text = text.replace("+", "")
         return text
 
     @staticmethod
@@ -1507,6 +1523,32 @@ class TtsMarkupService:
     @staticmethod
     def _normalize_numbers(text: str) -> str:
         return text.replace("%", " процентов")
+
+    @staticmethod
+    def _strip_leading_filler(text: str) -> str:
+        value = text.strip()
+        low = value.lower()
+        for filler in _LEADING_FILLERS:
+            if low.startswith(filler + ",") or low.startswith(filler + " ") or low == filler:
+                rest = value[len(filler):].lstrip(" ,—-").strip()
+                if rest:
+                    return rest[0].upper() + rest[1:]
+        return value
+
+    @staticmethod
+    def _accent_pauses(text: str) -> str:
+        # Insert a comma-pause before an emphasis word when it appears mid-sentence
+        # (preceded by a word and not already after a pause). Accent only in the
+        # middle — at the start it sounds bad, so we don't touch sentence openings.
+        result = text
+        for word in _ACCENT_WORDS:
+            result = re.sub(
+                rf"(\w)\s+({re.escape(word)})\b",
+                lambda m: f"{m.group(1)}, {m.group(2)}",
+                result,
+                flags=re.IGNORECASE,
+            )
+        return re.sub(r"\s*,\s*,", ",", result)  # collapse accidental double commas
 
     def _apply_pronunciation(self, text: str) -> str:
         result = text
@@ -2725,7 +2767,7 @@ class ParticipantAudioSession:
         self._router = SimpleIntentRouter()
         self._responses = CannedResponseEngine(config)
         self._vad = SileroVadEngine(config)
-        self._tts_markup = TtsMarkupService()
+        self._tts_markup = TtsMarkupService(provider=config.tts_provider)
         self._sales_speech_styler = SalesSpeechStyler(config)
         self._voice_style = VoiceStyleAdapter(config)
         self._dialogue_state = DialogueState()
