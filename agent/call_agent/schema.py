@@ -76,6 +76,10 @@ class TurnUnderstanding(BaseModel):
         default=False,
         description="true только при явном прощании/жёстком отказе. Обрыв/тишина — НЕ конец.",
     )
+    quality_signal: str = Field(
+        default="normal",
+        description="normal | noise | low_confidence | angry | duplicate | offtopic | end",
+    )
 
 
 # JSON schema for vLLM guided decoding (guaranteed-valid output on a weak model).
@@ -90,6 +94,10 @@ UNDERSTANDING_JSON_SCHEMA: dict[str, Any] = {
             "enum": ["real_estate", "vehicle", "partner", "consolidation", "none"],
         },
         "should_end": {"type": "boolean"},
+        "quality_signal": {
+            "type": "string",
+            "enum": ["normal", "noise", "low_confidence", "angry", "duplicate", "offtopic", "end"],
+        },
     },
     "required": ["reflection", "facts_update"],
     "additionalProperties": False,

@@ -2874,6 +2874,7 @@ class ParticipantAudioSession:
         self._first_frame_logged = False
         self._active_utterance_id: str | None = None
         self._utterance_counter = 0
+        self._processed_utterance_ids: set[str] = set()
         self._last_agent_message: str | None = None
         self._last_semantic_agent_message: str | None = None
         self._session_memory = SessionMemory(max_turns=12)
@@ -4177,6 +4178,14 @@ class ParticipantAudioSession:
         speech_end_time_ms: int,
         turn_revision: int,
     ) -> None:
+        # Dedupe: never process the same utterance twice (observed utt-0013 x2).
+        if utterance_id in self._processed_utterance_ids:
+            self._log(f"skip duplicate utterance_id={utterance_id}")
+            return
+        self._processed_utterance_ids.add(utterance_id)
+        if len(self._processed_utterance_ids) > 256:
+            self._processed_utterance_ids = set(list(self._processed_utterance_ids)[-128:])
+
         await self._publish_status("stt_processing")
         started_at = time.perf_counter()
         self._is_processing = True

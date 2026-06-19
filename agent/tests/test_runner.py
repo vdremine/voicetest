@@ -213,6 +213,40 @@ def test_specific_reflection_is_kept():
     assert out["reply"].startswith("Двести тысяч")
 
 
+def test_noise_quality_holds_node_and_drops_facts():
+    # On quality_signal=noise the graph must NOT advance or apply facts.
+    u = TurnUnderstanding(
+        reflection="кажется, я плохо расслышал",
+        facts_update={"property_type": "дом"},  # model leaked a fact on noise
+        quality_signal="noise",
+    )
+    facts = {"opening_done": "yes", "desired_amount": "1", "client_name": "Иван"}
+    out = _run(_runner(u), _state(facts, "ха-ха головка хуя"))
+    assert out["current_node"] == "collect_property_type"  # stayed (not advanced)
+    assert "property_type" not in out["known_facts"]        # fact dropped
+    assert "плохо расслышал" in out["reply"].lower()
+    assert out["reply"].rstrip().endswith("?")              # re-asks the slot
+
+
+def test_vehicle_model_alias_advances_branch():
+    # The prompt emits vehicle_model; navigation gates on vehicle_type (alias).
+    u = TurnUnderstanding(
+        reflection="Toyota RAV4, понял.",
+        facts_update={"vehicle_model": "Toyota RAV4"},
+        branch_signal="vehicle",
+    )
+    facts = {"opening_done": "yes", "vehicle_interest": "yes", "client_name": "Иван"}
+    out = _run(_runner(u), _state(facts, "тойота рав четыре"))
+    assert out["known_facts"].get("vehicle_type") == "Toyota RAV4"
+    assert out["current_node"] == "collect_vehicle_owner"  # advanced past type
+
+
+def test_clean_reply_strips_bad_start():
+    from call_agent.graph import clean_reply
+    assert not clean_reply("Угу, понял вас.").lower().startswith("угу, понял вас")
+    assert clean_reply("Двести тысяч, понял.") == "Двести тысяч, понял."
+
+
 def test_should_end_finishes():
     u = TurnUnderstanding(reflection="", should_end=True)
     out = _run(_runner(u), _state({"opening_done": "yes", "desired_amount": "1"}, "не интересно, спасибо"))

@@ -91,6 +91,26 @@ def _process_reflection(
     return reflection, (recent_acks + [""])[-3:], used_name
 
 
+# Hard guard before TTS: even after the dedup, strip these leftover bad openers
+# and cap length, in case the 14B slips through.
+_BAD_STARTS = ("угу, понял вас", "угу понял вас", "понял вас,", "хорошо, понял", "да, понял вас")
+_BLOCKING_QUALITY = {"noise", "low_confidence"}
+
+
+def clean_reply(text: str) -> str:
+    out = (text or "").strip()
+    low = out.lower().replace("ё", "е")
+    for bad in _BAD_STARTS:
+        if low.startswith(bad):
+            out = out[len(bad):].lstrip(" .,—-")
+            out = out[:1].upper() + out[1:] if out else out
+            break
+    if len(out) > 220:
+        head = out[:220].rsplit(".", 1)[0]
+        out = (head + ".") if head else out[:220]
+    return out.strip()
+
+
 def _ended_kind(facts: dict[str, Any]) -> str:
     if any(
         str(facts.get(k, "")).strip()
@@ -184,6 +204,11 @@ class CallGraphRunner:
         facts = state.get("known_facts", {})
         prior_repeat = state.get("node_repeat_count", {}).get(focus_before, 0)
 
+        # Quality gate: on noise / low-confidence, DON'T advance the graph or apply
+        # facts — just acknowledge and re-ask the same slot (keep current node).
+        if str(getattr(understanding, "quality_signal", "normal")) in _BLOCKING_QUALITY:
+            return self._hold_node(state, focus_before, understanding, result)
+
         facts_update = _apply_branch_signal(understanding.facts_update, understanding.branch_signal, facts)
         new_facts = apply_facts(facts, facts_update, current_node=focus_before)
 
@@ -252,7 +277,7 @@ class CallGraphRunner:
 
         repeat_count = dict(state.get("node_repeat_count", {}))
         repeat = repeat_count.get(focus_after, 0) if focus_after == focus_before else 0
-        reply = assemble_reply(
+        reply = clean_reply(assemble_reply(
             reflection=clean_reflection,
             answer=understanding.answer,
             focus_node=focus_after,
@@ -260,7 +285,7 @@ class CallGraphRunner:
             repeat_count=repeat,
             should_end=understanding.should_end,
             ended_kind=_ended_kind(new_facts),
-        )
+        ))
         if focus_after == focus_before:
             repeat_count[focus_after] = repeat_count.get(focus_after, 0) + 1
         else:
@@ -289,6 +314,31 @@ class CallGraphRunner:
                 "branch": branch_after,
                 "facts_update": facts_update,
                 "understanding": understanding.model_dump(),
+            },
+        }
+
+    def _hold_node(self, state: CallState, focus_before: str, understanding, result) -> CallState:
+        """Noise / low-confidence: acknowledge, re-ask the SAME slot, advance nothing."""
+        facts = state.get("known_facts", {})
+        repeat = state.get("node_repeat_count", {}).get(focus_before, 0)
+        reflection = (understanding.reflection or "").strip() or "кажется, я плохо расслышал"
+        reply = clean_reply(assemble_reply(
+            reflection=reflection, answer=understanding.answer.strip(),
+            focus_node=focus_before, facts=facts, repeat_count=repeat, should_end=False,
+        ))
+        return {
+            **state,
+            "reply": reply,
+            "current_node": focus_before,
+            "last_turn_note": reflection,
+            "history": self._append_history(state, reply),
+            "llm_decision": understanding.model_dump(),
+            "trace": {
+                **state.get("trace", {}),
+                "source": result.source,
+                "quality_hold": str(getattr(understanding, "quality_signal", "")),
+                "focus_before": focus_before,
+                "focus_after": focus_before,
             },
         }
 
