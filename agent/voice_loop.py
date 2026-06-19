@@ -186,7 +186,7 @@ class VoicePipelineConfig:
                 "TTS_MODEL_URL",
                 "https://models.silero.ai/models/tts/ru/v5_4_ru.pt",
             ),
-            tts_speaker=os.getenv("TTS_SPEAKER", "eugene"),
+            tts_speaker=os.getenv("TTS_SPEAKER", "aidar"),
             tts_speed=float(os.getenv("TTS_SPEED", "1.12")),
             tts_sample_rate=int(os.getenv("TTS_SAMPLE_RATE", "24000")),
             tts_publish_sample_rate=int(os.getenv("TTS_PUBLISH_SAMPLE_RATE", "24000")),
@@ -1776,8 +1776,19 @@ class SileroTtsService:
         )
         return self._model
 
+    def _valid_speaker(self, model: Any, requested: str) -> str:
+        """Silero v5_4_ru speakers: aidar/baya/kseniya/xenia/eugene vary by build.
+        Fall back to a known male voice so an unknown name never kills synthesis."""
+        speaker = (requested or "").strip() or "aidar"
+        available = getattr(model, "speakers", None)
+        if available and speaker not in available:
+            fallback = "aidar" if "aidar" in available else available[0]
+            self._log(f"tts speaker {speaker!r} not available {list(available)} -> {fallback!r}")
+            return fallback
+        return speaker
+
     def _render_segment_pcm(self, model: Any, request: TtsRequest, segment: str) -> np.ndarray:
-        speaker = request.speaker or self._config.tts_speaker
+        speaker = self._valid_speaker(model, request.speaker or self._config.tts_speaker)
         sr = self._config.tts_sample_rate
         # base speech rate (faster on average) unless the request overrides it
         speed = request.speed if (request.speed and abs(request.speed - 1.0) > 1e-3) else self._config.tts_speed
