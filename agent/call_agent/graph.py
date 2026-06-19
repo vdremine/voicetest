@@ -58,6 +58,27 @@ def _is_generic_ack(reflection: str) -> bool:
     return _ack_core(reflection) in _GENERIC_ACKS
 
 
+# The model ends almost every mirror with the SAME ack word ("…, понял").
+# Rotate it so two turns in a row don't repeat the same one.
+_ACK_POOL = ("понял", "принял", "зафиксировал", "записал", "отметил", "ясно")
+_ACK_RE = re.compile(r"\b(понял|принял|зафиксировал|записал|отметил|ясно|хорошо)\b", re.IGNORECASE)
+
+
+def _vary_ack(reflection: str, last_ack: str) -> tuple[str, str]:
+    """If the reflection's acknowledgement word repeats last turn's, swap it for a
+    different one — kills the monotonous '…, понял' on every single turn."""
+    m = _ACK_RE.search(reflection or "")
+    if not m:
+        return reflection, last_ack
+    word = m.group(1).lower()
+    if word == last_ack:
+        alts = [w for w in _ACK_POOL if w != last_ack] or list(_ACK_POOL)
+        repl = alts[len(reflection) % len(alts)]  # deterministic, varied
+        reflection = reflection[: m.start(1)] + repl + reflection[m.end(1):]
+        return reflection, repl
+    return reflection, word
+
+
 def _strip_vocative(reflection: str, name: str) -> str:
     """Remove a vocative address by the client's name (and diminutives) from the
     reflection: 'понял вас, Лен' -> 'понял вас', 'Ленечка, двести' -> 'двести'."""
@@ -123,6 +144,10 @@ def clean_reply(text: str) -> str:
             out = out[len(bad):].lstrip(" .,—-")
             out = out[:1].upper() + out[1:] if out else out
             break
+    # collapse artifacts left by vocative/ack edits: "Хорошо,, попробуем" / extra spaces
+    out = re.sub(r"\s+", " ", out)
+    out = re.sub(r"\s*,\s*,+", ", ", out)
+    out = re.sub(r"\s+([.,!?…])", r"\1", out)
     if len(out) > 220:
         head = out[:220].rsplit(".", 1)[0]
         out = (head + ".") if head else out[:220]
@@ -321,6 +346,8 @@ class CallGraphRunner:
             str(new_facts.get("client_name", "")),
             bool(state.get("last_named", False)),
         )
+        # Vary the acknowledgement word so it isn't "…, понял" every single turn.
+        clean_reflection, ack_now = _vary_ack(clean_reflection, str(state.get("last_ack", "")))
 
         repeat_count = dict(state.get("node_repeat_count", {}))
         repeat = repeat_count.get(focus_after, 0) if focus_after == focus_before else 0
@@ -349,6 +376,7 @@ class CallGraphRunner:
             "node_repeat_count": repeat_count,
             "recent_acks": recent_acks,
             "last_named": named_now,
+            "last_ack": ack_now,
             "last_turn_note": note,
             "history": self._append_history(state, reply),
             "llm_decision": understanding.model_dump(),

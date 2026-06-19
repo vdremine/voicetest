@@ -21,6 +21,7 @@ class CallState(TypedDict, total=False):
     node_repeat_count: dict[str, int]
     recent_acks: list[str]
     last_named: bool
+    last_ack: str
     call_finished: bool
 
     reply: str

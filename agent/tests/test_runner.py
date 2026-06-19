@@ -342,6 +342,30 @@ def test_high_confidence_allows_branch_and_name():
     assert out["current_node"].startswith("collect_vehicle")
 
 
+def test_ack_word_varies_across_turns():
+    # "…, понял" every turn is monotonous — the ack word must not repeat back-to-back.
+    runner = _runner(TurnUnderstanding(reflection="десять миллионов, понял.", facts_update={"desired_amount": "10000000"}))
+    out1 = _run(runner, _state({"opening_done": "yes"}, "десять миллионов"))
+    # next turn also ends with "понял"
+    r2 = _runner(TurnUnderstanding(reflection="квартира, понял.", facts_update={"property_type": "квартира"}))._llm_client
+    out2 = _run(make_call_graph(llm_client=r2, metrics=MetricsCollector(model_name="t")),
+                {**out1, "user_text": "квартира", "raw_text": "квартира"})
+    assert out1["last_ack"] == "понял"
+    # second reflection's ack rotated away from "понял"
+    assert "понял" not in out2["reply"].split(".")[0].lower() or out2["last_ack"] != "понял"
+
+
+def test_finale_strips_trailing_question():
+    from call_agent.flow import assemble_reply
+    reply = assemble_reply(
+        reflection="понял, быстро. А когда удобнее — сегодня, завтра?",
+        answer="", focus_node="finish", facts={}, should_end=True, ended_kind="success",
+    )
+    assert "когда удобнее" not in reply.lower()
+    assert "?" not in reply
+    assert "эксперт" in reply.lower()
+
+
 def test_should_end_finishes():
     u = TurnUnderstanding(reflection="", should_end=True)
     out = _run(_runner(u), _state({"opening_done": "yes", "desired_amount": "1"}, "не интересно, спасибо"))

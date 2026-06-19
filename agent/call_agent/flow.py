@@ -492,8 +492,23 @@ def question_for(node_id: str, facts: dict | None = None, repeat_count: int = 0)
 
 # --- reply assembly -------------------------------------------------------
 
-FINISH_SUCCESS = "Спасибо за уделённое время. Передаю информацию эксперту, ожидайте звонка. Всего доброго."
-FINISH_REFUSAL = "Понял вас. Тогда не буду отвлекать, всего доброго."
+# Short finale — long TTS (OmniVoice diffusion) lags on long replies.
+FINISH_SUCCESS = "Передаю эксперту, ожидайте звонка. Всего доброго."
+FINISH_REFUSAL = "Понял, не отвлекаю. Всего доброго."
+
+# A question mid-reflection right before the finale ("…когда удобнее? Спасибо…")
+# is wrong — strip a trailing question clause when finishing.
+import re as _re
+
+
+def _strip_trailing_question(text: str) -> str:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+    # drop the last clause if it is a question
+    parts = _re.split(r"(?<=[.!?…])\s+", cleaned)
+    parts = [p for p in parts if not p.strip().endswith("?")]
+    return " ".join(parts).strip()
 
 
 def _join(parts: list[str]) -> str:
@@ -525,8 +540,11 @@ def assemble_reply(
     facts = facts or {}
     if should_end or focus_node == "finish":
         finish = FINISH_SUCCESS if ended_kind == "success" else FINISH_REFUSAL
-        # Keep the warm acknowledgement ("завтра, зафиксировал.") before closing.
-        return _join([reflection, answer, finish])
+        # Drop any trailing question ("…когда удобнее?") before the finale so the
+        # bot doesn't ask AND say goodbye in one breath.
+        refl = _strip_trailing_question(reflection)
+        ans = _strip_trailing_question(answer)
+        return _join([refl, ans, finish])
 
     question = question_for(focus_node, facts, repeat_count)
     return _join([reflection, answer, question])
