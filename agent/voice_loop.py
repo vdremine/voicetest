@@ -117,6 +117,7 @@ class VoicePipelineConfig:
     piper_model_dir: str
     piper_use_cuda: bool
     piper_length_scale: float
+    idle_prompt_ms: int
     half_duplex: bool
     barge_in_enabled: bool
     barge_in_cue: str
@@ -225,6 +226,8 @@ class VoicePipelineConfig:
             piper_model_dir=os.getenv("PIPER_MODEL_DIR", "/models/piper").strip() or "/models/piper",
             piper_use_cuda=env_bool("PIPER_USE_CUDA", True),
             piper_length_scale=float(os.getenv("PIPER_LENGTH_SCALE", "0.95")),
+            # "Алло, вы на связи?" after this many ms of pure silence. 0 = off (default).
+            idle_prompt_ms=int(os.getenv("IDLE_PROMPT_MS", "0")),
             half_duplex=env_bool("HALF_DUPLEX", True),
             barge_in_enabled=env_bool("BARGE_IN_ENABLED", False),
             barge_in_cue=os.getenv("BARGE_IN_CUE", "click").strip().lower() or "click",
@@ -2949,6 +2952,8 @@ class ParticipantAudioSession:
         self._utterance_counter = 0
         self._processed_utterance_ids: set[str] = set()
         self._inaudible_count = 0  # consecutive empty STT (noise/music drowning speech)
+        self._idle_silence_ms = 0  # running silence used for the "вы на связи?" prompt
+        self._idle_prompts_sent = 0
         self._last_agent_message: str | None = None
         self._last_semantic_agent_message: str | None = None
         self._session_memory = SessionMemory(max_turns=12)
@@ -3270,8 +3275,11 @@ class ParticipantAudioSession:
         if not self._utterance_chunks:
             self._append_pre_speech(chunk)
             if not is_speech:
+                await self._idle_tick()
                 return
 
+            self._idle_silence_ms = 0
+            self._idle_prompts_sent = 0
             self._turn_revision += 1
             self._active_utterance_revision = self._turn_revision
             self._utterance_counter += 1
@@ -4033,6 +4041,44 @@ class ParticipantAudioSession:
         if count > 3:
             return None
         return self._INAUDIBLE_PROMPTS[(count - 1) % len(self._INAUDIBLE_PROMPTS)]
+
+    async def _idle_tick(self) -> None:
+        """Called per silent VAD chunk. After IDLE_PROMPT_MS of pure silence (and a
+        live conversation), nudge once or twice: "Алло, вы на связи?". Off when
+        IDLE_PROMPT_MS=0."""
+        if self._config.idle_prompt_ms <= 0 or not self._config.tts_enabled:
+            return
+        if not self._uses_text_api_backend() or not self._text_api_started:
+            return
+        if self._is_speaking or self._is_processing or self._idle_prompts_sent >= 2:
+            return
+        self._idle_silence_ms += self._chunk_ms
+        if self._idle_silence_ms < self._config.idle_prompt_ms:
+            return
+        self._idle_silence_ms = 0
+        self._idle_prompts_sent += 1
+        try:
+            await self._emit_idle_prompt()
+        except Exception as exc:
+            self._log(f"idle prompt skipped: {exc}")
+
+    async def _emit_idle_prompt(self) -> None:
+        prompt = self._INAUDIBLE_PROMPTS[(self._idle_prompts_sent - 1) % len(self._INAUDIBLE_PROMPTS)]
+        self._log(f"idle prompt participant={self._participant.identity} after_ms={self._config.idle_prompt_ms}")
+        await self._publish_status("speaking")
+        self._is_speaking = True
+        try:
+            await self._speak_response(
+                utterance_id=f"idle-{self._idle_prompts_sent}",
+                response_text=prompt,
+                intent_value="text_api",
+                tts_speed=1.0,
+            )
+        finally:
+            # Called directly from the VAD loop (not the dispatch), so reset the
+            # speaking flag ourselves or the bot stays "speaking" forever.
+            self._is_speaking = False
+            await self._publish_status("waiting_for_speech")
 
     async def _run_text_api_turn(
         self,
