@@ -2948,6 +2948,7 @@ class ParticipantAudioSession:
         self._active_utterance_id: str | None = None
         self._utterance_counter = 0
         self._processed_utterance_ids: set[str] = set()
+        self._inaudible_count = 0  # consecutive empty STT (noise/music drowning speech)
         self._last_agent_message: str | None = None
         self._last_semantic_agent_message: str | None = None
         self._session_memory = SessionMemory(max_turns=12)
@@ -4021,6 +4022,18 @@ class ParticipantAudioSession:
             self._log(f"stalled-slot rescue fallback for {self._participant.identity}: {exc}")
             return f"Да, возможно, я неточно понял. {resume_question}", None, 0
 
+    _INAUDIBLE_PROMPTS = (
+        "Алло, вы на связи? Что-то вас не слышно.",
+        "Кажется, плохо слышно — повторите, пожалуйста?",
+        "Вы здесь? Связь будто прерывается.",
+    )
+
+    def _inaudible_prompt(self, count: int) -> str | None:
+        # Prompt for the first few empty utterances, then stay quiet (don't nag).
+        if count > 3:
+            return None
+        return self._INAUDIBLE_PROMPTS[(count - 1) % len(self._INAUDIBLE_PROMPTS)]
+
     async def _run_text_api_turn(
         self,
         *,
@@ -4032,33 +4045,42 @@ class ParticipantAudioSession:
         stt_confidence: float = 1.0,
     ) -> dict[str, Any]:
         if not transcript_text.strip():
+            # VAD fired (sound present) but STT returned nothing -> noise / music /
+            # bad line drowning the speech. Prompt "вас не слышно" instead of silent
+            # waiting — but rate-limit so it doesn't nag forever.
+            self._inaudible_count += 1
+            prompt = self._inaudible_prompt(self._inaudible_count)
             intent = IntentResult(Intent.CLARIFY.value, 0.0, False, Action.ASK_REPEAT.value)
-            return {
-                "intent": intent,
-                "llm_reply": None,
-                "response_text": "",
-                "raw_response_text": "",
-                "response_published": False,
-                "suppress_response": True,
-                "router_latency_ms": 0,
-                "intent_ready_time_ms": 0,
-                "response_ready_time_ms": 0,
-                "llm_latency_ms": 0,
-                "tts_latency_ms": 0,
-                "tts_prepared_text": "",
-                "tts_segments": [],
-                "filler_added": False,
-                "filler_type": "",
-                "tts_synth_start_time_ms": 0,
-                "tts_synth_done_time_ms": 0,
-                "tts_publish_start_time_ms": 0,
-                "tts_publish_done_time_ms": 0,
+            base = {
+                "intent": intent, "llm_reply": None, "raw_response_text": prompt or "",
+                "router_latency_ms": 0, "intent_ready_time_ms": int(time.time() * 1000),
+                "response_ready_time_ms": int(time.time() * 1000), "llm_latency_ms": 0,
+                "filler_added": False, "filler_type": "",
+                "tts_synth_start_time_ms": 0, "tts_synth_done_time_ms": 0,
+                "tts_publish_start_time_ms": 0, "tts_publish_done_time_ms": 0,
                 "current_node": self._text_api_current_node,
                 "known_facts": dict(self._text_api_known_facts),
                 "last_turn_note": self._text_api_last_turn_note,
-                "trace": {},
-                "speech_end_time_ms": speech_end_time_ms,
+                "trace": {"source": "inaudible"}, "speech_end_time_ms": speech_end_time_ms,
             }
+            if not prompt or not self._config.tts_enabled:
+                return {**base, "response_text": "", "response_published": False,
+                        "suppress_response": True, "tts_latency_ms": 0,
+                        "tts_prepared_text": "", "tts_segments": []}
+            await self._publish_status("speaking")
+            self._is_speaking = True
+            spoken_text, tts_prepared_text, tts_segments, tts_latency_ms, _pc, fa, ft = (
+                await self._speak_response(
+                    utterance_id=utterance_id, response_text=prompt,
+                    intent_value="text_api", tts_speed=1.0,
+                )
+            )
+            return {**base, "response_text": spoken_text or prompt, "response_published": True,
+                    "suppress_response": False, "tts_latency_ms": tts_latency_ms,
+                    "tts_prepared_text": tts_prepared_text, "tts_segments": tts_segments,
+                    "filler_added": fa, "filler_type": ft}
+
+        self._inaudible_count = 0  # heard something — reset the "не слышно" counter
 
         if transcript_text.strip():
             self._session_memory.add_user(normalized_text or transcript_text)
