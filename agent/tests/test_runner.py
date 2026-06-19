@@ -189,6 +189,23 @@ def test_generic_ack_not_repeated_across_turns():
     assert out2["reply"].rstrip().endswith("?")  # still asks the question
 
 
+def test_name_appended_ack_is_deduped_and_name_not_every_turn():
+    # Server bug: "понял вас, Лен" every turn. Name-appended generic acks must be
+    # caught by the dedup, and the name must not appear two turns in a row.
+    u = TurnUnderstanding(reflection="понял вас, Лен.", facts_update={})
+    runner = _runner(u)
+    facts = {"opening_done": "yes", "desired_amount": "1", "client_name": "Лен",
+             "property_type": "квартира", "region": "Москва", "encumbrance": "нет"}
+    state = _state(facts, "ага")
+    state["last_named"] = True  # previous turn already addressed by name
+    out1 = _run(runner, state)
+    assert "лен" not in out1["reply"].lower().split("?")[0] or "понял вас, лен" not in out1["reply"].lower()
+    # second consecutive name+generic ack dropped
+    state2 = {**out1, "user_text": "ну да", "raw_text": "ну да"}
+    out2 = _run(runner, state2)
+    assert "понял вас, лен" not in out2["reply"].lower()
+
+
 def test_specific_reflection_is_kept():
     # A specific mirror (carries content) is NOT treated as a generic ack.
     u = TurnUnderstanding(reflection="Двести тысяч, понял.", facts_update={"desired_amount": "200000"})

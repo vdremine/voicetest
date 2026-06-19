@@ -19,6 +19,7 @@ class CallState(TypedDict, total=False):
 
     node_repeat_count: dict[str, int]
     recent_acks: list[str]
+    last_named: bool
 
     reply: str
     llm_decision: dict[str, Any]

@@ -2292,25 +2292,34 @@ class LiveKitAudioPublisher:
 
     async def interrupt_with_cue(self) -> None:
         """Stop current playback and play the barge-in cue (phone-like switch)."""
-        self.interrupt_playback()
         cue = self._build_cue()
         if len(cue) == 0 or self._source is None:
+            self.interrupt_playback()
             return
+        # Bump generation to stop the producer loop, but DON'T clear_queue here —
+        # clearing puts the source in a transient InvalidState where capture fails.
+        self._playback_generation += 1
+        self._source.clear_queue()
         spc = int(self._config.tts_publish_sample_rate * self._config.tts_frame_ms / 1000) or 480
-        try:
-            for cursor in range(0, len(cue), spc):
-                chunk = cue[cursor : cursor + spc]
-                if len(chunk) < spc:
-                    chunk = np.pad(chunk, (0, spc - len(chunk)))
-                frame = rtc.AudioFrame(
-                    data=memoryview(chunk.tobytes()),
-                    sample_rate=self._config.tts_publish_sample_rate,
-                    num_channels=self._config.num_channels,
-                    samples_per_channel=spc,
-                )
-                await self._source.capture_frame(frame)
-        except Exception as exc:
-            self._log(f"barge-in cue skipped: {exc}")
+        for attempt in range(3):
+            try:
+                await asyncio.sleep(0.01)  # let the source settle after clear_queue
+                for cursor in range(0, len(cue), spc):
+                    chunk = cue[cursor : cursor + spc]
+                    if len(chunk) < spc:
+                        chunk = np.pad(chunk, (0, spc - len(chunk)))
+                    frame = rtc.AudioFrame(
+                        data=memoryview(chunk.tobytes()),
+                        sample_rate=self._config.tts_publish_sample_rate,
+                        num_channels=self._config.num_channels,
+                        samples_per_channel=spc,
+                    )
+                    await self._source.capture_frame(frame)
+                self._log("interrupted current agent audio playback (with cue)")
+                return
+            except Exception as exc:
+                if attempt == 2:
+                    self._log(f"barge-in cue skipped: {exc}")
 
     async def speak_pcm(self, pcm16: np.ndarray, sample_rate: int) -> bool:
         await self.ensure_published()

@@ -58,16 +58,37 @@ def _is_generic_ack(reflection: str) -> bool:
     return _ack_core(reflection) in _GENERIC_ACKS
 
 
-def _dedupe_reflection(reflection: str, recent_acks: list[str]) -> tuple[str, list[str]]:
-    """Drop a generic ack if we used one in the last 2 turns. Returns the cleaned
-    reflection and the updated recent-acks history."""
-    generic = _is_generic_ack(reflection)
-    if generic and any(recent_acks[-2:]):
-        reflection = ""
-        kept = ""
-    else:
-        kept = _ack_core(reflection) if generic else ""
-    return reflection, (recent_acks + [kept])[-3:]
+def _strip_vocative(reflection: str, name: str) -> str:
+    """Remove a vocative address by the client's name (and diminutives) from the
+    reflection: 'понял вас, Лен' -> 'понял вас', 'Ленечка, двести' -> 'двести'."""
+    name = (name or "").strip()
+    if not name:
+        return reflection
+    stem = re.escape(name[: max(3, len(name) - 2)])  # match diminutives by stem
+    r = re.sub(rf"(^|[\s,])\s*{stem}\w*\s*(?=[,.!?…]|$)", r"\1", reflection, flags=re.IGNORECASE)
+    r = re.sub(rf"[,]?\s*{stem}\w*\s*[,]\s*", " ", r, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", r).strip(" ,").strip()
+
+
+def _has_vocative(reflection: str, name: str) -> bool:
+    return bool(name) and _strip_vocative(reflection, name).lower() != reflection.strip().lower()
+
+
+def _process_reflection(
+    reflection: str, recent_acks: list[str], name: str, prev_named: bool
+) -> tuple[str, list[str], bool]:
+    """Clean the reflection: drop repeated generic acks (even when a name is
+    appended), and don't address the client by name two turns in a row."""
+    bare = _strip_vocative(reflection, name)
+    if _is_generic_ack(bare):
+        if any(recent_acks[-2:]):  # generic ack used recently -> drop entirely
+            return "", (recent_acks + [""])[-3:], False
+        return bare, (recent_acks + [_ack_core(bare)])[-3:], False  # keep bare, no name spam
+    # specific reflection: keep, but avoid back-to-back name address
+    used_name = _has_vocative(reflection, name)
+    if used_name and prev_named:
+        return bare, (recent_acks + [""])[-3:], False
+    return reflection, (recent_acks + [""])[-3:], used_name
 
 
 def _ended_kind(facts: dict[str, Any]) -> str:
@@ -220,11 +241,13 @@ class CallGraphRunner:
                 if gate:
                     new_facts = {**new_facts, gate: "yes"}
 
-        # Kill repetitive generic acks ("угу, понял вас") — keep a specific mirror
-        # or just go to the question. Empty answer means the ack carried no content.
-        clean_reflection, recent_acks = _dedupe_reflection(
+        # Kill repetitive generic acks ("угу, понял вас", "понял вас, Лен") and
+        # stop addressing the client by name every single turn.
+        clean_reflection, recent_acks, named_now = _process_reflection(
             understanding.reflection,
             list(state.get("recent_acks", [])),
+            str(new_facts.get("client_name", "")),
+            bool(state.get("last_named", False)),
         )
 
         repeat_count = dict(state.get("node_repeat_count", {}))
@@ -252,6 +275,7 @@ class CallGraphRunner:
             "current_node": focus_after,
             "node_repeat_count": repeat_count,
             "recent_acks": recent_acks,
+            "last_named": named_now,
             "last_turn_note": note,
             "history": self._append_history(state, reply),
             "llm_decision": understanding.model_dump(),
