@@ -2494,18 +2494,9 @@ class GigaAmSttService:
         import onnx_asr  # local import: only when this backend is used
 
         name = self._config.stt_gigaam_model
-        # Try GPU (CUDAExecutionProvider) first; fall back to CPU if the CUDA
-        # provider/libs aren't available. onnxruntime-gpu must be CUDA-12-matched
-        # (see requirements-gigaam.txt) or the import itself fails earlier.
-        if self._config.stt_device != "cpu":
-            try:
-                self._model = onnx_asr.load_model(
-                    name, providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
-                )
-                self._log(f"initialized gigaam stt model={name} (cuda)")
-                return self._model
-            except Exception as exc:
-                self._log(f"gigaam cuda load failed ({exc}); loading on CPU")
+        # CPU onnxruntime (proven fast for this 0.6B RNN-T, ~0.2s/utt). Avoids the
+        # onnxruntime-gpu/CUDA mess. GPU is a later step with a clean CUDA-matched
+        # single onnxruntime-gpu (no coexisting CPU onnxruntime).
         self._model = onnx_asr.load_model(name)
         self._log(f"initialized gigaam stt model={name} (cpu)")
         return self._model

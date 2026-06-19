@@ -2,13 +2,9 @@
 # Activated at runtime with STT_BACKEND=gigaam. Falls back to faster-whisper if the
 # onnx_asr import fails (see build_stt_service).
 #
-# GPU build: pin onnxruntime-gpu to a CUDA-12 release (1.20.1 -> CUDA 12.4 + cuDNN 9),
-# matching the cu12/cudnn9 libs already in the image (from torch). A bare
-# `onnx-asr[gpu]` pulls the latest onnxruntime-gpu which targets CUDA 13
-# (libcudart.so.13) and fails on this CUDA-12 image.
-# NB: onnxruntime-gpu REPLACES the plain onnxruntime used by Silero VAD — if the GPU
-# libs don't load, VAD breaks too. Rollback: switch this file back to `onnx-asr[cpu,hub]`
-# and rebuild. CPU GigaAM was already fast (~0.2s/utt).
-nvidia-cuda-runtime-cu12
-onnxruntime-gpu==1.20.1
-onnx-asr[hub]
+# CPU onnxruntime (NOT [gpu]). The GPU path kept fighting: a CUDA-13 onnxruntime-gpu
+# (libcudart.so.13) on a CUDA-12 image, then a CUDA-12 pin left BOTH onnxruntime and
+# onnxruntime-gpu installed (same module -> conflict). CPU avoids all of it, reuses
+# the onnxruntime already in the image (used by Silero VAD), and is proven fast:
+# GigaAM 0.6B RNN-T recognises a short utterance in ~0.15-0.3s on CPU.
+onnx-asr[cpu,hub]

@@ -565,4 +565,9 @@ def assemble_reply(
         return _join([refl, ans, finish])
 
     question = question_for(focus_node, facts, repeat_count)
+    # The system asks the question deterministically — strip any question the model
+    # put in reflection/answer so we don't ask twice ("…А как вас зовут? <our q>").
+    if question:
+        reflection = _strip_trailing_question(reflection)
+        answer = _strip_trailing_question(answer)
     return _join([reflection, answer, question])
