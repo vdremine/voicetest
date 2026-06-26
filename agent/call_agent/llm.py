@@ -169,9 +169,18 @@ class TurnLlmClient:
             "max_tokens": self._settings.max_tokens,
         }
         if guided:
-            # vLLM guided decoding guarantees a schema-valid object.
-            kwargs["extra_body"] = {"guided_json": UNDERSTANDING_JSON_SCHEMA}
+            # vLLM >=0.23 убрал extra_body={"guided_json": ...} (молча игнорирует,
+            # возвращая свободный текст). Структурный вывод теперь через
+            # response_format json_schema — xgrammar принуждает схему TurnUnderstanding.
+            kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "turn_understanding",
+                    "schema": UNDERSTANDING_JSON_SCHEMA,
+                },
+            }
         else:
+            # фолбэк для бэкендов без json_schema: «любой валидный JSON».
             kwargs["response_format"] = {"type": "json_object"}
         return await self._client.chat.completions.create(**kwargs)
 
